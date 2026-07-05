@@ -168,6 +168,38 @@ These are deliberately separate resources so v1 stays small.
 
 ---
 
+## 3.2 Verified endpoint reality (live-checked 2026-07-06)
+
+Probed against a real logged-in session. The clean REST-li surface documented by
+older tools (e.g. the `linkedin-api` Python library) is **partly deprecated**;
+LinkedIn has moved key reads to GraphQL:
+
+| feature       | endpoint we target                              | live result | notes |
+|---------------|-------------------------------------------------|-------------|-------|
+| me            | `GET /me`                                       | ✅ 200      | `data."*miniProfile"` is a URN ref; object in `included` (decoder fixed) |
+| people search | ~~`/search/blended`~~ → `GET /graphql` clusters | ✅ 200      | legacy blended is **404**; use `voyagerSearchDashClusters`, decode `EntityResultViewModel` (fixed) |
+| profile by id | ~~`/identity/profiles/{id}/profileView`~~       | ❌ 410 gone | modern profile is decomposed GraphQL cards keyed by member id; not yet modeled |
+| connections   | `GET /relationships/connections`                | ✅ 200      | results in `data.elements`; decoder should follow refs (documented) |
+| invitations   | `/relationships/invitationViews`                | ❌ 400      | needs the GraphQL invitations surface; endpoint TBD |
+| messaging     | `GET /messaging/conversations`                  | ✅ 200      | results in `data.elements` |
+| feed          | `GET /feed/updatesV2?q=chronFeed`               | ✅ 200      | results in `data.elements` |
+
+### queryId maintenance (open decision)
+
+GraphQL calls carry a `queryId` like `voyagerSearchDashClusters.a7a0567f…` whose
+hash is pinned to a specific LinkedIn web-app build and **rotates over time**.
+When a GraphQL call starts returning 400/"missing query", the hash must be
+refreshed. All queryIds are centralized in `internal/voyager/graphql.go` so this
+is a one-file change. Strategy options (owner to pick):
+
+1. **Pin & update** (current): hardcode current hashes, refresh manually. Simple,
+   but breaks silently when LinkedIn ships a new build.
+2. **Runtime scrape**: parse the logged-in web app's JS bundle to extract current
+   hashes on the fly. Robust, but more code and its own fragility.
+3. **REST-preferred hybrid**: use the still-working REST-li endpoints wherever
+   they exist (me/connections/messaging/feed) and only fall back to GraphQL for
+   search/profile. Smallest GraphQL surface to maintain.
+
 ## 4. Exit codes (stable contract)
 
 | code | meaning                                   |

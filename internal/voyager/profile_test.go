@@ -2,6 +2,7 @@ package voyager
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -46,17 +47,18 @@ func newTestClient(t *testing.T, routes map[string]string) (*Client, *fixtureTra
 	return c, ft
 }
 
-func TestProfile(t *testing.T) {
-	c, ft := newTestClient(t, map[string]string{"/profileView": "profile_view.json"})
-	p, err := c.Profile(context.Background(), "ada-lovelace")
+func TestMe(t *testing.T) {
+	c, ft := newTestClient(t, map[string]string{"/me": "me.json"})
+	me, err := c.Me(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := p.Name(); got != "Ada Lovelace" {
+	// /me returns a *miniProfile reference resolved from included.
+	if got := me.Name(); got != "Ada Lovelace" {
 		t.Errorf("name = %q, want Ada Lovelace", got)
 	}
-	if p.Location != "London, England" {
-		t.Errorf("location = %q", p.Location)
+	if me.PublicID != "ada-lovelace" {
+		t.Errorf("public id = %q", me.PublicID)
 	}
 	// The CSRF header must be the JSESSIONID with quotes stripped.
 	if got := ft.lastReq.Header.Get("Csrf-Token"); got != "jsession_test" {
@@ -64,22 +66,38 @@ func TestProfile(t *testing.T) {
 	}
 }
 
+func TestProfileByIDUnsupported(t *testing.T) {
+	c, _ := newTestClient(t, map[string]string{})
+	// The legacy profileView endpoint is gone (410); we fail fast with ErrNotFound.
+	if _, err := c.Profile(context.Background(), "ada-lovelace"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
 func TestSearchPeople(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/search/blended": "people_search.json"})
-	res, err := c.SearchPeople(context.Background(), "compiler", 0)
+	c, ft := newTestClient(t, map[string]string{"/graphql": "people_search.json"})
+	res, err := c.SearchPeople(context.Background(), "compiler engineer", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Two people results; the premium upsell entity must be skipped.
 	if len(res) != 2 {
 		t.Fatalf("got %d results, want 2", len(res))
 	}
 	if res[0].Name != "Grace Hopper" || res[0].PublicID != "grace-hopper" {
 		t.Errorf("first result = %+v", res[0])
 	}
+	if res[0].Headline != "Rear Admiral · Compiler pioneer" || res[0].Location != "Arlington, Virginia" {
+		t.Errorf("headline/location = %q / %q", res[0].Headline, res[0].Location)
+	}
+	// Keywords with a space must be percent-encoded in the GraphQL variables.
+	if q := ft.lastReq.URL.RawQuery; !strings.Contains(q, "compiler%20engineer") {
+		t.Errorf("expected encoded keywords in query, got %q", q)
+	}
 }
 
 func TestSearchPeopleRespectsMax(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/search/blended": "people_search.json"})
+	c, _ := newTestClient(t, map[string]string{"/graphql": "people_search.json"})
 	res, err := c.SearchPeople(context.Background(), "x", 1)
 	if err != nil {
 		t.Fatal(err)

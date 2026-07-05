@@ -4,34 +4,50 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 )
 
+// miniProfile is the MiniProfile projection LinkedIn returns for a member. It
+// appears in `included` across many endpoints (/me, search, invitations).
+type miniProfile struct {
+	PublicIdentifier string `json:"publicIdentifier"`
+	EntityUrn        string `json:"entityUrn"`
+	FirstName        string `json:"firstName"`
+	LastName         string `json:"lastName"`
+	Occupation       string `json:"occupation"`
+}
+
 // Me returns the authenticated member's basic identity. It doubles as a cheap
-// session-validity check (used by `lion auth status`). It hits the /me
-// endpoint, which returns the viewer's mini profile.
+// session-validity check (used by `lion auth status`).
+//
+// Verified against the live API (2026-07-06): /me returns normalized JSON where
+// data holds a "*miniProfile" URN *reference* and the actual MiniProfile object
+// lives in `included` — so we resolve the reference through the entity index.
 func (c *Client) Me(ctx context.Context) (*Profile, error) {
 	body, err := c.get(ctx, "/me", nil)
 	if err != nil {
 		return nil, err
 	}
-	// /me returns a miniProfile under data; parse leniently.
 	var env struct {
 		Data struct {
-			MiniProfile struct {
-				PublicIdentifier string `json:"publicIdentifier"`
-				EntityUrn        string `json:"entityUrn"`
-				FirstName        string `json:"firstName"`
-				LastName         string `json:"lastName"`
-				Occupation       string `json:"occupation"`
-			} `json:"miniProfile"`
+			MiniProfileURN string `json:"*miniProfile"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil, fmt.Errorf("decode /me: %w", err)
 	}
-	mp := env.Data.MiniProfile
+	_, idx, err := parseNormalized(body)
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := idx.get(env.Data.MiniProfileURN)
+	if !ok {
+		return nil, fmt.Errorf("/me: miniProfile %q not found in response", env.Data.MiniProfileURN)
+	}
+	var mp miniProfile
+	if err := decodeInto(raw, &mp); err != nil {
+		return nil, fmt.Errorf("decode miniProfile: %w", err)
+	}
 	return &Profile{
 		PublicID:  mp.PublicIdentifier,
 		URN:       mp.EntityUrn,
@@ -47,84 +63,44 @@ func (c *Client) Profile(ctx context.Context, publicID string) (*Profile, error)
 	if publicID == "" {
 		return nil, fmt.Errorf("empty profile id")
 	}
-	path := fmt.Sprintf("/identity/profiles/%s/profileView", url.PathEscape(publicID))
-	body, err := c.get(ctx, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	return decodeProfileView(body, publicID)
+	// Verified 2026-07-06: the REST /identity/profiles/{id}/profileView endpoint
+	// is gone (HTTP 410). The modern profile is decomposed into many card-scoped
+	// GraphQL queries (voyagerIdentityDashProfiles + card queries) keyed by the
+	// member id, not the public slug. Modeling the full card set is follow-up
+	// work; until then, surface a clear error instead of hitting the dead path.
+	// `profile view me` works via Me(); `profile search` returns member basics.
+	return nil, fmt.Errorf("profile-by-id is not yet supported on LinkedIn's new GraphQL profile API (the legacy endpoint returns HTTP 410); use `lion profile search` or `lion profile view me`: %w", ErrNotFound)
 }
 
-// profileViewRaw captures the fields lion surfaces from a profileView payload.
-// profileView nests the core profile under data.profile.
-type profileViewRaw struct {
-	Data struct {
-		Profile struct {
-			FirstName    string `json:"firstName"`
-			LastName     string `json:"lastName"`
-			Headline     string `json:"headline"`
-			Summary      string `json:"summary"`
-			Industry     string `json:"industryName"`
-			LocationName string `json:"locationName"`
-			MiniProfile  struct {
-				PublicIdentifier string `json:"publicIdentifier"`
-				EntityUrn        string `json:"entityUrn"`
-			} `json:"miniProfile"`
-		} `json:"profile"`
-	} `json:"data"`
-}
-
-func decodeProfileView(body []byte, publicID string) (*Profile, error) {
-	var raw profileViewRaw
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("decode profileView: %w", err)
-	}
-	p := raw.Data.Profile
-	pub := p.MiniProfile.PublicIdentifier
-	if pub == "" {
-		pub = publicID
-	}
-	return &Profile{
-		PublicID:  pub,
-		URN:       p.MiniProfile.EntityUrn,
-		FirstName: p.FirstName,
-		LastName:  p.LastName,
-		Headline:  p.Headline,
-		Location:  p.LocationName,
-		Industry:  p.Industry,
-		Summary:   p.Summary,
-	}, nil
-}
-
-// SearchPeople runs a people search and returns up to max results (0 = server
-// default). It uses the blended search REST-li endpoint with a people filter.
+// SearchPeople runs a people search and returns up to max results (0 = default).
+//
+// Verified against the live API (2026-07-06): the legacy REST /search/blended is
+// gone (404). People search is now GraphQL (voyagerSearchDashClusters), and
+// results arrive as EntityResultViewModel entities in `included`.
 func (c *Client) SearchPeople(ctx context.Context, query string, max int) ([]SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("empty search query")
 	}
-	q := url.Values{}
-	q.Set("keywords", query)
-	q.Set("origin", "GLOBAL_SEARCH_HEADER")
-	q.Set("q", "all")
-	if max > 0 {
-		q.Set("count", fmt.Sprintf("%d", max))
+	count := max
+	if count <= 0 {
+		count = 10
 	}
-	body, err := c.get(ctx, "/search/blended", q)
+	// Rest.li variables string; only the keywords value is percent-encoded.
+	vars := fmt.Sprintf(
+		"(start:0,count:%d,origin:GLOBAL_SEARCH_HEADER,query:(keywords:%s,flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:resultType,value:List(PEOPLE)))))",
+		count, rlEncode(query),
+	)
+	body, err := c.getGraphQL(ctx, queryIDSearchClusters, vars)
 	if err != nil {
 		return nil, err
 	}
 	return decodePeopleSearch(body, max)
 }
 
-// decodePeopleSearch flattens blended search results, keeping only people hits.
-//
-// NOTE (known limitation, flagged in review): this returns every MiniProfile in
-// the normalized `included` cache rather than resolving the ordered result URNs
-// under `data`. `included` is a shared entity cache, so unrelated profiles may
-// appear and result ordering is not guaranteed. Resolving `data.elements` result
-// references first requires a live-captured blended-search payload to model the
-// exact shape; do that once a throwaway-account session is available. For now we
-// de-duplicate by public id and cap at max.
+// decodePeopleSearch extracts people hits from a search-clusters GraphQL
+// response. Each hit is an EntityResultViewModel whose title/primarySubtitle/
+// secondarySubtitle carry the name, headline and location, and whose
+// navigationUrl embeds the public identifier. Only profile results are kept.
 func decodePeopleSearch(body []byte, max int) ([]SearchResult, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
@@ -132,30 +108,54 @@ func decodePeopleSearch(body []byte, max int) ([]SearchResult, error) {
 	}
 	var out []SearchResult
 	seen := make(map[string]bool)
-	for _, raw := range idx.ofType("com.linkedin.voyager.identity.shared.MiniProfile") {
-		var mp struct {
-			PublicIdentifier string `json:"publicIdentifier"`
-			EntityUrn        string `json:"entityUrn"`
-			FirstName        string `json:"firstName"`
-			LastName         string `json:"lastName"`
-			Occupation       string `json:"occupation"`
+	for _, raw := range idx.ofType("com.linkedin.voyager.dash.search.EntityResultViewModel") {
+		var e struct {
+			EntityUrn     string    `json:"entityUrn"`
+			TrackingUrn   string    `json:"trackingUrn"`
+			NavigationURL string    `json:"navigationUrl"`
+			Title         textField `json:"title"`
+			PrimarySub    textField `json:"primarySubtitle"`
+			SecondarySub  textField `json:"secondarySubtitle"`
 		}
-		if err := decodeInto(raw, &mp); err != nil {
+		if err := decodeInto(raw, &e); err != nil {
 			continue
 		}
-		if mp.PublicIdentifier == "" || seen[mp.PublicIdentifier] {
+		// Only member profiles (skip companies, schools, upsell cards, etc.).
+		pub := publicIDFromNavURL(e.NavigationURL)
+		if pub == "" || seen[pub] {
 			continue
 		}
-		seen[mp.PublicIdentifier] = true
+		seen[pub] = true
 		out = append(out, SearchResult{
-			PublicID: mp.PublicIdentifier,
-			URN:      mp.EntityUrn,
-			Name:     strings.TrimSpace(mp.FirstName + " " + mp.LastName),
-			Headline: mp.Occupation,
+			PublicID: pub,
+			URN:      e.TrackingUrn,
+			Name:     strings.TrimSpace(e.Title.Text),
+			Headline: strings.TrimSpace(e.PrimarySub.Text),
+			Location: strings.TrimSpace(e.SecondarySub.Text),
 		})
 		if max > 0 && len(out) >= max {
 			break
 		}
 	}
 	return out, nil
+}
+
+// textField matches LinkedIn's { "text": "...", ... } attributed-string shape.
+type textField struct {
+	Text string `json:"text"`
+}
+
+// publicIDFromNavURL pulls the vanity slug out of a profile navigation URL like
+// "https://www.linkedin.com/in/jane-doe?miniProfileUrn=...". Returns "" for
+// non-profile URLs (company/school results).
+func publicIDFromNavURL(nav string) string {
+	i := strings.Index(nav, "/in/")
+	if i < 0 {
+		return ""
+	}
+	slug := nav[i+len("/in/"):]
+	if j := strings.IndexAny(slug, "?/#"); j >= 0 {
+		slug = slug[:j]
+	}
+	return slug
 }

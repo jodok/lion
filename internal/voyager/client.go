@@ -126,6 +126,27 @@ func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte
 	})
 }
 
+// getRawQuery performs a rate-limited GET where rawQuery is used verbatim as the
+// URL query string (no re-encoding). Needed for Voyager GraphQL, whose Rest.li
+// variables encoding must not be mangled by url.Values.
+func (c *Client) getRawQuery(ctx context.Context, path, rawQuery string) ([]byte, error) {
+	if err := c.limiter.Wait(ctx, ratelimit.Read); err != nil {
+		return nil, err
+	}
+	u := c.baseURL + path
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return c.do(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.setHeaders(req)
+		return req, nil
+	})
+}
+
 // post performs a rate-limited POST. class controls pacing. When dryRun is set,
 // it returns (nil, nil) without sending — callers must treat a nil body under
 // dry-run as "would have sent".
