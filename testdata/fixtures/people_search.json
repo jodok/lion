@@ -1,0 +1,23 @@
+{
+  "data": {
+    "metadata": {}
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA1",
+      "publicIdentifier": "grace-hopper",
+      "firstName": "Grace",
+      "lastName": "Hopper",
+      "occupation": "Rear Admiral · Compiler pioneer"
+    },
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA2",
+      "publicIdentifier": "katherine-johnson",
+      "firstName": "Katherine",
+      "lastName": "Johnson",
+      "occupation": "Mathematician · NASA"
+    }
+  ]
+}
