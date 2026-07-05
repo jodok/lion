@@ -42,11 +42,11 @@ func DefaultBudgets() map[Class]Budget {
 // Limiter paces actions and tracks last-action times per class. It is safe for
 // concurrent use, though lion is largely sequential.
 type Limiter struct {
-	mu       sync.Mutex
-	budgets  map[Class]Budget
-	lastAct  map[Class]time.Time
-	rnd      *rand.Rand
-	sleep    func(context.Context, time.Duration) error // injectable for tests
+	mu      sync.Mutex
+	budgets map[Class]Budget
+	lastAct map[Class]time.Time
+	rnd     *rand.Rand
+	sleep   func(context.Context, time.Duration) error // injectable for tests
 }
 
 // New returns a Limiter with the given budgets.

@@ -5,15 +5,15 @@ package voyager
 
 // Profile is a LinkedIn member profile.
 type Profile struct {
-	PublicID   string `json:"public_id"`
-	URN        string `json:"urn"`
-	FirstName  string `json:"first_name"`
-	LastName   string `json:"last_name"`
-	Headline   string `json:"headline"`
-	Location   string `json:"location"`
-	Industry   string `json:"industry"`
-	Summary    string `json:"summary,omitempty"`
-	Connections int   `json:"connections,omitempty"`
+	PublicID    string `json:"public_id"`
+	URN         string `json:"urn"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name"`
+	Headline    string `json:"headline"`
+	Location    string `json:"location"`
+	Industry    string `json:"industry"`
+	Summary     string `json:"summary,omitempty"`
+	Connections int    `json:"connections,omitempty"`
 }
 
 // Name returns the member's display name.
@@ -35,11 +35,11 @@ type SearchResult struct {
 
 // Connection is a first-degree connection.
 type Connection struct {
-	PublicID  string `json:"public_id"`
-	URN       string `json:"urn"`
-	Name      string `json:"name"`
-	Headline  string `json:"headline"`
-	ConnectedAt int64 `json:"connected_at,omitempty"` // epoch millis
+	PublicID    string `json:"public_id"`
+	URN         string `json:"urn"`
+	Name        string `json:"name"`
+	Headline    string `json:"headline"`
+	ConnectedAt int64  `json:"connected_at,omitempty"` // epoch millis
 }
 
 // Invitation is an incoming or outgoing connection request.
@@ -63,18 +63,18 @@ type Conversation struct {
 
 // Message is a single message within a conversation.
 type Message struct {
-	URN      string `json:"urn"`
-	From     string `json:"from"`
-	Text     string `json:"text"`
-	SentAt   int64  `json:"sent_at"` // epoch millis
+	URN    string `json:"urn"`
+	From   string `json:"from"`
+	Text   string `json:"text"`
+	SentAt int64  `json:"sent_at"` // epoch millis
 }
 
 // FeedItem is a single post in the feed.
 type FeedItem struct {
-	URN       string `json:"urn"`
+	URN        string `json:"urn"`
 	AuthorName string `json:"author_name"`
-	Text      string `json:"text"`
-	Likes     int    `json:"likes"`
-	Comments  int    `json:"comments"`
-	PostedAt  int64  `json:"posted_at"` // epoch millis
+	Text       string `json:"text"`
+	Likes      int    `json:"likes"`
+	Comments   int    `json:"comments"`
+	PostedAt   int64  `json:"posted_at"` // epoch millis
 }

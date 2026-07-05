@@ -22,12 +22,12 @@ var ErrNoAccount = errors.New("no such account; run `lion auth login`")
 
 // Credential is a single stored LinkedIn session.
 type Credential struct {
-	Alias     string    `json:"alias"`
-	LiAt      string    `json:"li_at"`
-	JSessionID string   `json:"jsessionid"`
-	MemberID  string    `json:"member_id,omitempty"`
-	Name      string    `json:"name,omitempty"`
-	SavedAt   time.Time `json:"saved_at"`
+	Alias      string    `json:"alias"`
+	LiAt       string    `json:"li_at"`
+	JSessionID string    `json:"jsessionid"`
+	MemberID   string    `json:"member_id,omitempty"`
+	Name       string    `json:"name,omitempty"`
+	SavedAt    time.Time `json:"saved_at"`
 }
 
 // store is the on-disk representation.
