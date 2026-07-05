@@ -7,6 +7,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Verticals self-register so adding one never requires editing root.go.
+func init() { registerCommand(newProfileCmd) }
+
 func newProfileCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "profile",

@@ -39,6 +39,16 @@ func appFrom(cmd *cobra.Command) *App {
 	return cmd.Context().Value(ctxKey{}).(*App)
 }
 
+// commandFactories holds constructors for feature-vertical commands. Verticals
+// register themselves from an init() in their own file so new verticals never
+// have to edit this file — keeping parallel work conflict-free.
+var commandFactories []func() *cobra.Command
+
+// registerCommand adds a top-level command constructor. Call from an init().
+func registerCommand(f func() *cobra.Command) {
+	commandFactories = append(commandFactories, f)
+}
+
 // Renderer builds an output.Renderer from the resolved config.
 func (a *App) Renderer() *output.Renderer {
 	f := output.FormatTable
@@ -107,8 +117,11 @@ func Execute() int {
 	root.AddCommand(
 		newVersionCmd(),
 		newAuthCmd(),
-		newProfileCmd(),
 	)
+	// Feature verticals (profile, connection, message, feed, ...) self-register.
+	for _, f := range commandFactories {
+		root.AddCommand(f())
+	}
 
 	if err := root.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
