@@ -1,0 +1,45 @@
+{
+  "data": {
+    "metadata": {}
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.feed.render.UpdateV2",
+      "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7000000000000000001,FEED_DETAIL,EMPTY,DEFAULT,false)",
+      "actor": {
+        "name": "Grace Hopper"
+      },
+      "commentary": {
+        "text": {
+          "text": "Debugging is twice as hard as writing the code in the first place."
+        }
+      },
+      "socialDetail": {
+        "totalSocialActivityCounts": {
+          "numLikes": 42,
+          "numComments": 7
+        }
+      },
+      "createdAt": 1717000000000
+    },
+    {
+      "$type": "com.linkedin.voyager.feed.render.UpdateV2",
+      "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7000000000000000002,FEED_DETAIL,EMPTY,DEFAULT,false)",
+      "actor": {
+        "name": "Katherine Johnson"
+      },
+      "commentary": {
+        "text": {
+          "text": "Excited to share our latest trajectory analysis."
+        }
+      },
+      "socialDetail": {
+        "totalSocialActivityCounts": {
+          "numLikes": 108,
+          "numComments": 15
+        }
+      },
+      "createdAt": 1717100000000
+    }
+  ]
+}
