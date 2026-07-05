@@ -1,5 +1,7 @@
 package voyager
 
+import "strings"
+
 // Domain types returned by the client. These are deliberately flat and
 // presentation-agnostic; the CLI layer decides how to render them.
 
@@ -21,7 +23,7 @@ func (p Profile) Name() string {
 	if p.FirstName == "" && p.LastName == "" {
 		return p.PublicID
 	}
-	return p.FirstName + " " + p.LastName
+	return strings.TrimSpace(p.FirstName + " " + p.LastName)
 }
 
 // SearchResult is a lightweight person hit from people search.

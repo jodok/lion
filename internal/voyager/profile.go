@@ -117,13 +117,21 @@ func (c *Client) SearchPeople(ctx context.Context, query string, max int) ([]Sea
 }
 
 // decodePeopleSearch flattens blended search results, keeping only people hits.
-// The included array holds MiniProfile entities referenced by the search hits.
+//
+// NOTE (known limitation, flagged in review): this returns every MiniProfile in
+// the normalized `included` cache rather than resolving the ordered result URNs
+// under `data`. `included` is a shared entity cache, so unrelated profiles may
+// appear and result ordering is not guaranteed. Resolving `data.elements` result
+// references first requires a live-captured blended-search payload to model the
+// exact shape; do that once a throwaway-account session is available. For now we
+// de-duplicate by public id and cap at max.
 func decodePeopleSearch(body []byte, max int) ([]SearchResult, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
 	var out []SearchResult
+	seen := make(map[string]bool)
 	for _, raw := range idx.ofType("com.linkedin.voyager.identity.shared.MiniProfile") {
 		var mp struct {
 			PublicIdentifier string `json:"publicIdentifier"`
@@ -135,9 +143,10 @@ func decodePeopleSearch(body []byte, max int) ([]SearchResult, error) {
 		if err := decodeInto(raw, &mp); err != nil {
 			continue
 		}
-		if mp.PublicIdentifier == "" {
+		if mp.PublicIdentifier == "" || seen[mp.PublicIdentifier] {
 			continue
 		}
+		seen[mp.PublicIdentifier] = true
 		out = append(out, SearchResult{
 			PublicID: mp.PublicIdentifier,
 			URN:      mp.EntityUrn,

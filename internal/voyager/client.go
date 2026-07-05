@@ -9,6 +9,7 @@
 package voyager
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -115,12 +116,14 @@ func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	c.setHeaders(req)
-	return c.do(req)
+	return c.do(func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.setHeaders(req)
+		return req, nil
+	})
 }
 
 // post performs a rate-limited POST. class controls pacing. When dryRun is set,
@@ -133,13 +136,27 @@ func (c *Client) post(ctx context.Context, path string, body io.Reader, class ra
 	if err := c.limiter.Wait(ctx, class); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, body)
-	if err != nil {
-		return nil, err
+	// Buffer the body once so each retry attempt can send a fresh copy.
+	var buf []byte
+	if body != nil {
+		var err error
+		if buf, err = io.ReadAll(body); err != nil {
+			return nil, err
+		}
 	}
-	c.setHeaders(req)
-	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	return c.do(req)
+	return c.do(func() (*http.Request, error) {
+		var r io.Reader
+		if buf != nil {
+			r = bytes.NewReader(buf)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, r)
+		if err != nil {
+			return nil, err
+		}
+		c.setHeaders(req)
+		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+		return req, nil
+	})
 }
 
 func (c *Client) setHeaders(req *http.Request) {
@@ -151,21 +168,30 @@ func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("Cookie", fmt.Sprintf("li_at=%s; JSESSIONID=%s", c.liAt, c.jsession))
 }
 
-// do executes a request with one retry on 429/5xx and maps errors to sentinels.
-func (c *Client) do(req *http.Request) ([]byte, error) {
+// do executes a request with one retry on 5xx and maps errors to sentinels.
+// newReq builds a fresh request per attempt so a consumed body is never reused.
+// 429 is surfaced immediately as ErrRateLimited rather than retried.
+func (c *Client) do(newReq func() (*http.Request, error)) ([]byte, error) {
 	const maxAttempts = 2
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			if readErr != nil {
+				return nil, fmt.Errorf("read response body: %w", readErr)
+			}
 			return body, nil
 		case resp.StatusCode == http.StatusUnauthorized:
 			return nil, ErrUnauthorized
