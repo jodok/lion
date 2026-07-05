@@ -1,0 +1,25 @@
+{
+  "data": {
+    "metadata": {}
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA3",
+      "publicIdentifier": "alan-turing",
+      "firstName": "Alan",
+      "lastName": "Turing",
+      "occupation": "Mathematician · Codebreaker"
+    },
+    {
+      "$type": "com.linkedin.voyager.relationships.invitation.InvitationView",
+      "entityUrn": "urn:li:fs_invitationView:1111",
+      "fromMember": "urn:li:fs_miniProfile:ACoAAA3",
+      "invitation": {
+        "entityUrn": "urn:li:fs_invitation:1111",
+        "sharedSecret": "shared-secret-1111",
+        "message": "I'd like to add you to my professional network."
+      }
+    }
+  ]
+}
