@@ -1,0 +1,52 @@
+{
+  "data": {
+    "elements": [
+      {
+        "entityUrn": "urn:li:fs_event:(2-YWJjMTIz,1)",
+        "createdAt": 1716999000000,
+        "from": {
+          "miniProfile": {
+            "entityUrn": "urn:li:fs_miniProfile:ACoAAA1"
+          }
+        },
+        "eventContent": {
+          "com.linkedin.voyager.messaging.event.MessageEvent": {
+            "body": "Hi! Great meeting you at the conference."
+          }
+        }
+      },
+      {
+        "entityUrn": "urn:li:fs_event:(2-YWJjMTIz,2)",
+        "createdAt": 1717000000000,
+        "from": {
+          "miniProfile": {
+            "entityUrn": "urn:li:fs_miniProfile:ACoAAAme"
+          }
+        },
+        "eventContent": {
+          "com.linkedin.voyager.messaging.event.MessageEvent": {
+            "body": "Are you free for a quick call this week?"
+          }
+        }
+      }
+    ]
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA1",
+      "publicIdentifier": "grace-hopper",
+      "firstName": "Grace",
+      "lastName": "Hopper",
+      "occupation": "Rear Admiral · Compiler pioneer"
+    },
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAAme",
+      "publicIdentifier": "ada-lovelace",
+      "firstName": "Ada",
+      "lastName": "Lovelace",
+      "occupation": "Mathematician · First programmer"
+    }
+  ]
+}
