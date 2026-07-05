@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/jodok/lion/internal/output"
+	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
 )
 
@@ -127,11 +128,18 @@ func newConnectionAcceptCmd() *cobra.Command {
 					return err
 				}
 				secret := ""
+				found := false
 				for _, inv := range invs {
 					if inv.InvitationURN == args[0] {
 						secret = inv.SharedSecret
+						found = true
 						break
 					}
+				}
+				// Fail fast locally rather than sending an incomplete mutation
+				// (an accept with an empty shared secret is known to be invalid).
+				if !found || secret == "" {
+					return fmt.Errorf("no pending invitation with shared secret for %q: %w", args[0], voyager.ErrNotFound)
 				}
 				if err := cl.AcceptInvitation(ctx, args[0], secret); err != nil {
 					return err

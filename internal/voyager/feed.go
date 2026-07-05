@@ -60,20 +60,30 @@ type feedUpdateRaw struct {
 }
 
 // decodeFeed flattens updatesV2 results, keeping the fields lion surfaces.
+//
+// NOTE (known limitation, flagged in review): this returns every UpdateV2 in the
+// normalized `included` cache rather than following the feed's ordered result
+// references under `data`. `included` can hold extra entities for rendering, so
+// unrelated updates may appear and ordering is not guaranteed. Resolving the
+// ordered `data` result URNs requires a live-captured feed payload to model the
+// exact shape — do that alongside endpoint verification. For now we de-duplicate
+// by URN and cap at max.
 func decodeFeed(body []byte, max int) ([]FeedItem, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
 	var out []FeedItem
+	seen := make(map[string]bool)
 	for _, raw := range idx.ofType("com.linkedin.voyager.feed.render.UpdateV2") {
 		var u feedUpdateRaw
 		if err := decodeInto(raw, &u); err != nil {
 			continue
 		}
-		if u.EntityUrn == "" {
+		if u.EntityUrn == "" || seen[u.EntityUrn] {
 			continue
 		}
+		seen[u.EntityUrn] = true
 		out = append(out, FeedItem{
 			URN:        u.EntityUrn,
 			AuthorName: u.Actor.Name,
@@ -95,6 +105,12 @@ func decodeFeed(body []byte, max int) ([]FeedItem, error) {
 func (c *Client) CreatePost(ctx context.Context, text, visibility string) error {
 	if text == "" {
 		return fmt.Errorf("empty post text")
+	}
+	// Validate visibility as an enum so a typo never silently broadens reach.
+	switch visibility {
+	case "connections", "public":
+	default:
+		return fmt.Errorf("invalid visibility %q: want \"connections\" or \"public\"", visibility)
 	}
 	payload := map[string]any{
 		"visibleToConnectionsOnly": visibility == "connections",

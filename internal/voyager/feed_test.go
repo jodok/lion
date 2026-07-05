@@ -53,3 +53,14 @@ func TestCreatePostDryRun(t *testing.T) {
 		t.Errorf("dry-run CreatePost made an HTTP request: %s", ft.lastReq.URL)
 	}
 }
+
+func TestCreatePostRejectsInvalidVisibility(t *testing.T) {
+	c, ft := newTestClient(t, map[string]string{})
+	// A typo must error before any request, never silently publish as public.
+	if err := c.CreatePost(context.Background(), "hello", "conectons"); err == nil {
+		t.Fatal("expected error for invalid visibility, got nil")
+	}
+	if ft.lastReq != nil {
+		t.Errorf("invalid visibility should not make a request: %s", ft.lastReq.URL)
+	}
+}

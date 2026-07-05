@@ -37,12 +37,20 @@ func (c *Client) Connections(ctx context.Context, max int) ([]Connection, error)
 
 // decodeConnections flattens the normalized connections payload, keeping the
 // MiniProfile entities that represent each connection.
+//
+// NOTE (known limitation, flagged in review): like people-search, this scans
+// every MiniProfile in the `included` cache rather than following the ordered
+// connection result references under `data`. That can surface unrelated cached
+// profiles and lose server ordering (so `max` caps arbitrary order). Resolving
+// the `data` result URNs needs a live-captured payload to model the shape — do
+// it alongside endpoint verification. For now we de-duplicate by URN.
 func decodeConnections(body []byte, max int) ([]Connection, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
 	var out []Connection
+	seen := make(map[string]bool)
 	for _, raw := range idx.ofType("com.linkedin.voyager.identity.shared.MiniProfile") {
 		var mp struct {
 			PublicIdentifier string `json:"publicIdentifier"`
@@ -54,9 +62,10 @@ func decodeConnections(body []byte, max int) ([]Connection, error) {
 		if err := decodeInto(raw, &mp); err != nil {
 			continue
 		}
-		if mp.PublicIdentifier == "" {
+		if mp.PublicIdentifier == "" || seen[mp.PublicIdentifier] {
 			continue
 		}
+		seen[mp.PublicIdentifier] = true
 		out = append(out, Connection{
 			PublicID: mp.PublicIdentifier,
 			URN:      mp.EntityUrn,
@@ -94,12 +103,22 @@ func (c *Client) Invitations(ctx context.Context, incoming bool) ([]Invitation, 
 // decodeInvitations flattens the normalized invitationViews payload. Each
 // invitation view entity carries the invitation URN, shared secret, and a
 // reference to the sending member's MiniProfile.
+//
+// NOTE (known limitation, flagged in review): this scans every InvitationView in
+// the `included` cache instead of resolving the ordered result references under
+// `data`. Because `connection accept --all` acts on this list, surfacing an
+// unrelated cached invitation could accept something outside the pending set.
+// The entities carry `entityUrn`, so we at least de-duplicate and skip ones with
+// no shared secret; resolving strictly from `data` needs a live-captured payload
+// to model the shape. Invitations with an empty shared secret are dropped so a
+// downstream accept can never send an incomplete mutation.
 func decodeInvitations(body []byte, incoming bool) ([]Invitation, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
 	var out []Invitation
+	seen := make(map[string]bool)
 	for _, raw := range idx.ofType("com.linkedin.voyager.relationships.invitation.InvitationView") {
 		var iv struct {
 			Invitation struct {
@@ -112,6 +131,10 @@ func decodeInvitations(body []byte, incoming bool) ([]Invitation, error) {
 		if err := decodeInto(raw, &iv); err != nil {
 			continue
 		}
+		if iv.Invitation.EntityUrn == "" || iv.Invitation.SharedSecret == "" || seen[iv.Invitation.EntityUrn] {
+			continue
+		}
+		seen[iv.Invitation.EntityUrn] = true
 		inv := Invitation{
 			InvitationURN: iv.Invitation.EntityUrn,
 			SharedSecret:  iv.Invitation.SharedSecret,
