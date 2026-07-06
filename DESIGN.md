@@ -200,6 +200,55 @@ is a one-file change. Strategy options (owner to pick):
    they exist (me/connections/messaging/feed) and only fall back to GraphQL for
    search/profile. Smallest GraphQL surface to maintain.
 
+## 3.3 The transport problem: Cloudflare bot management (live-checked 2026-07-06)
+
+This is the single most important constraint for the project, discovered by
+running the real binary against a live account.
+
+**LinkedIn fronts Voyager with Cloudflare bot management that fingerprints the
+TLS handshake.** Go's standard `net/http` TLS ClientHello is detectably not
+Chrome, and LinkedIn responds accordingly:
+
+- **GraphQL endpoints (search, modern profile): blocked immediately.** The
+  request gets a `302` that redirects to the *same URL* while sending
+  `Set-Cookie: li_at=delete me; Expires=1970` — i.e. it wipes the session
+  cookie. A no-cookie-jar client then loops until "too many redirects".
+- **Simple REST endpoints (`/me`): pass at first, then get blocked** once the
+  IP/session has been flagged by repeated non-browser requests.
+- Adding every plausible header (referer, `x-li-track`, `x-li-lang`,
+  `sec-fetch-*`, page-instance) does **not** help — it is not a header problem.
+
+**A Chrome-impersonating TLS stack defeats the bot wall.** Using
+`github.com/bogdanfinn/tls-client` (uTLS, `Chrome_124` profile) the same request
+flips from `302`+session-wipe to a clean app-layer `401` JSON — i.e. it gets
+past Cloudflare to LinkedIn's auth layer. So **lion's HTTP transport must
+impersonate Chrome's TLS fingerprint; stdlib `net/http` is not viable** for the
+protected endpoints.
+
+**Cookies: two are not enough for GraphQL.** `li_at` + `JSESSIONID` are accepted
+by `/me` but GraphQL appears to want the fuller browser cookie set
+(`bcookie`, `bscookie`, `lidc`, `li_gc`, and the Cloudflare `__cf_bm`). So
+`auth login` should import the *entire* linkedin.com cookie jar, not two values.
+
+**Operational caution (learned the hard way):** hammering the API from a
+non-browser client with a session cookie triggers anti-abuse and can invalidate
+the session (observed: a working session went to `401` everywhere, including the
+browser, after ~a dozen rapid probes). lion's own limiter is conservative, but
+*development/verification* must go through the browser for shape discovery and
+touch the real binary sparingly. Do not batch live probes.
+
+### Transport decision (owner to pick)
+
+- **A — uTLS single binary (recommended):** adopt `bogdanfinn/tls-client` as the
+  transport, and change `auth login` to import the full linkedin.com cookie jar
+  (paste a cookie header / cookies.txt / browser-extension export). Keeps the
+  "one binary" vision. Downside: an ongoing arms race with Cloudflare, and real
+  account-flag risk if paced badly.
+- **B — browser-backed transport:** drive Voyager through a real logged-in
+  Chrome (CDP / extension), so requests carry an authentic fingerprint and cookie
+  set. Most robust, sidesteps the arms race — but lion is no longer a standalone
+  binary and needs a browser.
+
 ## 4. Exit codes (stable contract)
 
 | code | meaning                                   |
