@@ -1,23 +1,21 @@
 // Package voyager is a client for LinkedIn's internal "Voyager" API — the same
 // private API the linkedin.com web app uses. It authenticates with browser
-// session cookies (li_at + JSESSIONID) and speaks both the older REST-li
-// endpoints and the newer GraphQL surface.
+// session cookies (li_at + JSESSIONID, and ideally the full cookie jar) and
+// speaks both the older REST-li endpoints and the newer GraphQL surface.
 //
 // This package never imports cobra or writes to stdout; it returns typed
-// domain values so the CLI layer stays thin and the client stays testable with
-// recorded fixtures (transport is injectable).
+// domain values so the CLI layer stays thin. All network I/O goes through the
+// Transport seam (see transport.go), which keeps the client testable with
+// recorded fixtures and lets production impersonate Chrome's TLS fingerprint.
 package voyager
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/jodok/lion/internal/ratelimit"
 )
@@ -52,10 +50,9 @@ var (
 
 // Client talks to Voyager. Construct with New.
 type Client struct {
-	http      *http.Client
+	transport Transport
+	cookies   map[string]string
 	csrf      string
-	liAt      string
-	jsession  string
 	limiter   *ratelimit.Limiter
 	dryRun    bool
 	baseURL   string
@@ -65,10 +62,21 @@ type Client struct {
 // Option configures a Client.
 type Option func(*Client)
 
-// WithTransport injects an http.RoundTripper (used by tests to replay
-// fixtures).
-func WithTransport(rt http.RoundTripper) Option {
-	return func(c *Client) { c.http.Transport = rt }
+// WithTransport injects a Transport (used by tests to replay fixtures, and by
+// the CLI to install the Chrome-impersonating transport).
+func WithTransport(t Transport) Option {
+	return func(c *Client) { c.transport = t }
+}
+
+// WithCookies supplies the full browser cookie jar (beyond li_at + JSESSIONID).
+// GraphQL endpoints want the complete set; merge it in before the default
+// transport is constructed.
+func WithCookies(cookies map[string]string) Option {
+	return func(c *Client) {
+		for k, v := range cookies {
+			c.cookies[k] = v
+		}
+	}
 }
 
 // WithLimiter sets a custom rate limiter.
@@ -86,14 +94,12 @@ func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = u }
 }
 
-// New builds a Client from session cookies. jsessionID is used both as a
-// cookie and (with quotes stripped) as the csrf-token header.
+// New builds a Client from session cookies. jsessionID is used both as a cookie
+// and (with quotes stripped) as the csrf-token header. Pass WithCookies to add
+// the rest of the browser jar.
 func New(liAt, jsessionID string, opts ...Option) *Client {
 	c := &Client{
-		http:      &http.Client{Timeout: 30 * time.Second},
-		csrf:      strings.Trim(jsessionID, `"`),
-		liAt:      liAt,
-		jsession:  jsessionID,
+		cookies:   map[string]string{"li_at": liAt, "JSESSIONID": jsessionID},
 		limiter:   ratelimit.New(ratelimit.DefaultBudgets()),
 		baseURL:   baseURL,
 		userAgent: userAgent,
@@ -101,11 +107,29 @@ func New(liAt, jsessionID string, opts ...Option) *Client {
 	for _, o := range opts {
 		o(c)
 	}
+	// csrf-token is the JSESSIONID with surrounding quotes stripped; recompute
+	// after options in case WithCookies replaced JSESSIONID.
+	c.csrf = strings.Trim(c.cookies["JSESSIONID"], `"`)
+	if c.transport == nil {
+		c.transport = newStdlibTransport(c.cookies)
+	}
 	return c
 }
 
 // DryRun reports whether mutations are suppressed.
 func (c *Client) DryRun() bool { return c.dryRun }
+
+// baseHeaders returns the headers common to every Voyager request. Cookies are
+// added by the transport, not here.
+func (c *Client) baseHeaders() map[string]string {
+	return map[string]string{
+		"Csrf-Token":                c.csrf,
+		"X-RestLi-Protocol-Version": restliVer,
+		"X-Li-Lang":                 "en_US",
+		"Accept":                    acceptType,
+		"User-Agent":                c.userAgent,
+	}
+}
 
 // get performs a rate-limited GET and returns the response body.
 func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte, error) {
@@ -116,14 +140,7 @@ func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	return c.do(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return nil, err
-		}
-		c.setHeaders(req)
-		return req, nil
-	})
+	return c.do(ctx, &Request{Method: "GET", URL: u, Headers: c.baseHeaders()})
 }
 
 // getRawQuery performs a rate-limited GET where rawQuery is used verbatim as the
@@ -137,14 +154,7 @@ func (c *Client) getRawQuery(ctx context.Context, path, rawQuery string) ([]byte
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
-	return c.do(func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return nil, err
-		}
-		c.setHeaders(req)
-		return req, nil
-	})
+	return c.do(ctx, &Request{Method: "GET", URL: u, Headers: c.baseHeaders()})
 }
 
 // post performs a rate-limited POST. class controls pacing. When dryRun is set,
@@ -157,7 +167,6 @@ func (c *Client) post(ctx context.Context, path string, body io.Reader, class ra
 	if err := c.limiter.Wait(ctx, class); err != nil {
 		return nil, err
 	}
-	// Buffer the body once so each retry attempt can send a fresh copy.
 	var buf []byte
 	if body != nil {
 		var err error
@@ -165,72 +174,43 @@ func (c *Client) post(ctx context.Context, path string, body io.Reader, class ra
 			return nil, err
 		}
 	}
-	return c.do(func() (*http.Request, error) {
-		var r io.Reader
-		if buf != nil {
-			r = bytes.NewReader(buf)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, r)
-		if err != nil {
-			return nil, err
-		}
-		c.setHeaders(req)
-		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-		return req, nil
-	})
+	h := c.baseHeaders()
+	h["Content-Type"] = "application/json; charset=UTF-8"
+	return c.do(ctx, &Request{Method: "POST", URL: c.baseURL + path, Headers: h, Body: buf})
 }
 
-func (c *Client) setHeaders(req *http.Request) {
-	req.Header.Set("Csrf-Token", c.csrf)
-	req.Header.Set("X-RestLi-Protocol-Version", restliVer)
-	req.Header.Set("X-Li-Lang", "en_US")
-	req.Header.Set("Accept", acceptType)
-	req.Header.Set("User-Agent", c.userAgent)
-	req.Header.Set("Cookie", fmt.Sprintf("li_at=%s; JSESSIONID=%s", c.liAt, c.jsession))
-}
-
-// do executes a request with one retry on 5xx and maps errors to sentinels.
-// newReq builds a fresh request per attempt so a consumed body is never reused.
-// 429 is surfaced immediately as ErrRateLimited rather than retried.
-func (c *Client) do(newReq func() (*http.Request, error)) ([]byte, error) {
+// do sends a request with one retry on 5xx and maps errors to sentinels. The
+// request Body is a byte slice, so retrying is safe without re-buffering. 429 is
+// surfaced immediately as ErrRateLimited rather than retried.
+func (c *Client) do(ctx context.Context, req *Request) ([]byte, error) {
 	const maxAttempts = 2
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := newReq()
-		if err != nil {
-			return nil, err
-		}
-		resp, err := c.http.Do(req)
+		resp, err := c.transport.Do(ctx, req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			if readErr != nil {
-				return nil, fmt.Errorf("read response body: %w", readErr)
-			}
-			return body, nil
-		case resp.StatusCode == http.StatusUnauthorized:
+			return resp.Body, nil
+		case resp.StatusCode == 401:
 			return nil, ErrUnauthorized
-		case resp.StatusCode == http.StatusForbidden:
+		case resp.StatusCode == 403:
 			// LinkedIn returns 403 for both expired CSRF and checkpoints.
-			if strings.Contains(strings.ToLower(string(body)), "challenge") {
+			if strings.Contains(strings.ToLower(string(resp.Body)), "challenge") {
 				return nil, ErrChallenge
 			}
 			return nil, ErrUnauthorized
-		case resp.StatusCode == http.StatusNotFound:
+		case resp.StatusCode == 404:
 			return nil, ErrNotFound
-		case resp.StatusCode == http.StatusTooManyRequests:
+		case resp.StatusCode == 429:
 			return nil, ErrRateLimited
 		case resp.StatusCode >= 500 && attempt < maxAttempts:
-			lastErr = &APIError{Status: resp.StatusCode, Body: string(body)}
+			lastErr = &APIError{Status: resp.StatusCode, Body: string(resp.Body)}
 			continue
 		default:
-			return nil, &APIError{Status: resp.StatusCode, Body: string(body)}
+			return nil, &APIError{Status: resp.StatusCode, Body: string(resp.Body)}
 		}
 	}
 	return nil, lastErr

@@ -3,41 +3,35 @@ package voyager
 import (
 	"context"
 	"errors"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// fixtureTransport serves recorded Voyager responses based on the request path.
+// fixtureTransport serves recorded Voyager responses based on the request URL.
 // This is the canonical test pattern for lion's Voyager client: no live account
-// is needed, and every resource vertical should mirror it.
+// is needed, and every resource vertical should mirror it. It implements the
+// Transport seam.
 type fixtureTransport struct {
-	// routes maps a path substring to a fixture filename under testdata/fixtures.
+	// routes maps a URL substring to a fixture filename under testdata/fixtures.
 	routes map[string]string
-	// lastReq captures the most recent request for header assertions.
-	lastReq *http.Request
+	// lastReq captures the most recent request for header/URL assertions.
+	lastReq *Request
 }
 
-func (f *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (f *fixtureTransport) Do(_ context.Context, req *Request) (*Response, error) {
 	f.lastReq = req
 	for sub, file := range f.routes {
-		if strings.Contains(req.URL.Path, sub) {
+		if strings.Contains(req.URL, sub) {
 			b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", file))
 			if err != nil {
 				return nil, err
 			}
-			return &http.Response{
-				StatusCode: 200,
-				Body:       io.NopCloser(strings.NewReader(string(b))),
-				Header:     make(http.Header),
-				Request:    req,
-			}, nil
+			return &Response{StatusCode: 200, Body: b}, nil
 		}
 	}
-	return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+	return &Response{StatusCode: 404, Body: []byte("{}")}, nil
 }
 
 func newTestClient(t *testing.T, routes map[string]string) (*Client, *fixtureTransport) {
@@ -61,7 +55,7 @@ func TestMe(t *testing.T) {
 		t.Errorf("public id = %q", me.PublicID)
 	}
 	// The CSRF header must be the JSESSIONID with quotes stripped.
-	if got := ft.lastReq.Header.Get("Csrf-Token"); got != "jsession_test" {
+	if got := ft.lastReq.Headers["Csrf-Token"]; got != "jsession_test" {
 		t.Errorf("csrf-token = %q, want jsession_test", got)
 	}
 }
@@ -91,8 +85,8 @@ func TestSearchPeople(t *testing.T) {
 		t.Errorf("headline/location = %q / %q", res[0].Headline, res[0].Location)
 	}
 	// Keywords with a space must be percent-encoded in the GraphQL variables.
-	if q := ft.lastReq.URL.RawQuery; !strings.Contains(q, "compiler%20engineer") {
-		t.Errorf("expected encoded keywords in query, got %q", q)
+	if !strings.Contains(ft.lastReq.URL, "compiler%20engineer") {
+		t.Errorf("expected encoded keywords in URL, got %q", ft.lastReq.URL)
 	}
 }
 
