@@ -237,17 +237,24 @@ browser, after ~a dozen rapid probes). lion's own limiter is conservative, but
 *development/verification* must go through the browser for shape discovery and
 touch the real binary sparingly. Do not batch live probes.
 
-### Transport decision (owner to pick)
+### Transport decision — RESOLVED: Option A (uTLS single binary)
 
-- **A — uTLS single binary (recommended):** adopt `bogdanfinn/tls-client` as the
-  transport, and change `auth login` to import the full linkedin.com cookie jar
-  (paste a cookie header / cookies.txt / browser-extension export). Keeps the
-  "one binary" vision. Downside: an ongoing arms race with Cloudflare, and real
-  account-flag risk if paced badly.
-- **B — browser-backed transport:** drive Voyager through a real logged-in
-  Chrome (CDP / extension), so requests carry an authentic fingerprint and cookie
-  set. Most robust, sidesteps the arms race — but lion is no longer a standalone
-  binary and needs a browser.
+Chosen 2026-07-06 and implemented. lion's `Transport` seam
+(`internal/voyager/transport.go`) has two impls: a stdlib fallback and
+`chromeTransport` (`internal/voyager/chrome_transport.go`) on
+`bogdanfinn/tls-client` (Chrome profile) which is what `App.Client` wires in.
+`auth login` imports the full linkedin.com cookie jar via `--cookies` (paste the
+`Cookie:` header) or `--cookies-file` (Cookie header line or Netscape
+cookies.txt, filtered to linkedin.com). JSESSIONID is normalized to exactly one
+quote pair at a single boundary (`auth.NormalizeCookies`).
+
+Considered and rejected for now — **B, browser-backed transport** (drive Voyager
+through a real logged-in Chrome via CDP/extension): most robust and sidesteps
+the Cloudflare arms race, but lion would no longer be a standalone binary. Kept
+as the fallback if Cloudflare tightening makes uTLS impractical.
+
+Still to verify live (needs a fresh full-cookie session): that the Chrome
+profile actually beats Cloudflare end-to-end and returns 200 on GraphQL.
 
 ## 4. Exit codes (stable contract)
 
