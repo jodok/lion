@@ -27,6 +27,12 @@ const (
 	// A realistic desktop UA reduces the chance of being flagged.
 	userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
 		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+	// liTrack identifies the client. Voyager's GraphQL gateway requires it even
+	// when simple REST endpoints (e.g. /me) tolerate its absence. clientVersion
+	// tracks a recent voyager-web build; it rarely needs to be exact.
+	liTrack = `{"clientVersion":"1.13.36348","mpVersion":"1.13.36348",` +
+		`"osName":"web","timezoneOffset":1,"deviceFormFactor":"DESKTOP",` +
+		`"mpName":"voyager-web","displayDensity":2,"displayWidth":2560,"displayHeight":1440}`
 )
 
 // APIError describes a non-2xx Voyager response, carrying enough for the CLI
@@ -126,6 +132,7 @@ func (c *Client) baseHeaders() map[string]string {
 		"Csrf-Token":                c.csrf,
 		"X-RestLi-Protocol-Version": restliVer,
 		"X-Li-Lang":                 "en_US",
+		"X-Li-Track":                liTrack,
 		"Accept":                    acceptType,
 		"User-Agent":                c.userAgent,
 	}

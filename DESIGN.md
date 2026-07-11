@@ -253,8 +253,21 @@ through a real logged-in Chrome via CDP/extension): most robust and sidesteps
 the Cloudflare arms race, but lion would no longer be a standalone binary. Kept
 as the fallback if Cloudflare tightening makes uTLS impractical.
 
-Still to verify live (needs a fresh full-cookie session): that the Chrome
-profile actually beats Cloudflare end-to-end and returns 200 on GraphQL.
+**Live result (2026-07-11): Cloudflare bypass CONFIRMED.** With the Chrome-TLS
+transport and the full cookie jar, `lion auth login` validated end-to-end (`/me`
+→ 200, session saved) and, critically, the session is no longer wiped — the old
+stdlib path got a `302` + `Set-Cookie: li_at=delete me`; the Chrome path gets
+clean responses. So Option A works: the TLS bot-wall is defeated.
+
+**Open: GraphQL returns app-level `401`.** `profile search` (GraphQL) returns
+`{"data":{"status":401}}` with a *valid* session (not a bot-block, no wipe).
+`/me` works with identical auth, so this is endpoint-specific. Adding `x-li-track`
+did not resolve it. Leading hypothesis: the pinned `queryId` hash is stale — it
+was captured from an earlier web-app build and these hashes rotate. Resolving it
+needs the *current* queryId captured from a logged-in browser's network tab
+(voyagerSearchDashClusters.*), then updated in `graphql.go`. Alternative
+hypothesis to rule out: the throwaway account became search-restricted after the
+earlier over-probing (verify search still returns 200 in-browser).
 
 ## 4. Exit codes (stable contract)
 
