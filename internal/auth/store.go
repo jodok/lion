@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jodok/lion/internal/config"
@@ -41,9 +42,33 @@ type Credential struct {
 	Cookies map[string]string `json:"cookies,omitempty"`
 }
 
-// normalize keeps Cookies and the legacy LiAt/JSessionID fields in sync.
-// When Cookies is empty (credentials saved before this field existed), it
-// is synthesized from LiAt/JSessionID; otherwise LiAt/JSessionID are
+// NormalizeCookies canonicalizes cookie values in place so they match what
+// LinkedIn expects on the wire. This is the single boundary where cookie
+// values are corrected, regardless of how they were supplied (pasted Cookie
+// header, cookies.txt import, individual flags, or legacy credentials).
+//
+// Currently it only touches JSESSIONID, which LinkedIn wraps in exactly one
+// pair of double quotes on the wire; users paste it with zero, one, or
+// (rarely) doubled quotes, so we strip every surrounding quote and re-wrap
+// in exactly one pair. The csrf-token header is derived from this value by
+// stripping the quotes again (see voyager.Client.New), so this stays
+// consistent. Structured as a switch on cookie name so future per-cookie
+// normalizations slot in.
+func NormalizeCookies(cookies map[string]string) {
+	for name, value := range cookies {
+		switch name {
+		case "JSESSIONID":
+			if value != "" {
+				cookies[name] = `"` + strings.Trim(value, `"`) + `"`
+			}
+		}
+	}
+}
+
+// normalize keeps Cookies and the legacy LiAt/JSessionID fields in sync and
+// canonicalizes the cookie values. When Cookies is empty (credentials saved
+// before this field existed), it is synthesized from LiAt/JSessionID;
+// NormalizeCookies then corrects the values, and the legacy fields are
 // refreshed from Cookies so both views of the same session agree.
 func (c *Credential) normalize() {
 	if len(c.Cookies) == 0 {
@@ -54,8 +79,8 @@ func (c *Credential) normalize() {
 		if c.JSessionID != "" {
 			c.Cookies["JSESSIONID"] = c.JSessionID
 		}
-		return
 	}
+	NormalizeCookies(c.Cookies)
 	if v, ok := c.Cookies["li_at"]; ok {
 		c.LiAt = v
 	}

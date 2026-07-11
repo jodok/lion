@@ -86,44 +86,53 @@ func newAuthLoginCmd() *cobra.Command {
 // resolveLoginCookies builds the cookie map for `auth login` from whichever
 // input source was given, in priority order: --cookies-file, --cookies,
 // then --li-at/--jsessionid (prompting for any still missing unless
-// --no-input is set).
+// --no-input is set). Every path funnels through auth.NormalizeCookies so
+// cookie values (notably JSESSIONID's wire quoting) are corrected in one
+// place, matching what auth.Save persists.
 func resolveLoginCookies(cookiesFlag, cookiesFile, liAt, jsession string, noInput bool) (map[string]string, error) {
+	var cookies map[string]string
 	switch {
 	case cookiesFile != "":
 		b, err := os.ReadFile(cookiesFile)
 		if err != nil {
 			return nil, fmt.Errorf("read cookies file: %w", err)
 		}
-		return parseCookiesFile(string(b)), nil
+		cookies = parseCookiesFile(string(b))
 	case cookiesFlag != "":
-		return parseCookieHeader(cookiesFlag), nil
+		cookies = parseCookieHeader(cookiesFlag)
+	default:
+		if liAt == "" {
+			liAt = promptSecret("li_at cookie: ", noInput)
+		}
+		if jsession == "" {
+			jsession = promptSecret("JSESSIONID cookie: ", noInput)
+		}
+		cookies = map[string]string{}
+		if liAt = strings.TrimSpace(liAt); liAt != "" {
+			cookies["li_at"] = liAt
+		}
+		// JSESSIONID's quoting is fixed up by auth.NormalizeCookies below, so
+		// the user can paste it with or without the surrounding quotes.
+		if jsession = strings.TrimSpace(jsession); jsession != "" {
+			cookies["JSESSIONID"] = jsession
+		}
 	}
-
-	if liAt == "" {
-		liAt = promptSecret("li_at cookie: ", noInput)
-	}
-	if jsession == "" {
-		jsession = promptSecret("JSESSIONID cookie: ", noInput)
-	}
-	liAt = strings.TrimSpace(liAt)
-	// JSESSIONID's cookie value carries literal surrounding quotes on the
-	// wire (transport.go's cookieHeader relies on this); re-wrap after
-	// trimming whatever the user pasted, so --jsessionid works whether or
-	// not they included the quotes themselves.
-	jsession = strings.Trim(strings.TrimSpace(jsession), `"`)
-	cookies := map[string]string{"li_at": liAt}
-	if jsession != "" {
-		cookies["JSESSIONID"] = `"` + jsession + `"`
-	}
+	auth.NormalizeCookies(cookies)
 	return cookies, nil
 }
 
 // parseCookieHeader parses a `Cookie:` header value (e.g. `li_at=..; ` +
-// `JSESSIONID="ajax:..."; bcookie=..; lidc=..`) into a name->value map.
-// Values are kept verbatim, including any quotes — LinkedIn's JSESSIONID
-// cookie is quoted on the wire and the csrf-token header is derived from it
-// by stripping them (see voyager.Client.New).
+// `JSESSIONID="ajax:..."; bcookie=..; lidc=..`) into a name->value map. An
+// optional literal `Cookie:` prefix (as copied straight from DevTools) is
+// stripped first. Values are kept verbatim, including any quotes — the
+// JSESSIONID cookie is quoted on the wire and normalized centrally by
+// auth.NormalizeCookies; the csrf-token header strips the quotes again (see
+// voyager.Client.New).
 func parseCookieHeader(header string) map[string]string {
+	header = strings.TrimSpace(header)
+	if len(header) >= len("cookie:") && strings.EqualFold(header[:len("cookie:")], "cookie:") {
+		header = strings.TrimSpace(header[len("cookie:"):])
+	}
 	cookies := map[string]string{}
 	for _, part := range strings.Split(header, ";") {
 		part = strings.TrimSpace(part)
@@ -174,7 +183,11 @@ func looksLikeNetscapeCookies(data string) bool {
 }
 
 // parseNetscapeCookies parses a Netscape cookies.txt export into a
-// name->value map.
+// name->value map. Only linkedin.com cookies are kept: cookiesToFHTTP later
+// rewrites every cookie's domain to .linkedin.com, so importing a general
+// cookies.txt export unfiltered would disclose other sites' cookies to
+// LinkedIn (and cause name collisions). Records for any other domain are
+// dropped.
 func parseNetscapeCookies(data string) map[string]string {
 	cookies := map[string]string{}
 	for _, line := range strings.Split(data, "\n") {
@@ -185,6 +198,10 @@ func parseNetscapeCookies(data string) map[string]string {
 		}
 		fields := strings.Split(line, "\t")
 		if len(fields) < 7 {
+			continue
+		}
+		host := strings.TrimPrefix(strings.TrimSpace(fields[0]), ".")
+		if host != "linkedin.com" && !strings.HasSuffix(host, ".linkedin.com") {
 			continue
 		}
 		name := strings.TrimSpace(fields[5])

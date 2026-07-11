@@ -51,6 +51,51 @@ func TestNormalizeSynthesizesCookiesFromLegacyFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeCookies(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"unquoted", "ajax:1", `"ajax:1"`},
+		{"already quoted (idempotent)", `"ajax:1"`, `"ajax:1"`},
+		{"doubled quotes", `""ajax:1""`, `"ajax:1"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cookies := map[string]string{"JSESSIONID": tc.in, "li_at": "keep"}
+			NormalizeCookies(cookies)
+			if cookies["JSESSIONID"] != tc.want {
+				t.Errorf("JSESSIONID = %q, want %q", cookies["JSESSIONID"], tc.want)
+			}
+			if cookies["li_at"] != "keep" {
+				t.Errorf("li_at = %q, want it left untouched", cookies["li_at"])
+			}
+		})
+	}
+	// Empty or absent JSESSIONID is left as-is.
+	empty := map[string]string{"JSESSIONID": ""}
+	NormalizeCookies(empty)
+	if empty["JSESSIONID"] != "" {
+		t.Errorf("empty JSESSIONID = %q, want empty", empty["JSESSIONID"])
+	}
+}
+
+// TestNormalizeQuotesLegacyUnquotedJSession covers the migration case Fix 1
+// closed: an old credential whose JSESSIONID was stored WITHOUT the wire
+// quotes must come out wrapped in exactly one pair after normalize(), so
+// GraphQL requests carry the value LinkedIn expects.
+func TestNormalizeQuotesLegacyUnquotedJSession(t *testing.T) {
+	c := &Credential{LiAt: "abc", JSessionID: "ajax:1"}
+	c.normalize()
+	if c.Cookies["JSESSIONID"] != `"ajax:1"` {
+		t.Errorf("Cookies[JSESSIONID] = %q, want quoted", c.Cookies["JSESSIONID"])
+	}
+	if c.JSessionID != `"ajax:1"` {
+		t.Errorf("JSessionID field = %q, want refreshed to quoted value", c.JSessionID)
+	}
+}
+
 // TestLoadSynthesizesCookiesForOldCredentialsFile simulates a
 // credentials.json written before the Cookies field existed (no "cookies"
 // key at all) and checks that loading it populates Cookies from the legacy
