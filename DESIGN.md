@@ -259,7 +259,20 @@ transport and the full cookie jar, `lion auth login` validated end-to-end (`/me`
 stdlib path got a `302` + `Set-Cookie: li_at=delete me`; the Chrome path gets
 clean responses. So Option A works: the TLS bot-wall is defeated.
 
-**Open: GraphQL returns app-level `401`.** `profile search` (GraphQL) returns
+**Root-caused (2026-07-11): stored cookies go stale fast.** The GraphQL `401`
+turned out not to be a code bug: with a *fresh* browser session the exact search
+request (same queryId, same minimal headers, same decoder shape) returns `200`
+in-browser, and a wrong csrf yields `403 "CSRF check failed"` — a different error
+— so csrf and the query are correct. The binary's imported snapshot simply
+decayed: `/me` worked at login and then `401`'d ~15 min later. LinkedIn rotates
+`JSESSIONID`/`li_at`/`lidc` and expires the Cloudflare `__cf_bm`, so a one-shot
+cookie snapshot is short-lived. **Fix (task #19): persist rotated cookies from
+each response's `Set-Cookie` back into the credential store** (the transport jar
+already captures them within a process; lion must write them back so the next
+invocation starts fresh, like a browser). Snapshot import stays the entry point;
+writeback keeps it alive.
+
+Historical note — earlier open `401`: `profile search` (GraphQL) returns
 `{"data":{"status":401}}` with a *valid* session (not a bot-block, no wipe).
 `/me` works with identical auth, so this is endpoint-specific. Adding `x-li-track`
 did not resolve it. Leading hypothesis: the pinned `queryId` hash is stale — it
