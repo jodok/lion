@@ -62,13 +62,30 @@ func (a *App) Renderer() *output.Renderer {
 }
 
 // Client constructs an authenticated voyager client for the active account,
-// applying dry-run from global flags. It returns ErrAuth-mappable errors.
+// wired to the Chrome-impersonating transport (DESIGN.md §3.3 — stdlib
+// net/http's TLS fingerprint gets blocked by LinkedIn's Cloudflare bot
+// management), and applying dry-run from global flags. It returns
+// ErrAuth-mappable errors.
 func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 	cred, err := auth.Get(a.Cfg.Account)
 	if err != nil {
 		return nil, err
 	}
-	base := []voyager.Option{voyager.WithDryRun(a.Cfg.DryRun)}
+	// cred.Cookies is normalized on load, so this fallback only matters for
+	// callers that build a Credential by hand rather than through auth.Get.
+	cookies := cred.Cookies
+	if len(cookies) == 0 {
+		cookies = map[string]string{"li_at": cred.LiAt, "JSESSIONID": cred.JSessionID}
+	}
+	chromeT, err := voyager.NewChromeTransport(cookies)
+	if err != nil {
+		return nil, err
+	}
+	base := []voyager.Option{
+		voyager.WithCookies(cookies),
+		voyager.WithTransport(chromeT),
+		voyager.WithDryRun(a.Cfg.DryRun),
+	}
 	return voyager.New(cred.LiAt, cred.JSessionID, append(base, opts...)...), nil
 }
 
