@@ -143,12 +143,49 @@ func randomNonce() string {
 	return hex.EncodeToString(b[:])
 }
 
-// sanitizeTSV neutralizes tabs/newlines that would corrupt TSV rows.
+// sanitizeTSV neutralizes tabs/newlines that would corrupt TSV rows, then
+// strips the control characters a terminal acts on rather than prints.
 func sanitizeTSV(s string) string {
 	s = strings.ReplaceAll(s, "\t", " ")
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
-	return s
+	return stripTerminalControls(s)
+}
+
+// stripTerminalControls removes characters a terminal interprets instead of
+// displaying. Everything rendered here is free text written by other LinkedIn
+// users — message bodies, post text, display names — and it lands in the
+// default table and --plain output, so without this a sender can embed
+// ANSI/OSC escapes and make lion's own output lie: repaint or erase lines to
+// hide what was really received, forge the look of another command, or drive
+// the terminal itself (OSC 52 writes the reader's clipboard). --wrap-untrusted
+// does not help here: it marks text as data for a downstream LLM, but the
+// bytes still reach the terminal on the way.
+//
+// JSON output deliberately does not go through this: encoding/json already
+// escapes control runes to \uXXXX, so they arrive inert, and stripping them
+// would corrupt values a consumer needs byte-for-byte.
+//
+// Removed rather than escaped: the goal is that the text can no longer drive
+// the terminal, and rendering a visible \x1b inside someone's name would be
+// noise without adding safety.
+func stripTerminalControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		// C0 controls and DEL — this is where ESC (0x1b) and BEL (0x07) live.
+		case r < 0x20, r == 0x7f:
+			return -1
+		// C1 controls: 0x9b is a single-byte CSI, equivalent to ESC [.
+		case r >= 0x80 && r <= 0x9f:
+			return -1
+		// Bidi overrides and isolates, which reorder what the reader sees
+		// without changing the underlying bytes — the same spoofing problem
+		// wearing a different coat.
+		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // collapse trims a cell to a single line for table display.

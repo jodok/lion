@@ -111,3 +111,38 @@ func TestSearchPeopleRespectsMax(t *testing.T) {
 		t.Fatalf("got %d, want 1", len(res))
 	}
 }
+
+// TestSearchReturnsMessageableURN guards the search-then-message workflow.
+// The decoder used to export trackingUrn (urn:li:member:<numeric>), which is
+// an analytics handle; messaging addresses people by urn:li:fs_miniProfile:…,
+// so `message send` was being handed a recipient it could not address.
+func TestSearchReturnsMessageableURN(t *testing.T) {
+	body, err := os.ReadFile("../../testdata/fixtures/people_search.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodePeopleSearch(body, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("no results decoded")
+	}
+	for _, r := range got {
+		if strings.HasPrefix(r.URN, "urn:li:member:") {
+			t.Errorf("%s: URN = %q, want a fs_miniProfile URN, not the tracking handle", r.PublicID, r.URN)
+		}
+		if !strings.HasPrefix(r.URN, "urn:li:fs_miniProfile:") {
+			t.Errorf("%s: URN = %q, want urn:li:fs_miniProfile:…", r.PublicID, r.URN)
+		}
+	}
+}
+
+// TestProfileURNFromNavURLMissingParam pins the deliberate empty return: a
+// guessed URN would be sent to LinkedIn as though it were real, whereas an
+// empty one fails loudly at the next step.
+func TestProfileURNFromNavURLMissingParam(t *testing.T) {
+	if got := profileURNFromNavURL("https://www.linkedin.com/in/grace-hopper"); got != "" {
+		t.Errorf("got %q, want \"\" when miniProfileUrn is absent", got)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -128,7 +129,7 @@ func decodePeopleSearch(body []byte, max int) ([]SearchResult, error) {
 		seen[pub] = true
 		out = append(out, SearchResult{
 			PublicID: pub,
-			URN:      e.TrackingUrn,
+			URN:      profileURNFromNavURL(e.NavigationURL),
 			Name:     strings.TrimSpace(e.Title.Text),
 			Headline: strings.TrimSpace(e.PrimarySub.Text),
 			Location: strings.TrimSpace(e.SecondarySub.Text),
@@ -158,4 +159,28 @@ func publicIDFromNavURL(nav string) string {
 		slug = slug[:j]
 	}
 	return slug
+}
+
+// profileURNFromNavURL extracts the miniProfile URN a search result carries in
+// its navigationUrl query string (miniProfileUrn=urn%3Ali%3Afs_miniProfile%3A…).
+//
+// This, not trackingUrn, is the identifier the rest of lion needs. trackingUrn
+// is a urn:li:member:<numeric> analytics handle, while messaging addresses
+// people by urn:li:fs_miniProfile:<opaque>. Exporting the tracking one made the
+// obvious search-then-message workflow hand SendMessageToProfile a recipient it
+// cannot address.
+//
+// Returns "" when the parameter is missing rather than synthesizing a URN from
+// another field: an empty URN fails loudly at the next step, whereas a guessed
+// one would be sent to LinkedIn as though it were real.
+func profileURNFromNavURL(nav string) string {
+	u, err := url.Parse(nav)
+	if err != nil {
+		return ""
+	}
+	urn := u.Query().Get("miniProfileUrn")
+	if !strings.HasPrefix(urn, "urn:li:") {
+		return ""
+	}
+	return urn
 }

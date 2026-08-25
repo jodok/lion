@@ -106,3 +106,59 @@ func TestEmitJSONWrapsWhenRequested(t *testing.T) {
 		t.Errorf("JSON output did not preserve the untrusted wrapper: %q", got["text"])
 	}
 }
+
+// TestTerminalControlsStrippedFromTableAndPlain covers a spoofing vector: all
+// of this text is written by other LinkedIn users and lands in a terminal, so
+// ANSI/OSC escapes in a name or message body could repaint the screen, hide
+// what was really received, or (via OSC 52) write the reader's clipboard.
+func TestTerminalControlsStrippedFromTableAndPlain(t *testing.T) {
+	hostile := "Eve\x1b[2K\rInvoice paid\x07 \x1b]52;c;aGF4\x07"
+	for _, tc := range []struct {
+		name   string
+		format Format
+	}{
+		{"table", FormatTable},
+		{"plain", FormatPlain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			r := New(&buf, tc.format, false)
+			if err := r.Emit(&Table{Cols: []string{"FROM"}, Rows: [][]string{{hostile}}}); err != nil {
+				t.Fatal(err)
+			}
+			out := buf.String()
+			for _, bad := range []string{"\x1b", "\x07", "\r"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("output still contains %q: %q", bad, out)
+				}
+			}
+			// The readable part must survive — this strips control bytes, it
+			// does not censor the message.
+			if !strings.Contains(out, "Eve") || !strings.Contains(out, "Invoice paid") {
+				t.Errorf("printable text was lost: %q", out)
+			}
+		})
+	}
+}
+
+// TestJSONKeepsValuesVerbatim pins the deliberate exception: encoding/json
+// escapes control runes to \uXXXX, so they arrive inert and the value stays
+// byte-for-byte recoverable for a consumer.
+func TestJSONKeepsValuesVerbatim(t *testing.T) {
+	var buf bytes.Buffer
+	r := New(&buf, FormatJSON, false)
+	if err := r.Emit(map[string]string{"from": "Eve\x1b[2K"}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("raw ESC byte reached JSON output: %q", out)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["from"] != "Eve\x1b[2K" {
+		t.Errorf("JSON value = %q, want it preserved verbatim for consumers", got["from"])
+	}
+}
