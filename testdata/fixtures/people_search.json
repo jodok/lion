@@ -1,0 +1,33 @@
+{
+  "data": {
+    "data": {
+      "searchDashClustersByAll": {
+        "$type": "com.linkedin.voyager.dash.search.SearchClusterCollection"
+      }
+    }
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.dash.search.EntityResultViewModel",
+      "entityUrn": "urn:li:fsd_entityResultViewModel:(urn:li:fsd_profile:ACoAAA1,SEARCH_SRP,DEFAULT)",
+      "trackingUrn": "urn:li:member:111111",
+      "navigationUrl": "https://www.linkedin.com/in/grace-hopper?miniProfileUrn=urn%3Ali%3Afs_miniProfile%3AACoAAA1",
+      "title": { "text": "Grace Hopper" },
+      "primarySubtitle": { "text": "Rear Admiral · Compiler pioneer" },
+      "secondarySubtitle": { "text": "Arlington, Virginia" }
+    },
+    {
+      "$type": "com.linkedin.voyager.dash.search.EntityResultViewModel",
+      "entityUrn": "urn:li:fsd_entityResultViewModel:(urn:li:fsd_profile:ACoAAA2,SEARCH_SRP,DEFAULT)",
+      "trackingUrn": "urn:li:member:222222",
+      "navigationUrl": "https://www.linkedin.com/in/katherine-johnson?miniProfileUrn=urn%3Ali%3Afs_miniProfile%3AACoAAA2",
+      "title": { "text": "Katherine Johnson" },
+      "primarySubtitle": { "text": "Mathematician · NASA" },
+      "secondarySubtitle": { "text": "Hampton, Virginia" }
+    },
+    {
+      "$type": "com.linkedin.voyager.dash.premium.PremiumUpsellSlotContent",
+      "entityUrn": "urn:li:fsd_premiumUpsellSlotContent:SEARCH"
+    }
+  ]
+}

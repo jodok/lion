@@ -1,0 +1,66 @@
+{
+  "data": {
+    "elements": [
+      {
+        "entityUrn": "urn:li:fs_conversation:2-YWJjMTIz",
+        "unread": true,
+        "lastActivityAt": 1717000000000,
+        "participants": [
+          {
+            "miniProfile": {
+              "entityUrn": "urn:li:fs_miniProfile:ACoAAA1"
+            }
+          }
+        ],
+        "events": [
+          {
+            "eventContent": {
+              "com.linkedin.voyager.messaging.event.MessageEvent": {
+                "body": "Are you free for a quick call this week?"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "entityUrn": "urn:li:fs_conversation:2-ZGVmNDU2",
+        "unread": false,
+        "lastActivityAt": 1716900000000,
+        "participants": [
+          {
+            "miniProfile": {
+              "entityUrn": "urn:li:fs_miniProfile:ACoAAA2"
+            }
+          }
+        ],
+        "events": [
+          {
+            "eventContent": {
+              "com.linkedin.voyager.messaging.event.MessageEvent": {
+                "body": "Thanks for connecting!"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA1",
+      "publicIdentifier": "grace-hopper",
+      "firstName": "Grace",
+      "lastName": "Hopper",
+      "occupation": "Rear Admiral · Compiler pioneer"
+    },
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA2",
+      "publicIdentifier": "katherine-johnson",
+      "firstName": "Katherine",
+      "lastName": "Johnson",
+      "occupation": "Mathematician · NASA"
+    }
+  ]
+}

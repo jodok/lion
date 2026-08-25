@@ -1,0 +1,7 @@
+/bin/
+*.out
+*.test
+.DS_Store
+
+# local agent worktrees
+.claude/

@@ -1,0 +1,61 @@
+{
+  "data": {
+    "metadata": {},
+    "elements": [
+      {
+        "*invitationView": "urn:li:fs_invitationView:2222"
+      },
+      {
+        "*invitationView": "urn:li:fs_invitationView:1111"
+      }
+    ]
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA3",
+      "publicIdentifier": "alan-turing",
+      "firstName": "Alan",
+      "lastName": "Turing",
+      "occupation": "Mathematician · Codebreaker"
+    },
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA2",
+      "publicIdentifier": "katherine-johnson",
+      "firstName": "Katherine",
+      "lastName": "Johnson",
+      "occupation": "Mathematician · NASA"
+    },
+    {
+      "$type": "com.linkedin.voyager.relationships.invitation.InvitationView",
+      "entityUrn": "urn:li:fs_invitationView:1111",
+      "fromMember": "urn:li:fs_miniProfile:ACoAAA3",
+      "invitation": {
+        "entityUrn": "urn:li:fs_invitation:1111",
+        "sharedSecret": "shared-secret-1111",
+        "message": "I'd like to add you to my professional network."
+      }
+    },
+    {
+      "$type": "com.linkedin.voyager.relationships.invitation.InvitationView",
+      "entityUrn": "urn:li:fs_invitationView:2222",
+      "fromMember": "urn:li:fs_miniProfile:ACoAAA2",
+      "invitation": {
+        "entityUrn": "urn:li:fs_invitation:2222",
+        "sharedSecret": "shared-secret-2222",
+        "message": "Let's connect!"
+      }
+    },
+    {
+      "$type": "com.linkedin.voyager.relationships.invitation.InvitationView",
+      "entityUrn": "urn:li:fs_invitationView:9999",
+      "fromMember": "urn:li:fs_miniProfile:ACoAAA3",
+      "invitation": {
+        "entityUrn": "urn:li:fs_invitation:9999",
+        "sharedSecret": "aux-secret-not-pending",
+        "message": "Not part of the pending set — must not be returned."
+      }
+    }
+  ]
+}
