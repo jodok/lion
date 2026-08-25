@@ -21,9 +21,15 @@ func newProfileCmd() *cobra.Command {
 
 func newProfileViewCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "view [id|me]",
-		Short: "View a profile by public id (default: your own)",
-		Args:  usageArgs(cobra.MaximumNArgs(1)),
+		Use:   "view [me]",
+		Short: "View your own profile",
+		Long: "View your own profile.\n\nViewing someone else's profile by " +
+			"public id is not supported in this build: LinkedIn retired the " +
+			"REST profileView endpoint (HTTP 410) and its modern replacement " +
+			"is a set of GraphQL cards this version doesn't model yet — see " +
+			"DESIGN.md §3.2. Use `lion profile search` to look people up in " +
+			"the meantime.",
+		Args: usageArgs(cobra.MaximumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()

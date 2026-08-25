@@ -12,27 +12,50 @@ to LinkedIn.
 
 ## Status
 
-Early development. See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
+v1. See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 
 Working today:
 
-- `lion auth login|status|logout` — store & validate a session cookie
-- `lion profile view [id|me]` — view a profile
-- `lion profile search <query>` — people search
+- `lion auth login|status|logout` — import, validate, and remove a session
+- `lion profile view me` · `lion profile search <query>`
+- `lion connection list|invite|remove`
+- `lion message list|read|send`
+- `lion feed read|post|comment|react|engagement`
+- `lion schema --json` · `lion version`
 
-In progress (delegated verticals): connections, messaging, feed/posting.
-Later: MCP server, `schema --json`, and a Phase-2 CRM + campaign engine
-(inspired by LinkedHelper and Lemlist).
+**Known v1 limitations.** These fail with a clear error rather than pretending:
+
+- **Viewing someone else's profile by public id.** LinkedIn retired the REST
+  `profileView` endpoint (HTTP 410) and its modern replacement is a set of
+  GraphQL cards lion doesn't model yet. `profile view me` and
+  `profile search` work; use those.
+- **`connection requests` / `connection accept`.** Incoming invitations moved
+  to a GraphQL surface whose query id hasn't been captured yet.
+- **`message send` takes a conversation id or a profile URN**, not a bare
+  person id — resolving one needs the unsupported profile-by-id lookup above.
+- **Sessions go stale quickly.** LinkedIn rotates `JSESSIONID`/`li_at`/`lidc`
+  and expires the Cloudflare `__cf_bm` cookie, and lion does not yet write
+  rotated cookies back, so a stored session can stop working within minutes of
+  a successful login. Re-run `lion auth login` when that happens. Fixing this
+  is the next change.
+- **Unix only** (macOS, Linux). The action-budget lock uses `flock`.
+
+Later: MCP server, and a Phase-2 CRM + campaign engine (inspired by
+LinkedHelper and Lemlist).
 
 ## Quick start
 
 ```sh
 make build
-# Get li_at + JSESSIONID from a logged-in browser's cookies for linkedin.com
-./bin/lion auth login
+# Copy the whole Cookie: header for linkedin.com from a logged-in browser —
+# li_at + JSESSIONID alone are not enough for the GraphQL endpoints.
+./bin/lion auth login --cookies-stdin
 ./bin/lion profile view me --json
 ./bin/lion profile search "compiler engineer" --max 10 --plain
 ```
+
+Every mutation is previewed with `--dry-run` and requires `--yes` to actually
+send. `--no-input` suppresses prompts but does **not** authorize a write.
 
 ## Design principles
 
