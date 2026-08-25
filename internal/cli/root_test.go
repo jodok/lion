@@ -266,3 +266,32 @@ func withStdin(t *testing.T, content string) {
 		r.Close()
 	})
 }
+
+// TestIsTerminalRejectsDevNull pins the /dev/null case that os.ModeCharDevice
+// got wrong: cron jobs and daemons run with stdin on /dev/null, which IS a
+// character device. Treating it as a TTY meant the prompt went to a stream
+// nobody reads, the scanner hit EOF, and the command exited 0 having mutated
+// nothing while automation recorded a success.
+func TestIsTerminalRejectsDevNull(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Error("isTerminal(/dev/null) = true, want false: a cron stdin is not a terminal")
+	}
+}
+
+// TestIsTerminalRejectsPipe covers the ordinary redirected-stdin case.
+func TestIsTerminalRejectsPipe(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if isTerminal(r) {
+		t.Error("isTerminal(pipe) = true, want false")
+	}
+}

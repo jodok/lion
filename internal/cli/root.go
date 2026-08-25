@@ -16,6 +16,7 @@ import (
 	"github.com/jodok/lion/internal/ratelimit"
 	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // Exit codes — stable contract, documented in DESIGN.md and `lion schema`.
@@ -102,9 +103,9 @@ func (a *App) requireWritable() error {
 
 // confirm prompts on stderr before a live (non-dry-run, non-readonly)
 // mutation and reads the answer from stdin (DESIGN.md §2.2 — writes need
-// confirmation). It returns proceed=true only when the answer is
-// "y"/"yes", or when --yes/--no-input is set (which skip the prompt
-// entirely).
+// confirmation). It returns proceed=true only when the answer is "y"/"yes",
+// or when --yes is set. --yes is the only flag that authorizes a write:
+// --no-input suppresses the prompt but does not answer it (see below).
 //
 // Declining the prompt is deliberately not an error: callers should print
 // their own "aborted" note to stderr and return nil so the command exits 0
@@ -141,23 +142,26 @@ func (a *App) confirm(prompt string) (bool, error) {
 	return ans == "y" || ans == "yes", nil
 }
 
-// isInteractive reports whether stdin looks like an interactive terminal
-// rather than a pipe or redirected file, i.e. whether it's meaningful to
+// isInteractive reports whether stdin is an interactive terminal rather than
+// a pipe, a redirected file, or /dev/null, i.e. whether it's meaningful to
 // prompt on it. It's a package variable (rather than a plain function call)
-// so tests can simulate a TTY without needing a real one — see
-// isTerminal below for the real, stdlib-only heuristic used in production.
+// so tests can simulate a TTY without needing a real one — see isTerminal
+// below for the check used in production.
 var isInteractive = func() bool { return isTerminal(os.Stdin) }
 
-// isTerminal reports whether f looks like an interactive terminal rather
-// than a pipe or redirected file. This is a stdlib-only heuristic (no
-// golang.org/x/term dependency): a character device is the standard signal
-// for "someone is typing here interactively".
+// isTerminal reports whether f is a real interactive terminal.
+//
+// This asks the OS (via an ioctl) rather than checking os.ModeCharDevice,
+// which was the earlier stdlib-only heuristic and was wrong in the case that
+// matters most: /dev/null is a character device, so cron jobs and daemons —
+// which conventionally run with stdin on /dev/null — looked interactive. The
+// prompt was then written to a stream nobody reads, the scanner hit EOF
+// immediately, and the mutation was silently skipped while the command exited
+// 0, so automation recorded an invite or message as sent that never was.
+// Failing that check now routes those callers to the "pass --yes" usage error
+// instead.
 func isTerminal(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // Execute is the entrypoint called by main. It builds the command tree, wires
@@ -212,7 +216,7 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 	pf.BoolVar(&cfg.ReadOnly, "readonly", false, "block all mutating actions")
 	pf.BoolVar(&cfg.DryRun, "dry-run", false, "print intended mutations without sending")
 	pf.BoolVar(&cfg.Yes, "yes", false, "assume yes for write confirmations")
-	pf.BoolVar(&cfg.NoInput, "no-input", false, "never prompt (for CI); also skips write confirmations like --yes")
+	pf.BoolVar(&cfg.NoInput, "no-input", false, "never prompt (for CI); writes still require --yes")
 	pf.BoolVar(&cfg.WrapUntrusted, "wrap-untrusted", false, "wrap LinkedIn free text as untrusted data")
 	pf.BoolVar(&cfg.Verbose, "verbose", false, "verbose logging on stderr")
 	pf.IntVar(&cfg.Max, "max", 0, "cap number of results (0 = command default)")
