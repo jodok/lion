@@ -6,7 +6,15 @@
         "count": 40,
         "total": 2
       }
-    }
+    },
+    "elements": [
+      {
+        "*miniProfile": "urn:li:fs_miniProfile:ACoAAA2"
+      },
+      {
+        "*miniProfile": "urn:li:fs_miniProfile:ACoAAA1"
+      }
+    ]
   },
   "included": [
     {
@@ -24,6 +32,14 @@
       "firstName": "Katherine",
       "lastName": "Johnson",
       "occupation": "Mathematician · NASA"
+    },
+    {
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAA9",
+      "publicIdentifier": "aux-cached-profile",
+      "firstName": "Aux",
+      "lastName": "Cached",
+      "occupation": "Not a connection result — must not be returned"
     }
   ]
 }

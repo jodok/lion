@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -47,10 +48,10 @@ func TestDailyBudgetWindowExpiry(t *testing.T) {
 	if err := l.Wait(ctx, Write); err != ErrDailyBudget {
 		t.Fatalf("got %v, want ErrDailyBudget", err)
 	}
-	// Advance beyond the 24h window; the old action should be pruned.
+	// Advance past midnight; the daily counter should reset.
 	l.now = func() time.Time { return base.Add(25 * time.Hour) }
 	if err := l.Wait(ctx, Write); err != nil {
-		t.Fatalf("after window: %v", err)
+		t.Fatalf("after day rollover: %v", err)
 	}
 }
 
@@ -76,5 +77,74 @@ func TestUnknownClassIsNoop(t *testing.T) {
 	l := newTestLimiter(map[Class]Budget{})
 	if err := l.Wait(context.Background(), Invite); err != nil {
 		t.Fatalf("unknown class should be no-op, got %v", err)
+	}
+}
+
+// F14(a): the very first action of a class must still incur the configured
+// jitter/min-gap. Before the fix, a class with no prior nextAt computed a
+// zero wait, so a freshly started process could fire its first mutating
+// action instantly.
+func TestFirstActionAppliesGap(t *testing.T) {
+	l := New(map[Class]Budget{
+		Write: {MinGap: 3 * time.Second, MaxGap: 3 * time.Second, DailyMax: 0},
+	})
+	var slept time.Duration
+	l.sleep = func(_ context.Context, d time.Duration) error {
+		slept = d
+		return nil
+	}
+	if err := l.Wait(context.Background(), Write); err != nil {
+		t.Fatal(err)
+	}
+	if slept < 3*time.Second {
+		t.Errorf("first action slept %v, want >= 3s (MinGap)", slept)
+	}
+}
+
+// F14(b): a second Limiter constructed over the same state file (simulating
+// a second `lion invite` process spawned by a shell loop) must see the
+// first process's consumed daily budget rather than starting fresh.
+func TestPersistedBudgetSurvivesNewLimiter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ratelimit.json")
+	budgets := map[Class]Budget{Invite: {MinGap: 0, MaxGap: 0, DailyMax: 1}}
+
+	l1 := NewPersistent(budgets, path)
+	l1.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l1.Wait(context.Background(), Invite); err != nil {
+		t.Fatalf("first process: %v", err)
+	}
+
+	// A fresh Limiter over the same path stands in for a second process.
+	l2 := NewPersistent(budgets, path)
+	l2.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l2.Wait(context.Background(), Invite); err != ErrDailyBudget {
+		t.Fatalf("second process: got %v, want ErrDailyBudget (budget should carry over)", err)
+	}
+}
+
+// F14(b): a persisted budget resets when the stored date is no longer
+// today, mirroring TestDailyBudgetWindowExpiry but across the process
+// boundary a state file introduces.
+func TestPersistedBudgetResetsOnDayRollover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ratelimit.json")
+	budgets := map[Class]Budget{Invite: {MinGap: 0, MaxGap: 0, DailyMax: 1}}
+	day1 := time.Date(2026, 8, 24, 23, 0, 0, 0, time.UTC)
+	day2 := day1.Add(2 * time.Hour) // 2026-08-25 01:00 UTC
+
+	l1 := NewPersistent(budgets, path)
+	l1.now = func() time.Time { return day1 }
+	l1.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l1.Wait(context.Background(), Invite); err != nil {
+		t.Fatalf("day 1: %v", err)
+	}
+	if err := l1.Wait(context.Background(), Invite); err != ErrDailyBudget {
+		t.Fatalf("day 1, second invite: got %v, want ErrDailyBudget", err)
+	}
+
+	l2 := NewPersistent(budgets, path)
+	l2.now = func() time.Time { return day2 }
+	l2.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l2.Wait(context.Background(), Invite); err != nil {
+		t.Fatalf("day 2: budget should have reset across the rollover, got %v", err)
 	}
 }

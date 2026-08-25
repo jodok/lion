@@ -180,7 +180,7 @@ LinkedIn has moved key reads to GraphQL:
 | people search | ~~`/search/blended`~~ → `GET /graphql` clusters | ✅ 200      | legacy blended is **404**; use `voyagerSearchDashClusters`, decode `EntityResultViewModel` (fixed) |
 | profile by id | ~~`/identity/profiles/{id}/profileView`~~       | ❌ 410 gone | modern profile is decomposed GraphQL cards keyed by member id; not yet modeled |
 | connections   | `GET /relationships/connections`                | ✅ 200      | results in `data.elements`; decoder should follow refs (documented) |
-| invitations   | `/relationships/invitationViews`                | ❌ 400      | needs the GraphQL invitations surface; endpoint TBD |
+| invitations   | `/relationships/invitationViews`                | ❌ 400      | needs the GraphQL invitations surface; endpoint TBD. v1 returns a clean typed "not yet supported" error (wraps `ErrNotFound`) instead of hitting this endpoint |
 | messaging     | `GET /messaging/conversations`                  | ✅ 200      | results in `data.elements` |
 | feed          | `GET /feed/updatesV2?q=chronFeed`               | ✅ 200      | results in `data.elements` |
 

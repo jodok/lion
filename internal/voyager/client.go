@@ -106,7 +106,7 @@ func WithBaseURL(u string) Option {
 func New(liAt, jsessionID string, opts ...Option) *Client {
 	c := &Client{
 		cookies:   map[string]string{"li_at": liAt, "JSESSIONID": jsessionID},
-		limiter:   ratelimit.New(ratelimit.DefaultBudgets()),
+		limiter:   ratelimit.NewDefault(ratelimit.DefaultBudgets()),
 		baseURL:   baseURL,
 		userAgent: userAgent,
 	}
@@ -186,11 +186,21 @@ func (c *Client) post(ctx context.Context, path string, body io.Reader, class ra
 	return c.do(ctx, &Request{Method: "POST", URL: c.baseURL + path, Headers: h, Body: buf})
 }
 
-// do sends a request with one retry on 5xx and maps errors to sentinels. The
-// request Body is a byte slice, so retrying is safe without re-buffering. 429 is
-// surfaced immediately as ErrRateLimited rather than retried.
+// do sends a request and maps errors to sentinels. The request Body is a
+// byte slice, so retrying (when it happens) is safe without re-buffering.
+// 429 is surfaced immediately as ErrRateLimited rather than retried.
+//
+// Only GET is retried on transport error / 5xx. GET is idempotent, so a
+// retry after a dropped connection or a flaky 500 is safe. POST is not:
+// retrying a mutation whose request reached LinkedIn but whose response
+// didn't reach us could duplicate a sent message, invite, comment, or post.
+// A POST therefore gets exactly one attempt; the caller sees the error and
+// decides whether to retry (with its own confirmation, if appropriate).
 func (c *Client) do(ctx context.Context, req *Request) ([]byte, error) {
-	const maxAttempts = 2
+	maxAttempts := 1
+	if req.Method == "GET" {
+		maxAttempts = 2
+	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		resp, err := c.transport.Do(ctx, req)
@@ -198,14 +208,19 @@ func (c *Client) do(ctx context.Context, req *Request) ([]byte, error) {
 			lastErr = err
 			continue
 		}
+		if sentinel := classifyRedirect(resp); sentinel != nil {
+			return nil, sentinel
+		}
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			return resp.Body, nil
 		case resp.StatusCode == 401:
 			return nil, ErrUnauthorized
 		case resp.StatusCode == 403:
-			// LinkedIn returns 403 for both expired CSRF and checkpoints.
-			if strings.Contains(strings.ToLower(string(resp.Body)), "challenge") {
+			// LinkedIn returns 403 for expired CSRF, checkpoints, and
+			// challenges; DESIGN.md §4 exit code 7 covers both spellings.
+			body := strings.ToLower(string(resp.Body))
+			if strings.Contains(body, "challenge") || strings.Contains(body, "checkpoint") {
 				return nil, ErrChallenge
 			}
 			return nil, ErrUnauthorized
@@ -221,6 +236,39 @@ func (c *Client) do(ctx context.Context, req *Request) ([]byte, error) {
 		}
 	}
 	return nil, lastErr
+}
+
+// classifyRedirect inspects a response's final URL and Set-Cookie headers
+// for the two clear signals a session-expired redirect leaves behind:
+// landing on a login/checkpoint page, or LinkedIn deleting li_at outright.
+// Both Transport implementations follow redirects (see transport.go,
+// chrome_transport.go), so a session that expired mid-request comes back as
+// a plain 200 serving login/checkpoint HTML instead of a 401/403 — without
+// this check, that HTML fails JSON decoding downstream and surfaces as a
+// generic error (exit 1) instead of auth (3) / challenge (7). Deliberately
+// conservative: only these exact signals reclassify a response; anything
+// else falls through to normal status-code handling.
+func classifyRedirect(resp *Response) error {
+	if resp == nil {
+		return nil
+	}
+	final := strings.ToLower(resp.FinalURL)
+	switch {
+	case strings.Contains(final, "/checkpoint/"):
+		return ErrChallenge
+	case strings.Contains(final, "/uas/login"), strings.Contains(final, "/authwall"):
+		return ErrUnauthorized
+	case final != "" && !strings.Contains(final, "/voyager/api/"):
+		// Redirected clean off the Voyager API surface entirely (e.g. to a
+		// plain www.linkedin.com page) — not a Voyager JSON response.
+		return ErrUnauthorized
+	}
+	for _, v := range resp.Headers.Values("Set-Cookie") {
+		if strings.Contains(v, "li_at=delete") {
+			return ErrUnauthorized
+		}
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {

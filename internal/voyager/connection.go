@@ -35,23 +35,46 @@ func (c *Client) Connections(ctx context.Context, max int) ([]Connection, error)
 	return decodeConnections(body, max)
 }
 
-// decodeConnections flattens the normalized connections payload, keeping the
-// MiniProfile entities that represent each connection.
+// connectionsEnvelope captures the ordered element references from a
+// connections list response. Each element carries a "*miniProfile" URN
+// reference — Voyager's convention for a not-yet-resolved reference field
+// (the same convention /me uses for its own "*miniProfile", see
+// DESIGN.md §3.2) — rather than an inline object; the actual MiniProfile
+// lives in included[] and is resolved via the entity index.
+type connectionsEnvelope struct {
+	Data struct {
+		Elements []struct {
+			MiniProfileRef string `json:"*miniProfile"`
+		} `json:"elements"`
+	} `json:"data"`
+}
+
+// decodeConnections resolves the connections list's ordered `data.elements`
+// references against the `included[]` entity index, returning connections in
+// the server's own order (most-recently-added first per the sortType this
+// package requests) and capped at max.
 //
-// NOTE (known limitation, flagged in review): like people-search, this scans
-// every MiniProfile in the `included` cache rather than following the ordered
-// connection result references under `data`. That can surface unrelated cached
-// profiles and lose server ordering (so `max` caps arbitrary order). Resolving
-// the `data` result URNs needs a live-captured payload to model the shape — do
-// it alongside endpoint verification. For now we de-duplicate by URN.
+// Earlier versions of this decoder scanned every MiniProfile in `included[]`
+// instead of following `data.elements`, which could surface unrelated cached
+// profiles (anything else the response happened to embed) and lost the
+// server's ordering, making `max` cap an arbitrary subset. Following the
+// ordered references fixes both.
 func decodeConnections(body []byte, max int) ([]Connection, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
+	var env connectionsEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("decode connections: %w", err)
+	}
 	var out []Connection
 	seen := make(map[string]bool)
-	for _, raw := range idx.ofType("com.linkedin.voyager.identity.shared.MiniProfile") {
+	for _, el := range env.Data.Elements {
+		raw, ok := idx.get(el.MiniProfileRef)
+		if !ok {
+			continue
+		}
 		var mp struct {
 			PublicIdentifier string `json:"publicIdentifier"`
 			EntityUrn        string `json:"entityUrn"`
@@ -83,43 +106,56 @@ func decodeConnections(body []byte, max int) ([]Connection, error) {
 // received invites (invitations sent to the authenticated member); outgoing
 // invites are not yet supported by this endpoint shape.
 //
-// NOTE: /relationships/invitationViews is the legacy REST-li surface for
-// invitations; LinkedIn has been migrating pieces of this to GraphQL
-// (voyagerRelationshipsDashInvitations). Verify against a live session and
-// adjust if the response shape or path has moved.
-func (c *Client) Invitations(ctx context.Context, incoming bool) ([]Invitation, error) {
-	q := url.Values{}
-	if incoming {
-		q.Set("q", "invitationType")
-		q.Set("invitationType", "CONNECTION")
-	}
-	body, err := c.get(ctx, "/relationships/invitationViews", q)
-	if err != nil {
-		return nil, err
-	}
-	return decodeInvitations(body, incoming)
+// Verified against the live API (2026-07-06): /relationships/invitationViews
+// returns HTTP 400 (see DESIGN.md §3.2) — the REST-li surface is gone and
+// connection requests now live behind a GraphQL surface whose queryId has
+// not been captured from a live browser session. Rather than send a request
+// that is known to always fail, this returns a clear, typed error so
+// callers fail honestly instead of surfacing a generic 400 API error.
+// decodeInvitations is kept (and still exercised directly by tests) so the
+// ordered-decode fix is ready to wire up once that GraphQL surface is
+// modeled.
+func (c *Client) Invitations(_ context.Context, _ bool) ([]Invitation, error) {
+	return nil, fmt.Errorf("connection requests/accept require LinkedIn's GraphQL invitations surface, not yet supported in this build: %w", ErrNotFound)
 }
 
-// decodeInvitations flattens the normalized invitationViews payload. Each
-// invitation view entity carries the invitation URN, shared secret, and a
-// reference to the sending member's MiniProfile.
+// invitationsEnvelope mirrors connectionsEnvelope's pattern: ordered
+// "*invitationView" reference elements resolved against included[].
+type invitationsEnvelope struct {
+	Data struct {
+		Elements []struct {
+			InvitationViewRef string `json:"*invitationView"`
+		} `json:"elements"`
+	} `json:"data"`
+}
+
+// decodeInvitations resolves the invitationViews response's ordered
+// `data.elements` references against the `included[]` entity index. Each
+// resolved invitation view entity carries the invitation URN, shared
+// secret, and a reference to the sending member's MiniProfile.
 //
-// NOTE (known limitation, flagged in review): this scans every InvitationView in
-// the `included` cache instead of resolving the ordered result references under
-// `data`. Because `connection accept --all` acts on this list, surfacing an
-// unrelated cached invitation could accept something outside the pending set.
-// The entities carry `entityUrn`, so we at least de-duplicate and skip ones with
-// no shared secret; resolving strictly from `data` needs a live-captured payload
-// to model the shape. Invitations with an empty shared secret are dropped so a
-// downstream accept can never send an incomplete mutation.
+// Earlier versions of this decoder scanned every InvitationView in
+// `included[]` instead of following `data.elements`. Because `connection
+// accept --all` acts on this list, surfacing an unrelated cached invitation
+// could accept something outside the pending set; following the ordered
+// references fixes that. Invitations with an empty shared secret are still
+// dropped so a downstream accept can never send an incomplete mutation.
 func decodeInvitations(body []byte, incoming bool) ([]Invitation, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
+	var env invitationsEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("decode invitations: %w", err)
+	}
 	var out []Invitation
 	seen := make(map[string]bool)
-	for _, raw := range idx.ofType("com.linkedin.voyager.relationships.invitation.InvitationView") {
+	for _, el := range env.Data.Elements {
+		raw, ok := idx.get(el.InvitationViewRef)
+		if !ok {
+			continue
+		}
 		var iv struct {
 			Invitation struct {
 				EntityUrn    string `json:"entityUrn"`

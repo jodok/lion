@@ -37,10 +37,19 @@ type Request struct {
 }
 
 // Response is a transport-agnostic HTTP response. The body is fully read; the
-// status is enough for the Client to map errors to exit-code sentinels.
+// status is enough for the Client to map most errors to exit-code sentinels.
+// Headers and FinalURL exist for the harder case: a session-expired redirect
+// to a login/checkpoint page, which arrives as a plain 2xx (see
+// client.go's classifyRedirect and DESIGN.md §3.3).
 type Response struct {
 	StatusCode int
 	Body       []byte
+	// Headers are the final response's headers (after following redirects).
+	Headers http.Header
+	// FinalURL is the URL the response actually came from, after any
+	// redirects were followed. It differs from the request URL only when a
+	// redirect occurred.
+	FinalURL string
 }
 
 // cookieHeader renders a cookie map as a single Cookie header value, in a stable
@@ -108,5 +117,32 @@ func (t *stdlibTransport) Do(ctx context.Context, req *Request) (*Response, erro
 	if err != nil {
 		return nil, err
 	}
-	return &Response{StatusCode: resp.StatusCode, Body: b}, nil
+	return &Response{
+		StatusCode: resp.StatusCode,
+		Body:       b,
+		Headers:    cloneHeader(resp.Header),
+		FinalURL:   finalURL(resp.Request, req.URL),
+	}, nil
+}
+
+// cloneHeader copies a response header map so callers never alias the
+// transport's internal state.
+func cloneHeader(h http.Header) http.Header {
+	out := make(http.Header, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
+}
+
+// finalURL returns the URL a response actually came from. net/http (and,
+// per its documented net/http-compatible behavior, tls-client) sets
+// Response.Request to the last request sent, so after following redirects
+// its URL is the final one; fall back to the originally requested URL if
+// that's unavailable.
+func finalURL(lastReq *http.Request, requested string) string {
+	if lastReq != nil && lastReq.URL != nil {
+		return lastReq.URL.String()
+	}
+	return requested
 }
