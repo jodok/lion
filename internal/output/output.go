@@ -131,15 +131,15 @@ func (r *Renderer) Untrusted(s string) string {
 }
 
 // randomNonce returns a fresh 16-hex-digit random token for tagging an
-// Untrusted boundary. Falls back to a fixed marker only in the practically
-// unreachable case crypto/rand itself fails (e.g. no entropy source) — that
-// still beats a panic, and a fixed delimiter here is no worse than the bug
-// this function exists to fix.
+// Untrusted boundary. Unpredictability is the whole mechanism: wrapped text
+// cannot close a boundary whose terminator it cannot guess, so a fixed
+// fallback nonce would reintroduce the exact escape this tagging prevents.
+// Since Go 1.24, crypto/rand.Read never returns an error (it terminates the
+// process if the OS entropy source fails), so there is no degraded path worth
+// taking here.
 func randomNonce() string {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "fallback0"
-	}
+	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
 
