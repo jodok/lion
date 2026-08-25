@@ -132,15 +132,31 @@ func ensureStoreDir(dir string) error {
 // chmods it to mode if it does — so a store.db that predates a stricter
 // lion version, or one created under a permissive umask, gets its
 // permissions repaired rather than silently trusted.
+// A symlink at the store path is refused rather than followed, and the mode
+// is applied through the open descriptor instead of by name. Both a plain
+// open and os.Chmod dereference a symlink, so a --store path in a shared
+// directory could be pre-placed as a link to someone else's file and lion
+// would open that file and re-permission it to 0600. The store is always a
+// regular file lion manages, so a link there is never legitimate.
+//
+// The Lstat leaves a small window before the open; closing it entirely needs
+// O_NOFOLLOW, which is unix-only (see internal/lockfile for the build-tagged
+// version). Refusing the symlink and never chmod'ing by name removes the
+// damaging half — lion can no longer be made to change another file's
+// permissions.
 func ensureFileMode(path string, mode os.FileMode) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("store: %s is a symlink; refusing to open it as the store", path)
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, mode)
 	if err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
 		return err
 	}
-	return os.Chmod(path, mode)
+	return f.Close()
 }
 
 // Close releases the underlying database handle.

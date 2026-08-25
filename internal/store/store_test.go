@@ -492,3 +492,39 @@ func TestSizeBytesGrowsWithData(t *testing.T) {
 		t.Errorf("SizeBytes() on a freshly-migrated store = %d, want > 0", before)
 	}
 }
+
+// TestOpenRefusesSymlinkedStorePath covers the permission-tampering half of
+// the symlink class fixed elsewhere in this branch. A plain open and os.Chmod
+// both dereference a symlink, so a --store path in a shared directory could be
+// pre-placed as a link to another file and lion would open it and re-permission
+// it to 0600. The store is always a regular file lion manages.
+func TestOpenRefusesSymlinkedStorePath(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "store.db")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(link); err == nil {
+		t.Fatal("Open on a symlinked store path should be refused")
+	}
+
+	fi, err := os.Lstat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o644 {
+		t.Errorf("victim mode = %o, want 0644 unchanged", got)
+	}
+	b, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "keep me" {
+		t.Errorf("victim contents = %q, want them untouched", b)
+	}
+}
