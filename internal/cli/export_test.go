@@ -236,6 +236,109 @@ func TestExportOutputFileNotWrittenWhenNoMessagesMatchFilter(t *testing.T) {
 	}
 }
 
+// TestExportJSONLOutputFileNotWrittenWhenNoMessagesMatchFilter is the jsonl
+// counterpart of TestExportOutputFileNotWrittenWhenNoMessagesMatchFilter:
+// writeExportFileJSONL can't know "zero rows" until store.Store.ForEachMessage
+// has already finished (unlike --format json, which knows from a
+// materialized slice before writing anything — see that test), so it must
+// remove the file safeWriteFile already published rather than leave an
+// empty archive that reads as "you have no messages".
+func TestExportJSONLOutputFileNotWrittenWhenNoMessagesMatchFilter(t *testing.T) {
+	seedExportStore(t)
+	out := filepath.Join(t.TempDir(), "nothing.jsonl")
+
+	err := runRoot(t, "message", "export", "--format", "jsonl", "--conversation", "c1", "--after", "9999-01-01", "--output", out)
+	if err == nil {
+		t.Fatal("expected an error when no messages match the filters")
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("a jsonl output file was left behind despite no messages matching the filters")
+	}
+}
+
+// oldStyleJSONLOutput reconstructs what the pre-streaming implementation
+// would have written for --format jsonl: st.Messages (flat, oldest-first)
+// grouped by conversation via groupMessagesByConversation, then each
+// group's messages encoded in turn (see that function's doc comment). It's
+// built directly from the store rather than pinned as a literal string, so
+// TestExportJSONLStreamingMatchesOldMaterializedOutput below is checking
+// "the new streaming path and the old materializing path agree", not just
+// "the output looks like valid JSON".
+func oldStyleJSONLOutput(t *testing.T, filter store.MessageFilter) string {
+	t.Helper()
+	path, err := store.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	msgs, err := st.Messages(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := groupMessagesByConversation(msgs)
+
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	for _, g := range groups {
+		for _, m := range g.messages {
+			if err := enc.Encode(toExportedMessage(m)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return buf.String()
+}
+
+// TestExportJSONLStreamingMatchesOldMaterializedOutput is the required
+// byte-for-byte regression: switching --format jsonl's write path from a
+// materialize-then-group slice (store.Messages + groupMessagesByConversation)
+// to store.Store.ForEachMessage streaming must not change what gets written,
+// for a fixture small enough that the two orderings coincide (see
+// oldStyleJSONLOutput) — even though the underlying mechanism changed
+// completely, from buffering everything to writing row by row.
+func TestExportJSONLStreamingMatchesOldMaterializedOutput(t *testing.T) {
+	seedExportStore(t)
+	want := oldStyleJSONLOutput(t, store.MessageFilter{})
+
+	var runErr error
+	got := captureStdout(t, func() {
+		runErr = runRoot(t, "message", "export", "--format", "jsonl")
+	})
+	if runErr != nil {
+		t.Fatalf("export: %v", runErr)
+	}
+
+	if got != want {
+		t.Errorf("streamed jsonl stdout differs from the old materialized-then-grouped output:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// TestExportJSONLOutputFileStreamingMatchesOldMaterializedOutput is the
+// --output counterpart: writeExportFileJSONL must publish the exact same
+// bytes writeJSONExportFile-via-groups would have for --format jsonl,
+// despite streaming through store.Store.ForEachMessage instead.
+func TestExportJSONLOutputFileStreamingMatchesOldMaterializedOutput(t *testing.T) {
+	seedExportStore(t)
+	want := oldStyleJSONLOutput(t, store.MessageFilter{})
+
+	out := filepath.Join(t.TempDir(), "export.jsonl")
+	if err := runRoot(t, "message", "export", "--format", "jsonl", "--output", out); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("streamed jsonl file differs from the old materialized-then-grouped output:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
 func readJSONLines(t *testing.T, path string) []string {
 	t.Helper()
 	f, err := os.Open(path)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -107,12 +108,26 @@ func newMessageExportCmd() *cobra.Command {
 				}
 			}
 
-			msgs, err := st.Messages(ctx, store.MessageFilter{
+			filter := store.MessageFilter{
 				ConversationID: conversationID,
 				After:          afterMs,
 				Before:         beforeMs,
 				Limit:          limit,
-			})
+			}
+
+			// --format jsonl streams straight from the store instead of
+			// materializing the match set first — see runJSONLExport.
+			if format == "jsonl" {
+				return runJSONLExport(ctx, st, filter, outputPath, app)
+			}
+
+			// --format json is the small-export, single-document format
+			// (see this flag's help text below): its envelope nests every
+			// conversation's messages inside one JSON value, which needs
+			// the whole match set assembled in memory to build regardless,
+			// so it keeps using store.Messages rather than
+			// store.Store.ForEachMessage.
+			msgs, err := st.Messages(ctx, filter)
 			if err != nil {
 				return err
 			}
@@ -137,28 +152,13 @@ func newMessageExportCmd() *cobra.Command {
 				// separate summary is printed here, unlike the --output
 				// cases below, since printing one would corrupt the piped
 				// stream.
-				return writeExportStream(os.Stdout, format, groups)
+				return writeJSONExportStream(os.Stdout, groups)
 			}
 
-			if err := writeExportFile(outputPath, format, groups); err != nil {
+			if err := writeJSONExportFile(outputPath, groups); err != nil {
 				return err
 			}
-
-			// Bare JSON, no wacli-style {"success":...,"data":...} envelope
-			// — see sync.go's identical note on emitSyncSummary for why.
-			r := app.Renderer()
-			if app.Cfg.JSON {
-				return r.Emit(map[string]any{
-					"status":        "exported",
-					"conversations": len(groups),
-					"messages":      len(msgs),
-					"path":          outputPath,
-				})
-			}
-			return r.Emit(&output.Table{
-				Cols: []string{"STATUS", "CONVERSATIONS", "MESSAGES", "PATH"},
-				Rows: [][]string{{"exported", fmt.Sprintf("%d", len(groups)), fmt.Sprintf("%d", len(msgs)), outputPath}},
-			})
+			return emitExportSummary(app, len(groups), len(msgs), outputPath)
 		},
 	}
 
@@ -182,13 +182,12 @@ type exportGroup struct {
 	messages []store.Message
 }
 
-// groupMessagesByConversation splits a flat, oldest-first message slice
-// (as returned by store.Messages) into per-conversation groups, preserving
-// each message's relative order within its group and each group's order of
-// first appearance in the flat slice. This is what lets a single
-// store.Messages query — which already implements --limit's "most recent N
-// overall" selection — serve both the flat jsonl stream and the grouped
-// json-envelope/directory layouts without querying twice.
+// groupMessagesByConversation splits a flat, oldest-first message slice (as
+// returned by store.Messages) into per-conversation groups, preserving each
+// message's relative order within its group and each group's order of first
+// appearance in the flat slice. Used only by the --format json path now:
+// jsonl streams directly from store.Store.ForEachMessage and never builds a
+// flat slice, let alone groups one (see runJSONLExport).
 func groupMessagesByConversation(msgs []store.Message) []*exportGroup {
 	var order []string
 	byID := map[string]*exportGroup{}
@@ -290,29 +289,20 @@ func buildEnvelope(groups []*exportGroup) exportEnvelope {
 	return env
 }
 
-// writeExportStream writes groups to w in format: one message-per-line for
-// jsonl (messages ordered oldest-first overall, matching store.Messages),
-// or one exportEnvelope document for json.
-func writeExportStream(w io.Writer, format string, groups []*exportGroup) error {
-	if format == "jsonl" {
-		enc := json.NewEncoder(w)
-		for _, g := range groups {
-			for _, m := range g.messages {
-				if err := enc.Encode(toExportedMessage(m)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
+// writeJSONExportStream writes groups to w as one exportEnvelope document —
+// the --format json shape. It's the only format left needing groups at all:
+// --format jsonl builds nothing in memory beyond a filter (see
+// runJSONLExport/streamJSONLMessages below), since a large enough export to
+// need streaming is exactly the one that can't afford a groups slice.
+func writeJSONExportStream(w io.Writer, groups []*exportGroup) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(buildEnvelope(groups))
 }
 
-// writeExportFile writes a single-document export to path (a file, not a
-// directory), creating its parent directories 0700 and the file itself
-// 0600 — this is a complete copy of someone's private messages.
+// writeJSONExportFile writes a single --format json document to path (a
+// file, not a directory), creating its parent directories 0700 and the file
+// itself 0600 — this is a complete copy of someone's private messages.
 //
 // It publishes through safeWriteFile rather than opening path directly: path
 // is exactly the caller-supplied --output value, so anyone able to pre-place
@@ -322,15 +312,130 @@ func writeExportStream(w io.Writer, format string, groups []*exportGroup) error 
 // conversations.jsonl, just at a --output path instead of a fixed filename
 // inside one. See safeWriteFile for why this is the one way this package
 // writes any file, rather than a third hand-rolled O_TRUNC.
-func writeExportFile(path, format string, groups []*exportGroup) error {
+func writeJSONExportFile(path string, groups []*exportGroup) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("export: create %s: %w", dir, err)
 	}
 	_, _, err := safeWriteFile(dir, ".export-*.tmp", filepath.Base(path), 0o600, func(w io.Writer) error {
-		return writeExportStream(w, format, groups)
+		return writeJSONExportStream(w, groups)
 	})
 	return err
+}
+
+// emitExportSummary prints the post-export status line/JSON object for an
+// --output export — shared by the --format json path above and jsonl's
+// runJSONLExport below so the two summaries have exactly the same shape,
+// even though jsonl arrives at its counts by streaming rather than from a
+// materialized groups/msgs pair.
+func emitExportSummary(app *App, conversations, messages int, outputPath string) error {
+	// Bare JSON, no wacli-style {"success":...,"data":...} envelope — see
+	// sync.go's identical note on emitSyncSummary for why.
+	r := app.Renderer()
+	if app.Cfg.JSON {
+		return r.Emit(map[string]any{
+			"status":        "exported",
+			"conversations": conversations,
+			"messages":      messages,
+			"path":          outputPath,
+		})
+	}
+	return r.Emit(&output.Table{
+		Cols: []string{"STATUS", "CONVERSATIONS", "MESSAGES", "PATH"},
+		Rows: [][]string{{"exported", fmt.Sprintf("%d", conversations), fmt.Sprintf("%d", messages), outputPath}},
+	})
+}
+
+// errNoMessagesMatchFilter is writeExportFileJSONL's internal signal that a
+// streamed --output export matched zero messages. Unlike the --format json
+// path (which knows this before writing anything, from its materialized
+// slice — see the Empty/no-match guards in newMessageExportCmd), a streamed
+// export only learns the count once store.Store.ForEachMessage has finished,
+// so writeExportFileJSONL removes the file safeWriteFile just published and
+// returns this instead, so runJSONLExport can print the same "no messages
+// match" message the json path does and leave no phantom empty archive
+// behind.
+var errNoMessagesMatchFilter = errors.New("export: no messages match the given filters")
+
+// runJSONLExport handles --format jsonl for both stdout and --output: it
+// streams straight from the store via store.Store.ForEachMessage instead of
+// collecting messages into a slice first (see the --format json comment at
+// newMessageExportCmd's call site for why that format keeps materializing).
+// A large archive that would OOM the moment it was fully buffered instead
+// produces output — or a file — one row at a time.
+func runJSONLExport(ctx context.Context, st *store.Store, filter store.MessageFilter, outputPath string, app *App) error {
+	if outputPath == "" {
+		messages, _, err := streamJSONLMessages(ctx, st, filter, os.Stdout)
+		if err != nil {
+			return err
+		}
+		if messages == 0 {
+			fmt.Fprintln(os.Stderr, "no messages match the given export filters (--conversation/--after/--before)")
+			return fmt.Errorf("nothing to export: no messages match the given filters")
+		}
+		// The stream itself is stdout's data, same as writeJSONExportStream's
+		// call site — no separate summary here either.
+		return nil
+	}
+
+	messages, conversations, err := writeExportFileJSONL(ctx, st, filter, outputPath)
+	if err != nil {
+		if errors.Is(err, errNoMessagesMatchFilter) {
+			fmt.Fprintln(os.Stderr, "no messages match the given export filters (--conversation/--after/--before)")
+		}
+		return err
+	}
+	return emitExportSummary(app, conversations, messages, outputPath)
+}
+
+// streamJSONLMessages writes messages matching filter to w, one
+// JSON-encoded message per line, via store.Store.ForEachMessage rather than
+// a materialized slice. It returns how many messages — and how many
+// distinct conversations they belong to — were written, for the summary
+// those numbers feed; the (typically tiny) set of conversation ids seen
+// stays in memory for the run, but message bodies never accumulate.
+func streamJSONLMessages(ctx context.Context, st *store.Store, filter store.MessageFilter, w io.Writer) (messages, conversations int, err error) {
+	enc := json.NewEncoder(w)
+	seen := map[string]struct{}{}
+	err = st.ForEachMessage(ctx, filter, func(m store.Message) error {
+		if err := enc.Encode(toExportedMessage(m)); err != nil {
+			return err
+		}
+		messages++
+		seen[m.ConversationID] = struct{}{}
+		return nil
+	})
+	return messages, len(seen), err
+}
+
+// writeExportFileJSONL is writeJSONExportFile's streaming counterpart for
+// --format jsonl --output: it publishes through the same safeWriteFile
+// temp-file-plus-rename helper (see writeJSONExportFile's doc comment for
+// why), but the file's content comes from store.Store.ForEachMessage
+// instead of an already-built groups slice — see errNoMessagesMatchFilter
+// for how the "zero rows" case is handled after the fact, since streaming
+// can't know that before it starts writing.
+func writeExportFileJSONL(ctx context.Context, st *store.Store, filter store.MessageFilter, path string) (messages, conversations int, err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return 0, 0, fmt.Errorf("export: create %s: %w", dir, err)
+	}
+	_, _, err = safeWriteFile(dir, ".export-*.tmp", filepath.Base(path), 0o600, func(w io.Writer) error {
+		var streamErr error
+		messages, conversations, streamErr = streamJSONLMessages(ctx, st, filter, w)
+		return streamErr
+	})
+	if err != nil {
+		return messages, conversations, err
+	}
+	if messages == 0 {
+		// safeWriteFile already published an (empty) file at path; remove
+		// it rather than leave an archive behind that reads exactly like
+		// "you have no messages" (see errNoMessagesMatchFilter).
+		os.Remove(path)
+		return 0, 0, errNoMessagesMatchFilter
+	}
+	return messages, conversations, nil
 }
 
 // safeWriteFile is the one way this package creates or replaces a file at a

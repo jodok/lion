@@ -42,6 +42,19 @@ type Store struct {
 	// running out of disk with the same result code, and only one of those
 	// is a clean truncation — see asDatabaseFull.
 	maxPages int64
+	// maxBytes is the full --max-db-size budget SetMaxSize was given (0 =
+	// none), i.e. the user-facing definition of "size" the flag bounds —
+	// SizeBytes()'s total, including the WAL/shm sidecars, not just the
+	// main file maxPages governs. asDatabaseFull compares this against
+	// SizeBytes() to work out how much headroom the failed transaction
+	// still had under the cap.
+	maxBytes int64
+	// diskFree reports how many bytes are free on a directory's
+	// filesystem, or false if that can't be determined (non-unix, or the
+	// stat call itself fails). Set to diskFreeBytes in Open; injectable
+	// (like now) so asDatabaseFull's cap-vs-disk comparison can be tested
+	// without genuinely filling or shrinking a real filesystem.
+	diskFree func(dir string) (bytesFree int64, ok bool)
 }
 
 // DefaultPath returns the default store location, $LION_HOME/store.db,
@@ -100,7 +113,7 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db, path: path, now: time.Now}
+	s := &Store{db: db, path: path, now: time.Now, diskFree: diskFreeBytes}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
@@ -178,6 +191,17 @@ func ensureFileMode(path string, mode os.FileMode) error {
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error {
+	// Best-effort: WAL checkpointing normally happens incrementally as
+	// journal_size_limit is crossed (see SetMaxSize), but that only
+	// truncates, it doesn't force one — so a store closed right after a
+	// burst of writes can still leave the WAL/shm sidecars sitting near
+	// their budget rather than shrunk back down. TRUNCATE folds the WAL
+	// back into the main file and shrinks it to (ideally) zero, so a
+	// finished sync leaves SizeBytes() reporting close to just the main
+	// file again. Its error is ignored: Close's job is to release the
+	// handle either way, and a checkpoint that can't complete (e.g.
+	// another connection still reading) shouldn't block that.
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return s.db.Close()
 }
 

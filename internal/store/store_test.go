@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -402,6 +403,72 @@ func TestMessagesFilterAndLimit(t *testing.T) {
 	}
 	if len(limited) != 2 || limited[0].URN != "m3" || limited[1].URN != "m4" {
 		t.Errorf("Limit=2 = %+v, want the 2 most recent (m3,m4), oldest-first", limited)
+	}
+}
+
+// TestForEachMessageMatchesMessagesFilterAndLimit is ForEachMessage's
+// required regression: it must honor the same filter semantics as Messages,
+// including Limit's "most recent N, emitted oldest-first" selection — done
+// here via a SQL subquery rather than by buffering and reversing in Go (see
+// ForEachMessage's doc comment), so this pins that the two selection
+// strategies actually agree.
+func TestForEachMessageMatchesMessagesFilterAndLimit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		return tx.UpsertConversation(ctx, Conversation{ID: "c1", URN: "urn:c1", UpdatedAt: 1}, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.RecordMessagePage(ctx, "c1", []Message{
+			{URN: "m1", ConversationID: "c1", SentAt: 100},
+			{URN: "m2", ConversationID: "c1", SentAt: 200},
+			{URN: "m3", ConversationID: "c1", SentAt: 300},
+			{URN: "m4", ConversationID: "c1", SentAt: 400},
+		}, 1)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	collect := func(f MessageFilter) []Message {
+		t.Helper()
+		var got []Message
+		if err := s.ForEachMessage(ctx, f, func(m Message) error {
+			got = append(got, m)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	after := int64(150)
+	got := collect(MessageFilter{After: &after})
+	if len(got) != 3 || got[0].URN != "m2" || got[2].URN != "m4" {
+		t.Errorf("After=150 = %+v, want m2,m3,m4 oldest-first", got)
+	}
+
+	limited := collect(MessageFilter{Limit: 2})
+	if len(limited) != 2 || limited[0].URN != "m3" || limited[1].URN != "m4" {
+		t.Errorf("Limit=2 = %+v, want the 2 most recent (m3,m4), oldest-first", limited)
+	}
+
+	// fn's error must stop iteration immediately and come back unchanged, so
+	// a caller streaming into an io.Writer can propagate a write failure.
+	stopErr := errors.New("stop")
+	seen := 0
+	err := s.ForEachMessage(ctx, MessageFilter{}, func(Message) error {
+		seen++
+		return stopErr
+	})
+	if !errors.Is(err, stopErr) {
+		t.Errorf("err = %v, want stopErr", err)
+	}
+	if seen != 1 {
+		t.Errorf("fn invoked %d times before the error stopped iteration, want 1", seen)
 	}
 }
 

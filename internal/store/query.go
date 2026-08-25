@@ -163,6 +163,76 @@ func (s *Store) Messages(ctx context.Context, f MessageFilter) ([]Message, error
 	return out, nil
 }
 
+// ForEachMessage streams messages matching f to fn, oldest first, without
+// ever materializing the matching set into a slice — unlike Messages, which
+// this otherwise mirrors exactly (see MessageFilter.Limit for what "most
+// recent N, emitted oldest-first" means). It exists for internal/cli's jsonl
+// export path: an archive large enough to matter is exactly the one that
+// can't be safely loaded into memory before the first byte is written.
+//
+// Limit's selection still can't be done by scanning forward and stopping
+// early — the most recent N rows are the ones nearest the *end* of
+// oldest-first order — so it's expressed in SQL instead of in Go: an inner
+// query does ORDER BY sent_at DESC LIMIT N to pick the right rows, and an
+// outer query re-sorts just that (Limit-sized, not table-sized) result back
+// to oldest-first. That keeps the selection itself from ever buffering more
+// than Limit rows, matching the no-buffering promise for the common case
+// where Limit is unset (0) too.
+//
+// fn is called once per matching row in final order; an error from fn stops
+// iteration immediately and is returned as-is, so a caller streaming into an
+// io.Writer can propagate a write failure straight out of ForEachMessage.
+func (s *Store) ForEachMessage(ctx context.Context, f MessageFilter, fn func(Message) error) error {
+	var where []string
+	var args []any
+	if f.ConversationID != "" {
+		where = append(where, "conversation_id = ?")
+		args = append(args, f.ConversationID)
+	}
+	if f.After != nil {
+		where = append(where, "sent_at >= ?")
+		args = append(args, *f.After)
+	}
+	if f.Before != nil {
+		where = append(where, "sent_at <= ?")
+		args = append(args, *f.Before)
+	}
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, " AND ")
+	}
+
+	const cols = "urn, conversation_id, sender_name, sender_urn, sent_at, body"
+	query := fmt.Sprintf(`SELECT %s FROM messages %s ORDER BY sent_at ASC`, cols, whereClause)
+	if f.Limit > 0 {
+		// f.Limit is formatted directly for the same reason Messages' own
+		// LIMIT clause is: it's a validated Go int (the CLI rejects
+		// --limit < 0 before this is ever called), never a raw caller
+		// string, so there's no injection surface to bind a parameter
+		// against.
+		query = fmt.Sprintf(
+			`SELECT %s FROM (SELECT %s FROM messages %s ORDER BY sent_at DESC LIMIT %d) newest_first ORDER BY sent_at ASC`,
+			cols, cols, whereClause, f.Limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.URN, &m.ConversationID, &m.SenderName, &m.SenderURN, &m.SentAt, &m.Body); err != nil {
+			return err
+		}
+		if err := fn(m); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // Search returns messages whose body or sender name matches an FTS5 query,
 // most relevant first, capped at limit (0 = FTS5's default, effectively
 // unbounded for this store's size).

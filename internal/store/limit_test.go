@@ -148,3 +148,79 @@ func TestDiskFullIsNotReportedAsTheSizeCap(t *testing.T) {
 		t.Errorf("a SQLITE_FULL we did not cause was reported as the --max-db-size cap: %v", err)
 	}
 }
+
+// TestSetMaxSizeSplitsBudgetBetweenMainFileAndWAL is the required regression
+// for the WAL sidecars: --max-db-size's user-facing definition of size is
+// SizeBytes() (main file plus WAL/shm, see SizeBytes), but PRAGMA
+// max_page_count only ever bounded the main file's logical pages, leaving
+// the WAL free to carry the total well past the advertised bound. SetMaxSize
+// must reserve part of maxBytes for journal_size_limit too, so the pragmas
+// read back the derived split, and SizeBytes() after a rejection stays close
+// to maxBytes rather than drifting past it by however large the WAL grew.
+func TestSetMaxSizeSplitsBudgetBetweenMainFileAndWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var pageSize int64
+	if err := s.db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		t.Fatal(err)
+	}
+	maxBytes := 400 * pageSize
+	if err := s.SetMaxSize(maxBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	wantWALBudget := maxBytes / 4
+	wantMainBudget := maxBytes - wantWALBudget
+	wantMaxPages := wantMainBudget / pageSize
+
+	var gotJournalLimit, gotMaxPages int64
+	if err := s.db.QueryRow("PRAGMA journal_size_limit").Scan(&gotJournalLimit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("PRAGMA max_page_count").Scan(&gotMaxPages); err != nil {
+		t.Fatal(err)
+	}
+	if gotJournalLimit != wantWALBudget {
+		t.Errorf("journal_size_limit = %d, want %d (maxBytes/4)", gotJournalLimit, wantWALBudget)
+	}
+	if gotMaxPages != wantMaxPages {
+		t.Errorf("max_page_count = %d, want %d (the remaining 3/4 of maxBytes, in pages)", gotMaxPages, wantMaxPages)
+	}
+
+	// Fill past the cap and confirm SizeBytes (main file + sidecars) still
+	// lands close to maxBytes, not wherever the WAL happened to grow to
+	// before the page ceiling caught the write.
+	ctx := context.Background()
+	longBody := strings.Repeat("x", 20000)
+	err = s.WithTx(ctx, func(tx *Tx) error {
+		if err := tx.UpsertConversation(ctx, Conversation{ID: "c1", URN: "urn:li:fs_conversation:c1", UpdatedAt: 1}, 1); err != nil {
+			return err
+		}
+		msgs := make([]Message, 200)
+		for i := range msgs {
+			msgs[i] = Message{URN: fmt.Sprintf("m%d", i), ConversationID: "c1", SentAt: int64(i), Body: longBody}
+		}
+		_, err := tx.RecordMessagePage(ctx, "c1", msgs, 1)
+		return err
+	})
+	if !errors.Is(err, ErrDatabaseFull) {
+		t.Fatalf("err = %v, want ErrDatabaseFull", err)
+	}
+
+	size, err := s.SizeBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A single in-flight transaction can transiently push things a bit past
+	// budget before the rejection rolls it back and the next checkpoint
+	// truncates the WAL (see SetMaxSize's doc comment on what remains
+	// soft) — a few pages of slack over maxBytes, not an unbounded amount.
+	if slack := size - maxBytes; slack > 8*pageSize {
+		t.Errorf("SizeBytes() after rejection = %d, maxBytes = %d (slack %d > 8 pages)", size, maxBytes, slack)
+	}
+}
