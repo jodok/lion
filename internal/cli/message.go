@@ -115,15 +115,16 @@ func renderMessages(r *output.Renderer, jsonOut bool, msgs []voyager.Message) er
 
 func newMessageSendCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "send <conversation-id> <text...>",
-		Short: "Send a message to an existing conversation",
-		Long: "Send a message to an existing conversation.\n\nv1 requires a " +
-			"conversation id (copy one from `lion message list`), not a " +
-			"person id: resolving a person id to a profile URN needs " +
+		Use:   "send <conversation-id|profile-urn> <text...>",
+		Short: "Send a message to a conversation or a profile URN",
+		Long: "Send a message to an existing conversation, or to a person by " +
+			"their profile URN.\n\nv1 does not accept a bare person id " +
+			"(e.g. \"ada-lovelace\"): resolving one to a profile URN needs " +
 			"profile-by-id, which LinkedIn's modern API doesn't support in " +
 			"this build (the legacy endpoint returns HTTP 410 — see " +
-			"DESIGN.md §3.2). Start the conversation in the LinkedIn app " +
-			"first, then use its conversation id here.",
+			"DESIGN.md §3.2). Copy a conversation id from `lion message " +
+			"list`, or pass the person's urn:li:fs_miniProfile:... URN, " +
+			"which is sent to directly.",
 		Args: usageArgs(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
@@ -139,8 +140,14 @@ func newMessageSendCmd() *cobra.Command {
 			// DESIGN.md §3.2). Rather than attempt it and fail with a
 			// confusing downstream error, reject it here with a clear,
 			// actionable message before even building a client.
-			if !isConversationID(target) {
-				return usageErr("message send requires a conversation id in this build (got %q, which looks like a person id/URN); person-id targeting needs profile-by-id resolution, which LinkedIn's modern API doesn't support (see DESIGN.md §3.2) — copy a conversation id from `lion message list` instead", target)
+			//
+			// Only a *bare* person id needs that lookup, though. A profile URN
+			// is already what SendMessageToProfile wants, so it goes straight
+			// through — rejecting it too would break a path that works.
+			isConversation := isConversationID(target)
+			isProfileURN := !isConversation && strings.HasPrefix(target, "urn:")
+			if !isConversation && !isProfileURN {
+				return usageErr("message send needs a conversation id or a profile URN in this build (got %q, a bare person id); resolving a person id to its profile URN needs profile-by-id, which LinkedIn's modern API doesn't support (see DESIGN.md §3.2) — copy a conversation id from `lion message list`, or pass the person's urn:li:fs_miniProfile:... URN", target)
 			}
 
 			cl, err := app.Client()
@@ -156,7 +163,11 @@ func newMessageSendCmd() *cobra.Command {
 				return r.Emit(&output.Table{Cols: []string{"STATUS", "TARGET", "BODY"}, Rows: [][]string{{"dry-run", target, text}}})
 			}
 
-			ok, err := app.confirm(fmt.Sprintf("About to send a message to conversation %s. Proceed?", target))
+			noun := "conversation"
+			if isProfileURN {
+				noun = "profile"
+			}
+			ok, err := app.confirm(fmt.Sprintf("About to send a message to %s %s. Proceed?", noun, target))
 			if err != nil {
 				return err
 			}
@@ -165,8 +176,15 @@ func newMessageSendCmd() *cobra.Command {
 				return nil
 			}
 
-			if err := cl.SendMessage(context.Background(), target, text); err != nil {
-				return err
+			ctx := context.Background()
+			var sendErr error
+			if isProfileURN {
+				sendErr = cl.SendMessageToProfile(ctx, target, text)
+			} else {
+				sendErr = cl.SendMessage(ctx, target, text)
+			}
+			if sendErr != nil {
+				return sendErr
 			}
 			if app.Cfg.JSON {
 				return r.Emit(map[string]string{"status": "sent", "target": target})

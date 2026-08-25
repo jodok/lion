@@ -191,3 +191,30 @@ func TestMessageSendDeclineAbortsWithoutMutating(t *testing.T) {
 		t.Errorf("declined send must not emit any stdout data, got %q", out)
 	}
 }
+
+// TestMessageSendProfileURNNotRejected guards a regression: scoping `message
+// send` to conversation ids was over-broad and rejected profile URNs too,
+// which never needed the unsupported profile-by-id lookup — SendMessageToProfile
+// takes a URN directly. Only a *bare* person id requires resolution. Verified
+// via --dry-run so no request is issued.
+func TestMessageSendProfileURNNotRejected(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runRoot(t, "message", "send", "urn:li:fs_miniProfile:ACoAAA1", "hello", "--dry-run", "--json")
+	})
+	if runErr != nil {
+		t.Fatalf("a profile URN must be accepted, got %v", runErr)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output not valid JSON: %v\noutput: %s", err, out)
+	}
+	if got["status"] != "dry-run" {
+		t.Errorf("status = %q, want dry-run", got["status"])
+	}
+	if got["target"] != "urn:li:fs_miniProfile:ACoAAA1" {
+		t.Errorf("target = %q, want the profile URN passed in", got["target"])
+	}
+}
