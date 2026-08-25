@@ -137,10 +137,10 @@ func ensureStoreDir(dir string) error {
 		// with a symlink mid-flight. Where nobody else can create entries,
 		// there is no one to lose the race to. Checked, not warned, because a
 		// warning doesn't stop the attack.
-		if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		if dirWritableByOthers(fi) {
 			return fmt.Errorf("store: %s is writable by other users (mode %04o); "+
 				"the store holds your private messages and its path must not be "+
-				"replaceable by someone else — use a private directory such as $LION_HOME", dir, perm)
+				"replaceable by someone else — use a private directory such as $LION_HOME", dir, fi.Mode().Perm())
 		}
 		return nil
 	} else if !os.IsNotExist(err) {

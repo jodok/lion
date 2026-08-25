@@ -355,3 +355,34 @@ func readJSONLines(t *testing.T, path string) []string {
 	}
 	return lines
 }
+
+// TestExportJSONLZeroMatchPreservesExistingArchive covers a data-loss
+// ordering bug: the empty temp file must never be renamed over an existing
+// archive before the match count is known. Publishing first and removing
+// after meant a filtered re-export matching nothing destroyed the previous
+// export and left only an error behind.
+func TestExportJSONLZeroMatchPreservesExistingArchive(t *testing.T) {
+	seedExportStore(t)
+	out := filepath.Join(t.TempDir(), "archive.jsonl")
+
+	if err := runRoot(t, "message", "export", "--format", "jsonl", "--output", out); err != nil {
+		t.Fatalf("initial export: %v", err)
+	}
+	before, err := os.ReadFile(out)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("initial archive missing: %v", err)
+	}
+
+	// A filter that matches nothing must leave the archive untouched.
+	err = runRoot(t, "message", "export", "--format", "jsonl", "--output", out, "--conversation", "no-such-conversation")
+	if err == nil {
+		t.Fatal("zero-match export should error")
+	}
+	after, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("previous archive was destroyed: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Error("previous archive was modified by a zero-match export")
+	}
+}

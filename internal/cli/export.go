@@ -423,17 +423,22 @@ func writeExportFileJSONL(ctx context.Context, st *store.Store, filter store.Mes
 	_, _, err = safeWriteFile(dir, ".export-*.tmp", filepath.Base(path), 0o600, func(w io.Writer) error {
 		var streamErr error
 		messages, conversations, streamErr = streamJSONLMessages(ctx, st, filter, w)
-		return streamErr
+		if streamErr != nil {
+			return streamErr
+		}
+		if messages == 0 {
+			// Refuse from inside the callback, before safeWriteFile renames
+			// the temp file into place: a zero-match run must not touch the
+			// destination at all. Publishing first and removing after would
+			// destroy an existing archive at path on a filtered re-export
+			// that happened to match nothing — the previous export would be
+			// gone and only an error left in its place.
+			return errNoMessagesMatchFilter
+		}
+		return nil
 	})
 	if err != nil {
 		return messages, conversations, err
-	}
-	if messages == 0 {
-		// safeWriteFile already published an (empty) file at path; remove
-		// it rather than leave an archive behind that reads exactly like
-		// "you have no messages" (see errNoMessagesMatchFilter).
-		os.Remove(path)
-		return 0, 0, errNoMessagesMatchFilter
 	}
 	return messages, conversations, nil
 }
