@@ -77,13 +77,15 @@ func newProfileSearchCmd() *cobra.Command {
 				return err
 			}
 			r := app.Renderer()
-			// Wrap free text captured from LinkedIn once, here, so both the
+			// Wrap every LinkedIn-controlled free-text field (via
+			// wrapSearchResult — see untrusted.go) once, here, so both the
 			// JSON and table/plain branches below see the same (possibly
-			// wrapped) value — this is what keeps --wrap-untrusted honored
+			// wrapped) values — this is what keeps --wrap-untrusted honored
 			// consistently across output formats (F17) instead of only in
-			// the table path.
+			// the table path, and covers the person's name and location as
+			// well as their headline.
 			for i := range results {
-				results[i].Headline = r.Untrusted(results[i].Headline)
+				results[i] = wrapSearchResult(r, results[i])
 			}
 			if app.Cfg.JSON {
 				return r.Emit(results)
@@ -102,12 +104,19 @@ func newProfileSearchCmd() *cobra.Command {
 }
 
 func renderProfile(r *output.Renderer, app *App, publicID, name, headline, location, industry, summary string) error {
-	// Wrap free text captured from LinkedIn once, here, so it's applied
-	// identically whichever branch below renders it (F17 — --wrap-untrusted
-	// must not be JSON/table-format-specific). hadSummary is captured before
-	// wrapping since Untrusted("") is no longer empty once wrapped.
+	// Wrap every LinkedIn-controlled free-text field once, here, so it's
+	// applied identically whichever branch below renders it (F17 —
+	// --wrap-untrusted must not be JSON/table-format-specific, and must not
+	// stop at headline/summary while leaving name/location/industry — the
+	// member's own free-text description of themselves — unwrapped). Only
+	// public_id is left alone: it's the machine identifier a script needs
+	// verbatim. hadSummary is captured before wrapping since Untrusted("")
+	// is no longer empty once wrapped.
 	hadSummary := summary != ""
+	name = r.Untrusted(name)
 	headline = r.Untrusted(headline)
+	location = r.Untrusted(location)
+	industry = r.Untrusted(industry)
 	summary = r.Untrusted(summary)
 	if app.Cfg.JSON {
 		return r.Emit(map[string]string{

@@ -47,12 +47,14 @@ func newMessageListCmd() *cobra.Command {
 	return cmd
 }
 
-// renderConversations wraps free text captured from LinkedIn once and
-// renders it identically for every output format — JSON included — so
-// --wrap-untrusted is honored consistently (F17).
+// renderConversations wraps every LinkedIn-controlled free-text field (via
+// wrapConversation — see untrusted.go) once and renders it identically for
+// every output format — JSON included — so --wrap-untrusted is honored
+// consistently (F17), covering participant names as well as the last
+// message preview.
 func renderConversations(r *output.Renderer, jsonOut bool, convs []voyager.Conversation) error {
 	for i := range convs {
-		convs[i].LastMessage = r.Untrusted(convs[i].LastMessage)
+		convs[i] = wrapConversation(r, convs[i])
 	}
 	if jsonOut {
 		return r.Emit(convs)
@@ -89,11 +91,13 @@ func newMessageReadCmd() *cobra.Command {
 	}
 }
 
-// renderMessages wraps free text captured from LinkedIn once and renders it
-// identically for every output format (F17 — see renderConversations).
+// renderMessages wraps every LinkedIn-controlled free-text field (via
+// wrapMessage) once and renders it identically for every output format
+// (F17 — see renderConversations), covering the sender name as well as the
+// message body.
 func renderMessages(r *output.Renderer, jsonOut bool, msgs []voyager.Message) error {
 	for i := range msgs {
-		msgs[i].Text = r.Untrusted(msgs[i].Text)
+		msgs[i] = wrapMessage(r, msgs[i])
 	}
 	if jsonOut {
 		return r.Emit(msgs)

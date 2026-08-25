@@ -48,13 +48,15 @@ func newConnectionListCmd() *cobra.Command {
 	}
 }
 
-// renderConnections wraps free text captured from LinkedIn once and renders
-// it identically for every output format — JSON included — so
-// --wrap-untrusted is honored consistently (F17) rather than only in the
-// table path.
+// renderConnections wraps every LinkedIn-controlled free-text field (via
+// wrapConnection, the single place that lists which Connection fields are
+// free text — see untrusted.go) once and renders it identically for every
+// output format — JSON included — so --wrap-untrusted is honored
+// consistently (F17) rather than only in the table path, and rather than
+// only some fields.
 func renderConnections(r *output.Renderer, jsonOut bool, conns []voyager.Connection) error {
 	for i := range conns {
-		conns[i].Headline = r.Untrusted(conns[i].Headline)
+		conns[i] = wrapConnection(r, conns[i])
 	}
 	if jsonOut {
 		return r.Emit(conns)
@@ -187,13 +189,9 @@ func newConnectionAcceptCmd() *cobra.Command {
 				accepted = append(accepted, inv.InvitationURN)
 			}
 
-			status := mutationStatus(dryRun, "accepted")
+			jsonVal, t := acceptResult(dryRun, accepted)
 			if app.Cfg.JSON {
-				return r.Emit(map[string]any{"status": status, "invitations": accepted})
-			}
-			t := &output.Table{Cols: []string{"INVITATION_URN", "STATUS"}}
-			for _, urn := range accepted {
-				t.Rows = append(t.Rows, []string{urn, status})
+				return r.Emit(jsonVal)
 			}
 			return r.Emit(t)
 		},
@@ -270,11 +268,12 @@ func newConnectionRequestsCmd() *cobra.Command {
 	return cmd
 }
 
-// renderInvitations wraps free text captured from LinkedIn once and renders
-// it identically for every output format (F17 — see renderConnections).
+// renderInvitations wraps every LinkedIn-controlled free-text field (via
+// wrapInvitation) once and renders it identically for every output format
+// (F17 — see renderConnections).
 func renderInvitations(r *output.Renderer, jsonOut bool, invs []voyager.Invitation) error {
 	for i := range invs {
-		invs[i].Message = r.Untrusted(invs[i].Message)
+		invs[i] = wrapInvitation(r, invs[i])
 	}
 	if jsonOut {
 		return r.Emit(invs)
@@ -295,4 +294,30 @@ func mutationStatus(dryRun bool, verb string) string {
 		return "dry-run"
 	}
 	return verb
+}
+
+// acceptResult builds the JSON value and table for `connection accept`.
+//
+// The live JSON contract keeps the original "accepted" field (the list of
+// accepted invitation URNs) present and stable: an earlier dry-run rework
+// replaced it with "invitations", which silently broke any automation
+// reading the documented "accepted" field even though the mutation itself
+// had succeeded. "status" is included alongside it, but "accepted" is the
+// field with the load-bearing meaning and must always be present on a live
+// run.
+//
+// Dry-run gets its own field name ("invitations", not "accepted") precisely
+// so a preview can never be mistaken for confirmation that URNs were
+// actually accepted — the same rule mutationStatus already enforces for the
+// STATUS column/value.
+func acceptResult(dryRun bool, accepted []string) (any, *output.Table) {
+	status := mutationStatus(dryRun, "accepted")
+	t := &output.Table{Cols: []string{"INVITATION_URN", "STATUS"}}
+	for _, urn := range accepted {
+		t.Rows = append(t.Rows, []string{urn, status})
+	}
+	if dryRun {
+		return map[string]any{"status": status, "invitations": accepted}, t
+	}
+	return map[string]any{"status": status, "accepted": accepted}, t
 }

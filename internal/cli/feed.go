@@ -48,12 +48,13 @@ func newFeedReadCmd() *cobra.Command {
 	}
 }
 
-// renderFeedItems wraps free text captured from LinkedIn once and renders
-// it identically for every output format — JSON included — so
-// --wrap-untrusted is honored consistently (F17).
+// renderFeedItems wraps every LinkedIn-controlled free-text field (via
+// wrapFeedItem — see untrusted.go) once and renders it identically for
+// every output format — JSON included — so --wrap-untrusted is honored
+// consistently (F17), covering the author's name as well as the post text.
 func renderFeedItems(r *output.Renderer, jsonOut bool, items []voyager.FeedItem) error {
 	for i := range items {
-		items[i].Text = r.Untrusted(items[i].Text)
+		items[i] = wrapFeedItem(r, items[i])
 	}
 	if jsonOut {
 		return r.Emit(items)
