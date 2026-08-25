@@ -32,10 +32,10 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 	t := &Tx{tx: sqlTx}
 	if err := fn(t); err != nil {
 		_ = sqlTx.Rollback() // best-effort; the original err is what matters
-		return asDatabaseFull(err)
+		return s.asDatabaseFull(err)
 	}
 	if err := sqlTx.Commit(); err != nil {
-		return asDatabaseFull(err)
+		return s.asDatabaseFull(err)
 	}
 	return nil
 }

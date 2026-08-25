@@ -102,3 +102,49 @@ func TestSetMaxSizeZeroIsNoLimit(t *testing.T) {
 		t.Fatalf("WithTx with no size limit: %v", err)
 	}
 }
+
+// TestDiskFullIsNotReportedAsTheSizeCap covers the ambiguity in SQLITE_FULL:
+// SQLite returns result code 13 both for the max_page_count ceiling
+// SetMaxSize installs and for a genuinely full filesystem. Only the first is
+// a clean truncation. Mapping the second onto ErrDatabaseFull would let sync
+// suppress a storage failure as an ordinary early stop — exiting successfully
+// with a stale archive — even when --max-db-size was never passed.
+//
+// A real disk-full can't be produced in a unit test, so this stands in the
+// equivalent position: a genuine driver SQLITE_FULL arising from a ceiling
+// this package did not install (SetMaxSize is never called, so maxPages
+// stays 0).
+func TestDiskFullIsNotReportedAsTheSizeCap(t *testing.T) {
+	s := newTestStore(t)
+	if s.maxPages != 0 {
+		t.Fatalf("precondition: maxPages = %d, want 0 (SetMaxSize not called)", s.maxPages)
+	}
+	// A ceiling imposed by something other than SetMaxSize, standing in for
+	// the filesystem running out of room.
+	if _, err := s.db.Exec("PRAGMA max_page_count = 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	err := s.WithTx(ctx, func(tx *Tx) error {
+		c := Conversation{ID: "2-full", URN: "urn:li:fs_conversation:2-full", UpdatedAt: 1}
+		if err := tx.UpsertConversation(ctx, c, 1); err != nil {
+			return err
+		}
+		big := strings.Repeat("x", 4096)
+		msgs := make([]Message, 0, 500)
+		for i := 0; i < 500; i++ {
+			msgs = append(msgs, Message{
+				URN: fmt.Sprintf("m%d", i), ConversationID: "2-full", SentAt: int64(i), Body: big,
+			})
+		}
+		_, err := tx.RecordMessagePage(ctx, "2-full", msgs, 1)
+		return err
+	})
+	if err == nil {
+		t.Fatal("expected the write to fail against a 1-page ceiling")
+	}
+	if errors.Is(err, ErrDatabaseFull) {
+		t.Errorf("a SQLITE_FULL we did not cause was reported as the --max-db-size cap: %v", err)
+	}
+}

@@ -37,6 +37,11 @@ type Store struct {
 	// than asserting against a moving clock, mirroring ratelimit.Limiter's
 	// same pattern.
 	now func() time.Time
+	// maxPages is the PRAGMA max_page_count ceiling SetMaxSize installed
+	// (0 = none). Kept because SQLite reports hitting that ceiling and
+	// running out of disk with the same result code, and only one of those
+	// is a clean truncation — see asDatabaseFull.
+	maxPages int64
 }
 
 // DefaultPath returns the default store location, $LION_HOME/store.db,
