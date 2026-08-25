@@ -21,6 +21,13 @@ import (
 // ErrDailyBudget is returned when a class's daily action budget is spent.
 var ErrDailyBudget = errors.New("daily action budget exhausted for this class")
 
+// ErrBudgetLock is returned when the inter-process state lock could not be
+// acquired. The limiter fails closed rather than reserving unlocked: two
+// processes reserving against the same state file without serialization is
+// exactly the cross-process double-spend persistence exists to prevent, so
+// an unavailable lock must abort the reservation, not fall back to it.
+var ErrBudgetLock = errors.New("ratelimit: could not acquire inter-process state lock")
+
 // Class groups actions by how sensitive LinkedIn is to them. Reads are cheap;
 // invites are the most likely to trigger restrictions.
 type Class int
@@ -65,9 +72,12 @@ func classByName(name string) (Class, bool) {
 type Budget struct {
 	// MinGap and MaxGap bound the randomized delay between actions.
 	MinGap, MaxGap time.Duration
-	// DailyMax caps actions per calendar day (0 = unlimited). The day is
-	// determined by the limiter's clock (real wall-clock time in
-	// production); it resets at local midnight, not on a rolling 24h basis.
+	// DailyMax caps actions per rolling 24-hour window (0 = unlimited),
+	// counted back from the limiter's clock (real wall-clock time in
+	// production). It is intentionally not a calendar-day counter: a
+	// calendar-day reset lets a caller spend the whole budget right before
+	// local midnight and the whole budget again right after, doubling the
+	// intended burst.
 	DailyMax int
 }
 
@@ -88,12 +98,21 @@ func DefaultBudgets() map[Class]Budget {
 // entirely: each invocation would start a fresh, empty in-memory limiter.
 const stateFileName = "ratelimit.json"
 
-// persistedState is the on-disk shape. Date is compared as a plain string
-// (YYYY-MM-DD) so a calendar-day rollover is a simple inequality check.
+// budgetWindow is the rolling window DailyMax is measured over. It is a
+// named constant, not folded into the arithmetic at each use, so the
+// "24 hours" in the budget check, the load-time prune, and the save-time
+// prune are provably the same window rather than three numbers that could
+// drift apart under future edits.
+const budgetWindow = 24 * time.Hour
+
+// persistedState is the on-disk shape. Actions holds, per class name, the
+// timestamps of recent actions of that class; a rolling-window budget check
+// is "how many of these are newer than now - budgetWindow", so the raw
+// timestamps — not a precomputed count — are what must survive a process
+// restart.
 type persistedState struct {
-	Date   string               `json:"date"`
-	Counts map[string]int       `json:"counts"`
-	NextAt map[string]time.Time `json:"next_at"`
+	Actions map[string][]time.Time `json:"actions"`
+	NextAt  map[string]time.Time   `json:"next_at"`
 }
 
 // DefaultStatePath resolves the persisted limiter state file path under the
@@ -119,11 +138,12 @@ type Limiter struct {
 	// inter-action gap. A class with no entry has no known history (neither
 	// in this process nor loaded from a state file).
 	nextAt map[Class]time.Time
-	// counts holds how many actions of each class have run on `date`.
-	counts map[Class]int
-	// date is the calendar day (YYYY-MM-DD) counts is for; it resets counts
-	// to zero the first time Wait observes a different day.
-	date string
+	// actions holds, per class, the timestamps of recent actions still
+	// inside budgetWindow. The DailyMax check counts entries here rather
+	// than a running counter, so the budget is a true rolling window instead
+	// of one that can be doubled by acting just before and after a
+	// calendar-day boundary.
+	actions map[Class][]time.Time
 	// statePath is where state is persisted; "" disables persistence.
 	statePath string
 	rnd       *rand.Rand
@@ -138,7 +158,7 @@ func New(budgets map[Class]Budget) *Limiter {
 	return &Limiter{
 		budgets: budgets,
 		nextAt:  map[Class]time.Time{},
-		counts:  map[Class]int{},
+		actions: map[Class][]time.Time{},
 		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		now:     time.Now,
 		sleep:   sleepCtx,
@@ -191,9 +211,9 @@ func (l *Limiter) Wait(ctx context.Context, c Class) error {
 
 	reserve := func() {
 		now = l.now()
-		l.resetIfNewDayLocked(now)
+		l.pruneLocked(now)
 
-		if b.DailyMax > 0 && l.counts[c] >= b.DailyMax {
+		if b.DailyMax > 0 && len(l.actions[c]) >= b.DailyMax {
 			budgetErr = ErrDailyBudget
 			return
 		}
@@ -217,24 +237,35 @@ func (l *Limiter) Wait(ctx context.Context, c Class) error {
 			start = now.Add(gap)
 		}
 		l.nextAt[c] = start.Add(gap)
-		l.counts[c]++
+		l.actions[c] = append(l.actions[c], now)
 		l.saveLocked()
 	}
 
 	// Reserving is a read-modify-write of state shared across processes: the
 	// mutex above only orders goroutines, but every `lion` invocation is its
 	// own process. Without an inter-process lock two concurrent runs both read
-	// the same counts, both reserve, and the later write erases the earlier
+	// the same actions, both reserve, and the later write erases the earlier
 	// reservation — reinstating exactly the shell-loop bypass that persisting
 	// the budget exists to prevent. Re-read inside the lock so this run paces
 	// against what other processes have already committed.
+	//
+	// The lock is flock-based and blocking rather than a time-bounded
+	// heuristic: flock is released by the kernel the instant the holding
+	// process exits, crashes, or is killed, so there is no stale-lock file to
+	// misjudge and therefore no case where proceeding unlocked would be safe.
+	// If the lock genuinely cannot be acquired (e.g. an unwritable directory),
+	// this run fails closed instead of reserving against possibly-stale state.
 	if l.statePath == "" {
 		reserve()
 	} else {
-		withStateLock(l.statePath, func() {
-			l.load()
-			reserve()
-		})
+		unlock, err := lockFile(l.statePath + ".lock")
+		if err != nil {
+			l.mu.Unlock()
+			return fmt.Errorf("%w: %v", ErrBudgetLock, err)
+		}
+		l.load()
+		reserve()
+		unlock()
 	}
 	l.mu.Unlock()
 
@@ -247,64 +278,33 @@ func (l *Limiter) Wait(ctx context.Context, c Class) error {
 	return nil
 }
 
-// withStateLock runs fn while holding a best-effort inter-process lock for the
-// limiter's state file. Like the credential store's lock it is advisory and
-// time-bounded: after maxWait it proceeds anyway rather than hanging a command,
-// and it only removes a lock file this call actually created — deleting one
-// after giving up would break the mutex for the process still holding it.
-func withStateLock(statePath string, fn func()) {
-	const (
-		retryDelay   = 25 * time.Millisecond
-		maxWait      = 5 * time.Second
-		staleLockAge = 30 * time.Second
-	)
-	lp := statePath + ".lock"
-	deadline := time.Now().Add(maxWait)
-	acquired := false
-	for {
-		f, err := os.OpenFile(lp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			f.Close()
-			acquired = true
-			break
+// pruneLocked drops action timestamps older than budgetWindow, so neither
+// the in-memory maps nor the persisted state file grow without bound across
+// a long-lived process or many `lion` invocations over time. Caller holds
+// l.mu.
+func (l *Limiter) pruneLocked(now time.Time) {
+	cutoff := now.Add(-budgetWindow)
+	for c, ts := range l.actions {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
 		}
-		if !errors.Is(err, os.ErrExist) {
-			break // cannot lock at all (unwritable dir): pace rather than fail
+		if len(kept) == 0 {
+			delete(l.actions, c)
+		} else {
+			l.actions[c] = kept
 		}
-		if fi, statErr := os.Stat(lp); statErr == nil && time.Since(fi.ModTime()) > staleLockAge {
-			os.Remove(lp) // steal a stale lock left by a crashed process
-		}
-		// Check the deadline even after stealing, so a lock that keeps being
-		// recreated cannot spin here past maxWait.
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(retryDelay)
-	}
-	if acquired {
-		defer os.Remove(lp)
-	}
-	fn()
-}
-
-// resetIfNewDayLocked zeroes the daily counters when now falls on a
-// different calendar day than the one counts was last reset for. Caller
-// holds l.mu.
-func (l *Limiter) resetIfNewDayLocked(now time.Time) {
-	today := now.Format("2006-01-02")
-	if l.date == today {
-		return
-	}
-	l.date = today
-	for c := range l.counts {
-		l.counts[c] = 0
 	}
 }
 
-// load reads persisted state from statePath, if set, populating date,
-// counts, and nextAt. Any error (missing file, corrupt JSON, unknown class
-// name) is ignored: the limiter simply starts with no known history, the
-// same as a fresh in-memory Limiter.
+// load reads persisted state from statePath, if set, populating actions and
+// nextAt. Any error (missing file, corrupt JSON, unknown class name) is
+// ignored: the limiter simply starts with no known history, the same as a
+// fresh in-memory Limiter. Timestamps are pruned immediately after loading
+// so a state file that predates a long idle period doesn't resurrect
+// long-expired actions into the rolling window.
 func (l *Limiter) load() {
 	if l.statePath == "" {
 		return
@@ -317,10 +317,9 @@ func (l *Limiter) load() {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return
 	}
-	l.date = st.Date
-	for name, n := range st.Counts {
+	for name, ts := range st.Actions {
 		if c, ok := classByName(name); ok {
-			l.counts[c] = n
+			l.actions[c] = append([]time.Time(nil), ts...)
 		}
 	}
 	for name, t := range st.NextAt {
@@ -328,6 +327,7 @@ func (l *Limiter) load() {
 			l.nextAt[c] = t
 		}
 	}
+	l.pruneLocked(l.now())
 }
 
 // saveLocked persists the limiter's state to statePath, if set. It writes
@@ -335,18 +335,20 @@ func (l *Limiter) load() {
 // path, so a crash or a concurrent reader never observes a partial write;
 // the file is created 0600 since it's a lightweight local action log.
 // Caller holds l.mu. Errors are ignored: persistence is best-effort and
-// must never block a Voyager call from proceeding.
+// must never block a Voyager call from proceeding. Pruning again here (load
+// already pruned) keeps the file from growing unboundedly for a long-lived
+// process that never restarts and so never re-runs load's prune.
 func (l *Limiter) saveLocked() {
 	if l.statePath == "" {
 		return
 	}
+	l.pruneLocked(l.now())
 	st := persistedState{
-		Date:   l.date,
-		Counts: make(map[string]int, len(l.counts)),
-		NextAt: make(map[string]time.Time, len(l.nextAt)),
+		Actions: make(map[string][]time.Time, len(l.actions)),
+		NextAt:  make(map[string]time.Time, len(l.nextAt)),
 	}
-	for c, n := range l.counts {
-		st.Counts[c.name()] = n
+	for c, ts := range l.actions {
+		st.Actions[c.name()] = ts
 	}
 	for c, t := range l.nextAt {
 		st.NextAt[c.name()] = t

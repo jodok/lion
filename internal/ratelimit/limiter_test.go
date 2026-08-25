@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -48,10 +49,11 @@ func TestDailyBudgetWindowExpiry(t *testing.T) {
 	if err := l.Wait(ctx, Write); err != ErrDailyBudget {
 		t.Fatalf("got %v, want ErrDailyBudget", err)
 	}
-	// Advance past midnight; the daily counter should reset.
+	// Advance past the rolling 24h window; the one action recorded above
+	// ages out and the budget frees up, regardless of any calendar boundary.
 	l.now = func() time.Time { return base.Add(25 * time.Hour) }
 	if err := l.Wait(ctx, Write); err != nil {
-		t.Fatalf("after day rollover: %v", err)
+		t.Fatalf("after window expiry: %v", err)
 	}
 }
 
@@ -122,30 +124,106 @@ func TestPersistedBudgetSurvivesNewLimiter(t *testing.T) {
 	}
 }
 
-// F14(b): a persisted budget resets when the stored date is no longer
-// today, mirroring TestDailyBudgetWindowExpiry but across the process
-// boundary a state file introduces.
-func TestPersistedBudgetResetsOnDayRollover(t *testing.T) {
+// F14(b) / rolling-window regression: a calendar-date reset let a caller
+// spend the whole invite/write budget right before local midnight and the
+// whole budget again right after — double the intended burst, and a process
+// in a different timezone could reset the shared file repeatedly. This test
+// picks times either side of midnight that are only 2h apart to prove the
+// budget does NOT reset there: it must stay spent until a full 24h has
+// elapsed since the action was recorded, not until the calendar date changes.
+func TestPersistedBudgetIsRollingNotCalendarDay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ratelimit.json")
 	budgets := map[Class]Budget{Invite: {MinGap: 0, MaxGap: 0, DailyMax: 1}}
-	day1 := time.Date(2026, 8, 24, 23, 0, 0, 0, time.UTC)
-	day2 := day1.Add(2 * time.Hour) // 2026-08-25 01:00 UTC
+	beforeMidnight := time.Date(2026, 8, 24, 23, 0, 0, 0, time.UTC)
+	afterMidnight := beforeMidnight.Add(2 * time.Hour) // 2026-08-25 01:00 UTC, new calendar day
 
 	l1 := NewPersistent(budgets, path)
-	l1.now = func() time.Time { return day1 }
+	l1.now = func() time.Time { return beforeMidnight }
 	l1.sleep = func(context.Context, time.Duration) error { return nil }
 	if err := l1.Wait(context.Background(), Invite); err != nil {
-		t.Fatalf("day 1: %v", err)
+		t.Fatalf("first invite: %v", err)
 	}
-	if err := l1.Wait(context.Background(), Invite); err != ErrDailyBudget {
-		t.Fatalf("day 1, second invite: got %v, want ErrDailyBudget", err)
+
+	// Crossing midnight 2h later must NOT free the budget: a calendar-day
+	// reset here is exactly the double-spend this defect reintroduced.
+	l2 := NewPersistent(budgets, path)
+	l2.now = func() time.Time { return afterMidnight }
+	l2.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l2.Wait(context.Background(), Invite); err != ErrDailyBudget {
+		t.Fatalf("2h later, across midnight: got %v, want ErrDailyBudget (rolling window, not calendar day)", err)
+	}
+}
+
+// TestRollingWindowAges verifies the two boundary cases explicitly: an
+// action 23h old is still inside the rolling 24h window and must still
+// count against the budget; the same action 25h old has aged out and must
+// not.
+func TestRollingWindowAges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ratelimit.json")
+	budgets := map[Class]Budget{Invite: {MinGap: 0, MaxGap: 0, DailyMax: 1}}
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+
+	l1 := NewPersistent(budgets, path)
+	l1.now = func() time.Time { return base }
+	l1.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l1.Wait(context.Background(), Invite); err != nil {
+		t.Fatalf("first invite: %v", err)
 	}
 
 	l2 := NewPersistent(budgets, path)
-	l2.now = func() time.Time { return day2 }
+	l2.now = func() time.Time { return base.Add(23 * time.Hour) }
 	l2.sleep = func(context.Context, time.Duration) error { return nil }
-	if err := l2.Wait(context.Background(), Invite); err != nil {
-		t.Fatalf("day 2: budget should have reset across the rollover, got %v", err)
+	if err := l2.Wait(context.Background(), Invite); err != ErrDailyBudget {
+		t.Fatalf("23h later: got %v, want ErrDailyBudget (still inside the rolling window)", err)
+	}
+
+	l3 := NewPersistent(budgets, path)
+	l3.now = func() time.Time { return base.Add(25 * time.Hour) }
+	l3.sleep = func(context.Context, time.Duration) error { return nil }
+	if err := l3.Wait(context.Background(), Invite); err != nil {
+		t.Fatalf("25h later: budget should have freed up, got %v", err)
+	}
+}
+
+// TestRollingWindowFreesExactlyExpiredSlots checks that expiry is per-action
+// rather than a bulk reset: with a multi-slot budget, staggered reservations
+// must age out of the window one at a time as it slides, not all at once the
+// way a calendar-day counter would.
+func TestRollingWindowFreesExactlyExpiredSlots(t *testing.T) {
+	l := newTestLimiter(map[Class]Budget{
+		Write: {MinGap: 0, MaxGap: 0, DailyMax: 2},
+	})
+	base := time.Now()
+	ctx := context.Background()
+
+	l.now = func() time.Time { return base }
+	if err := l.Wait(ctx, Write); err != nil {
+		t.Fatalf("action 1: %v", err)
+	}
+
+	l.now = func() time.Time { return base.Add(time.Hour) }
+	if err := l.Wait(ctx, Write); err != nil {
+		t.Fatalf("action 2: %v", err)
+	}
+
+	// Both slots are now spent.
+	l.now = func() time.Time { return base.Add(2 * time.Hour) }
+	if err := l.Wait(ctx, Write); err != ErrDailyBudget {
+		t.Fatalf("got %v, want ErrDailyBudget", err)
+	}
+
+	// 24h after action 1 (23h after action 2): only action 1 has aged out,
+	// freeing exactly one slot for a new reservation.
+	l.now = func() time.Time { return base.Add(24 * time.Hour) }
+	if err := l.Wait(ctx, Write); err != nil {
+		t.Fatalf("after first slot expires: %v", err)
+	}
+
+	// The freed slot is immediately spent again (action 2 from t=1h and the
+	// new one from t=24h both still count), so a third reservation must fail.
+	l.now = func() time.Time { return base.Add(24*time.Hour + 30*time.Minute) }
+	if err := l.Wait(ctx, Write); err != ErrDailyBudget {
+		t.Fatalf("got %v, want ErrDailyBudget", err)
 	}
 }
 
@@ -177,7 +255,72 @@ func TestConcurrentLimitersDoNotLoseReservations(t *testing.T) {
 	wg.Wait()
 
 	final := NewPersistent(budgets, statePath)
-	if got := final.counts[Write]; got != procs {
+	if got := len(final.actions[Write]); got != procs {
 		t.Fatalf("persisted write count = %d, want %d (reservations were lost to a cross-process race)", got, procs)
+	}
+}
+
+// TestLockFileIsExclusive verifies flock actually blocks a second acquirer
+// until the first releases. This is what makes a lock file left behind by a
+// killed process safe to reuse instantly, with no staleness heuristic
+// needed: the kernel releases the flock the moment the holding process dies,
+// so a live holder always blocks a second acquirer and a dead one never does.
+func TestLockFileIsExclusive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ratelimit.json.lock")
+
+	unlock1, err := lockFile(path)
+	if err != nil {
+		t.Fatalf("first lockFile: %v", err)
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		unlock2, err := lockFile(path)
+		if err != nil {
+			t.Errorf("second lockFile: %v", err)
+			return
+		}
+		close(acquired)
+		unlock2()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second lockFile acquired the lock while the first still held it")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: the second acquirer is still blocked.
+	}
+
+	unlock1()
+
+	select {
+	case <-acquired:
+		// Expected: releasing the first lock let the second proceed.
+	case <-time.After(2 * time.Second):
+		t.Fatal("second lockFile never acquired the lock after the first released it")
+	}
+}
+
+// TestWaitFailsClosedWhenLockUnavailable ensures that when the inter-process
+// lock cannot be acquired, Wait returns an error instead of silently
+// reserving unlocked. Falling back to unlocked reservation is exactly the
+// cross-process bypass persistence exists to prevent (see
+// TestConcurrentLimitersDoNotLoseReservations), so an unavailable lock must
+// be a hard stop.
+func TestWaitFailsClosedWhenLockUnavailable(t *testing.T) {
+	// statePath sits under a parent directory that doesn't exist, so the
+	// ".lock" sibling file can never be created and lockFile always fails.
+	statePath := filepath.Join(t.TempDir(), "missing-parent", "ratelimit.json")
+	budgets := map[Class]Budget{Write: {MinGap: 0, MaxGap: 0, DailyMax: 100}}
+
+	l := NewPersistent(budgets, statePath)
+	l.sleep = func(context.Context, time.Duration) error { return nil }
+
+	err := l.Wait(context.Background(), Write)
+	if !errors.Is(err, ErrBudgetLock) {
+		t.Fatalf("got %v, want an error wrapping ErrBudgetLock", err)
+	}
+	if len(l.actions[Write]) != 0 {
+		t.Fatalf("reservation was made despite failing to acquire the lock: %v", l.actions[Write])
 	}
 }
