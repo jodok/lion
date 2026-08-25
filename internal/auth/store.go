@@ -285,6 +285,71 @@ func Get(alias string) (*Credential, error) {
 	return c, nil
 }
 
+// UpdateCookies overlays rotated cookie values onto alias's stored
+// credential (empty alias resolves to the store's default, matching Get)
+// and saves it only if something actually changed. The CLI calls this after
+// every command that built a client, so a no-op write on the common case —
+// a command whose session didn't rotate anything this run — would mean
+// touching disk and taking the store lock on essentially every invocation;
+// skipping the save when nothing changed avoids that churn and the lock
+// contention it would create against a concurrent `auth login`/`logout`.
+//
+// It goes through the same withLock + atomic save() path as Save/Delete so
+// this writeback can't interleave with (or clobber) a concurrent login or
+// logout, and reuses Credential.normalize() so JSESSIONID ends up
+// re-quoted exactly the way every other write already produces it.
+//
+// A missing account (alias not found, or no accounts at all) returns
+// (false, nil) rather than an error — a cookie writeback must never be the
+// thing that fails an otherwise-successful command.
+func UpdateCookies(alias string, rotated map[string]string) (bool, error) {
+	if len(rotated) == 0 {
+		return false, nil
+	}
+	var changed bool
+	err := withLock(func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		resolved := alias
+		if resolved == "" {
+			resolved = s.Default
+		}
+		if resolved == "" {
+			return nil
+		}
+		c, ok := s.Accounts[resolved]
+		if !ok {
+			return nil
+		}
+		for name, value := range rotated {
+			// An empty rotated value means the transport's jar never saw
+			// that cookie change, not that LinkedIn cleared it — never let
+			// that blank out a good stored cookie.
+			if value == "" {
+				continue
+			}
+			if c.Cookies[name] != value {
+				if c.Cookies == nil {
+					c.Cookies = map[string]string{}
+				}
+				c.Cookies[name] = value
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		c.normalize()
+		return s.save()
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
 // List returns all stored credentials and the default alias, sorted by
 // alias so callers (e.g. `auth status`) get stable, deterministic output
 // instead of Go's randomized map iteration order.

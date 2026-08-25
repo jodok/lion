@@ -77,6 +77,21 @@ func cookiesToFHTTP(cookies map[string]string) []*fhttp.Cookie {
 	return out
 }
 
+// Snapshot implements voyager.CookieSnapshotter: it returns the transport's
+// live cookie jar, including any values LinkedIn rotated in via Set-Cookie
+// during this process's requests (JSESSIONID, li_at, and lidc rotate
+// continuously; the Cloudflare __cf_bm cookie expires — DESIGN.md §3.3), so
+// the CLI can persist them for the next invocation instead of reloading the
+// stale snapshot `auth login` stored.
+func (t *chromeTransport) Snapshot() map[string]string {
+	cookies := t.http.GetCookies(linkedInCookieURL)
+	out := make(map[string]string, len(cookies))
+	for _, c := range cookies {
+		out[c.Name] = cookieWireValue(c.Value, c.Quoted)
+	}
+	return out
+}
+
 // Do implements Transport by converting req into an fhttp request, sending
 // it through the Chrome-impersonating client, and converting the response
 // back into lion's transport-agnostic Response.

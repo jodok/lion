@@ -70,9 +70,16 @@ func newAuthLoginCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("validate session: %w", err)
 			}
+			// Save cl.Cookies() — the post-validation jar — rather than the
+			// cookies map built above: LinkedIn can rotate JSESSIONID/li_at
+			// or refresh __cf_bm during the very /me request that validates
+			// the session, and saving the pre-validation snapshot would
+			// store an already-stale credential. Without this, a login can
+			// become unusable within minutes of being saved even though it
+			// worked at the moment it was validated.
 			cred := &auth.Credential{
 				Alias:    firstNonEmpty(alias, "default"),
-				Cookies:  cookies,
+				Cookies:  cl.Cookies(),
 				MemberID: me.URN,
 				Name:     me.Name(),
 				SavedAt:  time.Now(),

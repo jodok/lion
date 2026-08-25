@@ -125,6 +125,34 @@ func New(liAt, jsessionID string, opts ...Option) *Client {
 // DryRun reports whether mutations are suppressed.
 func (c *Client) DryRun() bool { return c.dryRun }
 
+// Cookies returns the client's current cookie set: the static cookies
+// supplied at construction (New/WithCookies), overlaid with whatever the
+// transport's live jar holds if it implements CookieSnapshotter. The
+// overlay is what makes this useful — LinkedIn rotates JSESSIONID, li_at,
+// and lidc continuously, and the static set only ever reflects what was
+// seeded in, so without the live jar this would just echo back what the CLI
+// already had on disk (DESIGN.md §3.3). The snapshot wins per cookie name;
+// names only present in the static set (e.g. a transport with no jar) are
+// preserved as-is. A transport's snapshot can legitimately omit a cookie it
+// never saw rotate, so an empty snapshot value never overwrites a good
+// stored one. The returned map is always a fresh copy so callers can't
+// mutate the client's internal state through it.
+func (c *Client) Cookies() map[string]string {
+	out := make(map[string]string, len(c.cookies))
+	for k, v := range c.cookies {
+		out[k] = v
+	}
+	if snap, ok := c.transport.(CookieSnapshotter); ok {
+		for k, v := range snap.Snapshot() {
+			if v == "" {
+				continue
+			}
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // baseHeaders returns the headers common to every Voyager request. Cookies are
 // added by the transport, not here.
 func (c *Client) baseHeaders() map[string]string {

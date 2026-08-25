@@ -224,6 +224,107 @@ func TestLoadSynthesizesCookiesForOldCredentialsFile(t *testing.T) {
 	}
 }
 
+// TestUpdateCookiesRoundTripsAndRenormalizes covers the cookie-writeback
+// happy path: a rotated value overlays the stored credential, is persisted,
+// and JSESSIONID's wire quoting is corrected by the same normalize() path
+// every other write goes through, even when the rotated value arrived
+// unquoted.
+func TestUpdateCookiesRoundTripsAndRenormalizes(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at":      "orig-li-at",
+		"JSESSIONID": `"orig-jsession"`,
+		"bcookie":    "b1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", map[string]string{
+		"li_at":      "rotated-li-at",
+		"JSESSIONID": "rotated-jsession", // unquoted on purpose
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("UpdateCookies() changed = false, want true")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "rotated-li-at" {
+		t.Errorf("Cookies[li_at] = %q, want rotated-li-at", got.Cookies["li_at"])
+	}
+	if got.Cookies["JSESSIONID"] != `"rotated-jsession"` {
+		t.Errorf("Cookies[JSESSIONID] = %q, want quoted rotated-jsession", got.Cookies["JSESSIONID"])
+	}
+	// A cookie UpdateCookies never mentioned must survive untouched.
+	if got.Cookies["bcookie"] != "b1" {
+		t.Errorf("Cookies[bcookie] = %q, want untouched b1", got.Cookies["bcookie"])
+	}
+}
+
+// TestUpdateCookiesNoopWhenNothingChanged pins the "must not write" half of
+// the contract: a rotated map that already matches what's stored must
+// report changed=false and must not touch the file on disk (checked via
+// mtime, since a rewrite would bump it even with identical content).
+func TestUpdateCookiesNoopWhenNothingChanged(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at":      "same",
+		"JSESSIONID": `"same-jsession"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	home := os.Getenv("LION_HOME")
+	path := filepath.Join(home, "credentials.json")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := UpdateCookies("default", map[string]string{
+		"li_at":      "same",
+		"JSESSIONID": `"same-jsession"`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Error("UpdateCookies() changed = true, want false when nothing actually changed")
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("credentials.json was rewritten (mtime %v -> %v) despite no change", before.ModTime(), after.ModTime())
+	}
+}
+
+// TestUpdateCookiesUnknownAliasReturnsFalseNotError is the "must never break
+// a command" requirement: a writeback for an account that doesn't exist (or
+// an empty store) must not surface as an error.
+func TestUpdateCookiesUnknownAliasReturnsFalseNotError(t *testing.T) {
+	isolate(t)
+	changed, err := UpdateCookies("no-such-account", map[string]string{"li_at": "x"})
+	if err != nil {
+		t.Errorf("UpdateCookies(unknown alias) err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("UpdateCookies(unknown alias) changed = true, want false")
+	}
+
+	// Also covers the empty-store, empty-alias (resolve-to-default) case.
+	changed, err = UpdateCookies("", map[string]string{"li_at": "x"})
+	if err != nil {
+		t.Errorf("UpdateCookies(\"\") on empty store err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("UpdateCookies(\"\") on empty store changed = true, want false")
+	}
+}
+
 func TestGetNoAccount(t *testing.T) {
 	isolate(t)
 	if _, err := Get("default"); err != ErrNoAccount {

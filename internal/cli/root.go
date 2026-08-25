@@ -35,6 +35,17 @@ const (
 // through cobra's context.
 type App struct {
 	Cfg *config.Config
+
+	// clients and clientAlias record every voyager.Client this App built via
+	// Client(), and the account alias they were built for, so
+	// persistRotatedCookies can write back whatever cookies LinkedIn rotated
+	// during the command's run (DESIGN.md §3.3). A single App only ever
+	// resolves one alias per invocation (a.Cfg.Account doesn't change
+	// mid-command), so tracking one alias alongside however many clients
+	// were built is enough — every command file that calls Client() does so
+	// at most once per RunE today, but nothing stops that from changing.
+	clients     []*voyager.Client
+	clientAlias string
 }
 
 type ctxKey struct{}
@@ -90,7 +101,43 @@ func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 		voyager.WithTransport(chromeT),
 		voyager.WithDryRun(a.Cfg.DryRun),
 	}
-	return voyager.New(cred.LiAt, cred.JSessionID, append(base, opts...)...), nil
+	cl := voyager.New(cred.LiAt, cred.JSessionID, append(base, opts...)...)
+	// cred.Alias is the *resolved* alias: auth.Get("") resolves an empty
+	// a.Cfg.Account to the store's default, so this must come off the
+	// returned credential rather than a.Cfg.Account directly, or the
+	// writeback below would try to save under alias "" instead of the
+	// account it actually authenticated as.
+	a.clients = append(a.clients, cl)
+	a.clientAlias = cred.Alias
+	return cl, nil
+}
+
+// persistRotatedCookies writes back any cookies LinkedIn rotated during this
+// command's run — JSESSIONID, li_at, and lidc rotate continuously, and the
+// Cloudflare __cf_bm cookie expires (DESIGN.md §3.3) — so the next
+// invocation starts from a fresh jar instead of the stale snapshot `auth
+// login` stored, which otherwise stops working within minutes. Later
+// clients win when merging (matching how a later Set-Cookie would actually
+// supersede an earlier one within the same run).
+//
+// A writeback failure is deliberately non-fatal: this runs after the
+// command already did what it was asked to do, so a store-lock timeout or a
+// disk error here must never turn a successful command into a failing one.
+// It's reported on stderr only under --verbose, since otherwise it would be
+// noise on every single command that happens to hit it.
+func (a *App) persistRotatedCookies() {
+	if len(a.clients) == 0 {
+		return
+	}
+	merged := map[string]string{}
+	for _, cl := range a.clients {
+		for k, v := range cl.Cookies() {
+			merged[k] = v
+		}
+	}
+	if _, err := auth.UpdateCookies(a.clientAlias, merged); err != nil && a.Cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "warning: could not persist rotated session cookies: %v\n", err)
+	}
 }
 
 // requireWritable blocks a mutating command under --readonly.
@@ -171,10 +218,32 @@ func Execute() int {
 	root, app := newRootCmd(cfg)
 	ctx := context.WithValue(context.Background(), ctxKey{}, app)
 
-	if err := root.ExecuteContext(ctx); err != nil {
+	err := root.ExecuteContext(ctx)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitCode(err)
 	}
+	// Persisting cookie rotation is wired here rather than as a
+	// PersistentPostRun(E) on root: cobra only runs the *nearest*
+	// PersistentPostRun in the command tree for a given invocation — a
+	// child command that sets its own overrides the root's rather than
+	// running alongside it (short of opting into
+	// cobra.EnableTraverseRunHooks, which nothing here does). Feature
+	// verticals in this codebase self-register from independent files
+	// specifically so they don't have to coordinate with each other (see
+	// commandFactories' doc comment); a future vertical adding its own
+	// PersistentPostRunE for unrelated cleanup would silently disable
+	// cookie writeback for its whole subtree, with no compiler error and no
+	// obvious symptom beyond sessions quietly going stale again. Calling
+	// persistRotatedCookies directly here instead makes it run exactly
+	// once, whenever the command succeeded, regardless of what any
+	// subcommand does with its own hooks. Only firing on a nil err mirrors
+	// PersistentPostRun's own semantics (it doesn't run after a failing
+	// RunE either): a command that errored may have failed precisely
+	// because the session is no longer good (ErrUnauthorized), so there is
+	// no case where skipping the writeback on failure loses something a
+	// following command actually needed.
+	app.persistRotatedCookies()
 	return ExitOK
 }
 
