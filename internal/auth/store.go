@@ -337,24 +337,39 @@ func UpdateCookies(alias, baselineLiAt string, rotated map[string]string) (bool,
 		if baselineLiAt != "" && c.Cookies["li_at"] != baselineLiAt {
 			return nil
 		}
+		// rotated is the jar's full state, not a patch, so a name it omits has
+		// expired or been dropped rather than merely not been seen — the
+		// Cloudflare __cf_bm does exactly this on its short TTL. Replacing the
+		// set therefore lets an expired cookie actually go away; merging would
+		// resurrect it and re-seed the dead value on every later run.
+		//
+		// Guarded on li_at being present: a jar without the session cookie is
+		// not a credential worth writing, and persisting one would turn a
+		// recoverable "session expired, log in again" into a corrupted record.
+		next := make(map[string]string, len(rotated))
 		for name, value := range rotated {
-			// An empty rotated value means the transport's jar never saw
-			// that cookie change, not that LinkedIn cleared it — never let
-			// that blank out a good stored cookie.
 			if value == "" {
 				continue
 			}
-			if c.Cookies[name] != value {
-				if c.Cookies == nil {
-					c.Cookies = map[string]string{}
-				}
-				c.Cookies[name] = value
-				changed = true
-			}
+			next[name] = value
 		}
-		if !changed {
+		if next["li_at"] == "" {
 			return nil
 		}
+		if len(next) == len(c.Cookies) {
+			same := true
+			for name, value := range next {
+				if c.Cookies[name] != value {
+					same = false
+					break
+				}
+			}
+			if same {
+				return nil
+			}
+		}
+		changed = true
+		c.Cookies = next
 		c.normalize()
 		return s.save()
 	})

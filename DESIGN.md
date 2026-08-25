@@ -325,8 +325,15 @@ Four details worth keeping:
    credential is still the same session: if an `auth login` replaced the alias
    mid-command, applying our jar would splice the old session's authentication
    onto the new account's record.
-3. **An empty snapshot value never overwrites a stored cookie** — it means the
-   jar never saw that cookie, not that LinkedIn cleared it.
+3. **The jar's snapshot replaces the stored cookie set; it is not merged into
+   it.** The jar was seeded with exactly the stored cookies, so it already is
+   "everything we started with, plus rotations, minus anything that expired" —
+   and that last part is why merging is wrong. A name the jar omits has been
+   dropped or has expired (the Cloudflare `__cf_bm` does this on its short
+   TTL); overlaying onto the stored set would resurrect the dead value and
+   re-seed it on every later run. Empty values are skipped, and a set without
+   `li_at` is refused outright rather than written — a session-less credential
+   turns a recoverable "log in again" into a corrupted record.
 4. **The snapshot reconstructs each cookie's wire form,** because both cookie
    parsers move a quoted value's quotes into `Cookie.Quoted` instead of leaving
    them in `Value`. Without that, JSESSIONID sheds its quotes a little more on

@@ -44,10 +44,16 @@ func (s *snapshotTransport) Snapshot() map[string]string { return s.snapshot }
 // live jar (a stand-in for cookies LinkedIn rotated in mid-session) wins
 // per-name over the static cookies passed at construction, while a name only
 // present in the static set is preserved.
-func TestCookiesOverlaysSnapshotOverStatic(t *testing.T) {
+func TestCookiesUsesSnapshotAsAuthoritativeSet(t *testing.T) {
+	// The jar is seeded with the static cookies, so its contents are already
+	// "what we started with, plus rotations, minus anything that expired".
+	// bcookie is deliberately absent from the snapshot: it must NOT come back
+	// from the static set, or an expired cookie would be resurrected and
+	// re-seeded on every later run.
 	st := &snapshotTransport{snapshot: map[string]string{
-		"JSESSIONID": `"rotated:1"`, // rotated: overrides the static value
-		"lidc":       "dc-2",        // new cookie the jar picked up mid-session
+		"li_at":      "li_at_test",
+		"JSESSIONID": `"rotated:1"`, // rotated mid-session
+		"lidc":       "dc-2",        // picked up mid-session
 	}}
 	c := New("li_at_test", `"jsession_test"`, WithTransport(st),
 		WithCookies(map[string]string{"bcookie": "static-b"}))
@@ -56,7 +62,6 @@ func TestCookiesOverlaysSnapshotOverStatic(t *testing.T) {
 		"li_at":      "li_at_test",
 		"JSESSIONID": `"rotated:1"`,
 		"lidc":       "dc-2",
-		"bcookie":    "static-b",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("Cookies() = %#v, want %#v", got, want)
@@ -65,6 +70,9 @@ func TestCookiesOverlaysSnapshotOverStatic(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("Cookies()[%q] = %q, want %q", k, got[k], v)
 		}
+	}
+	if _, ok := got["bcookie"]; ok {
+		t.Error("a cookie the jar dropped was resurrected from the static set")
 	}
 }
 
@@ -92,12 +100,20 @@ func TestCookiesWithoutSnapshotterReturnsStaticCopy(t *testing.T) {
 // whose jar never saw a particular cookie rotate reports it back as "" (the
 // zero value for a name it never observed), and that must never blank out a
 // good cookie the static set already had.
-func TestCookiesEmptySnapshotValueDoesNotEraseStored(t *testing.T) {
-	st := &snapshotTransport{snapshot: map[string]string{"li_at": ""}}
+func TestCookiesSkipsEmptySnapshotValues(t *testing.T) {
+	// A jar entry with no value carries nothing worth persisting, so it is
+	// dropped rather than written. auth.UpdateCookies then refuses the whole
+	// set for lacking li_at, which is the safe outcome: better to keep the
+	// stored credential and let the user re-authenticate than to write a
+	// session-less record.
+	st := &snapshotTransport{snapshot: map[string]string{"li_at": "", "lidc": "dc-2"}}
 	c := New("li_at_test", `"jsession_test"`, WithTransport(st))
 	got := c.Cookies()
-	if got["li_at"] != "li_at_test" {
-		t.Errorf("Cookies()[li_at] = %q, want the stored value preserved (li_at_test)", got["li_at"])
+	if _, ok := got["li_at"]; ok {
+		t.Errorf("Cookies()[li_at] = %q, want the empty entry dropped", got["li_at"])
+	}
+	if got["lidc"] != "dc-2" {
+		t.Errorf("Cookies()[lidc] = %q, want dc-2", got["lidc"])
 	}
 }
 

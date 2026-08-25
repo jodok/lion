@@ -320,8 +320,11 @@ func (r *rotatingTransport) Snapshot() map[string]string { return r.snapshot }
 func TestPersistRotatedCookiesWritesBackToStore(t *testing.T) {
 	isolateHome(t)
 	saveFakeAccount(t)
+	// A live jar always carries li_at — it was seeded with it and it hasn't
+	// expired — so the snapshot is the full session, not just the deltas.
 	cl := voyager.New("test-li-at", `"test-jsession"`,
 		voyager.WithTransport(&rotatingTransport{snapshot: map[string]string{
+			"li_at":      "test-li-at",
 			"JSESSIONID": `"rotated:9"`,
 			"lidc":       "dc-3",
 		}}))
@@ -338,10 +341,31 @@ func TestPersistRotatedCookiesWritesBackToStore(t *testing.T) {
 	if got.Cookies["lidc"] != "dc-3" {
 		t.Errorf("Cookies[lidc] = %q, want dc-3", got.Cookies["lidc"])
 	}
-	// li_at wasn't in the transport's snapshot, so the originally-saved
-	// value must survive untouched.
 	if got.Cookies["li_at"] != "test-li-at" {
-		t.Errorf("Cookies[li_at] = %q, want the original test-li-at preserved", got.Cookies["li_at"])
+		t.Errorf("Cookies[li_at] = %q, want test-li-at", got.Cookies["li_at"])
+	}
+}
+
+// TestPersistRotatedCookiesRefusesSessionlessJar pins the safety guard at the
+// CLI level: if the jar somehow comes back without li_at, nothing is written
+// and the stored credential survives for the user to retry with.
+func TestPersistRotatedCookiesRefusesSessionlessJar(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	cl := voyager.New("test-li-at", `"test-jsession"`,
+		voyager.WithTransport(&rotatingTransport{snapshot: map[string]string{"lidc": "dc-3"}}))
+	app := &App{Cfg: &config.Config{}, clients: []*voyager.Client{cl}, clientAlias: "default"}
+	app.persistRotatedCookies()
+
+	got, err := auth.Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "test-li-at" {
+		t.Errorf("Cookies[li_at] = %q, want the stored credential untouched", got.Cookies["li_at"])
+	}
+	if _, ok := got.Cookies["lidc"]; ok {
+		t.Error("a session-less jar was written to the store")
 	}
 }
 

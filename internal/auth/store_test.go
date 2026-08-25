@@ -241,6 +241,7 @@ func TestUpdateCookiesRoundTripsAndRenormalizes(t *testing.T) {
 	changed, err := UpdateCookies("default", "", map[string]string{
 		"li_at":      "rotated-li-at",
 		"JSESSIONID": "rotated-jsession", // unquoted on purpose
+		"bcookie":    "b1",               // still in the jar, so still stored
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,9 +259,9 @@ func TestUpdateCookiesRoundTripsAndRenormalizes(t *testing.T) {
 	if got.Cookies["JSESSIONID"] != `"rotated-jsession"` {
 		t.Errorf("Cookies[JSESSIONID] = %q, want quoted rotated-jsession", got.Cookies["JSESSIONID"])
 	}
-	// A cookie UpdateCookies never mentioned must survive untouched.
+	// A cookie the jar still holds is carried through unchanged.
 	if got.Cookies["bcookie"] != "b1" {
-		t.Errorf("Cookies[bcookie] = %q, want untouched b1", got.Cookies["bcookie"])
+		t.Errorf("Cookies[bcookie] = %q, want b1", got.Cookies["bcookie"])
 	}
 }
 
@@ -376,7 +377,9 @@ func TestUpdateCookiesAppliesWhenSessionMatches(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{"lidc": "b=OGST00"})
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`, "lidc": "b=OGST00",
+	})
 	if err != nil || !changed {
 		t.Fatalf("UpdateCookies = (%v, %v), want (true, nil)", changed, err)
 	}
@@ -386,5 +389,62 @@ func TestUpdateCookiesAppliesWhenSessionMatches(t *testing.T) {
 	}
 	if got.Cookies["lidc"] != "b=OGST00" {
 		t.Errorf("lidc = %q, want the rotation applied", got.Cookies["lidc"])
+	}
+}
+
+// TestUpdateCookiesRemovesExpiredCookie covers the reason writeback replaces
+// the cookie set instead of merging into it. The jar's contents are its full
+// state, so a name it omits has expired — the Cloudflare __cf_bm does this on
+// its short TTL. Merging would resurrect the dead value and re-seed it on
+// every later run, which is the opposite of browser-equivalent persistence.
+func TestUpdateCookiesRemovesExpiredCookie(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`, "__cf_bm": "expired-value",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// The jar no longer holds __cf_bm.
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	})
+	if err != nil || !changed {
+		t.Fatalf("UpdateCookies = (%v, %v), want (true, nil)", changed, err)
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := got.Cookies["__cf_bm"]; ok {
+		t.Errorf("__cf_bm = %q, want it gone once the jar dropped it", v)
+	}
+	if got.Cookies["li_at"] != "SESSION-A" {
+		t.Errorf("li_at = %q, want it preserved", got.Cookies["li_at"])
+	}
+}
+
+// TestUpdateCookiesRefusesSetWithoutSession guards the replace path: a jar
+// with no li_at is not a credential worth writing, and persisting one would
+// turn a recoverable "log in again" into a corrupted record.
+func TestUpdateCookiesRefusesSetWithoutSession(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{"lidc": "dc-2"})
+	if err != nil {
+		t.Fatalf("UpdateCookies err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("a session-less cookie set was written; want it refused")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "SESSION-A" {
+		t.Errorf("li_at = %q, want the stored credential left intact", got.Cookies["li_at"])
 	}
 }
