@@ -20,7 +20,7 @@ func newMessageCmd() *cobra.Command {
 		Use:   "message",
 		Short: "Read and send LinkedIn messages",
 	}
-	cmd.AddCommand(newMessageListCmd(), newMessageReadCmd(), newMessageSendCmd())
+	cmd.AddCommand(newMessageListCmd(), newMessageReadCmd(), newMessageSendCmd(), newMessageExportCmd())
 	return cmd
 }
 

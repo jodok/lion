@@ -1,0 +1,604 @@
+// Package cli's sync.go implements `lion sync`: the network pass that
+// populates internal/store from LinkedIn, following the same
+// sync-then-read-locally architecture as wacli (https://wacli.sh) rather
+// than lion's other commands' one-shot API-to-stdout shape. See
+// internal/store's package doc for why, and export.go for the read side.
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/jodok/lion/internal/output"
+	"github.com/jodok/lion/internal/store"
+	"github.com/jodok/lion/internal/voyager"
+	"github.com/spf13/cobra"
+)
+
+func init() { registerCommand(newSyncCmd) }
+
+// defaultConversationPageSize/defaultMessagePageSize bound how much a
+// single fetched page (and therefore a single store transaction — see
+// store.WithTx) covers. Smaller than LinkedIn's own server-side default so
+// an interrupted sync loses at most a small page's worth of in-flight work,
+// not a huge one.
+const (
+	defaultConversationPageSize = 25
+	defaultMessagePageSize      = 50
+)
+
+// errMaxDBSizeReached stops a sync cleanly once the store would exceed
+// --max-db-size, the same way a rate-limit budget stops it: reported on
+// stderr, folded into complete:false, not treated as a crash.
+var errMaxDBSizeReached = errors.New("store size limit reached (--max-db-size)")
+
+func newSyncCmd() *cobra.Command {
+	var (
+		backfill         bool
+		after            string
+		maxConversations int
+		maxMessages      int
+		maxDBSize        string
+		storePath        string
+		once             bool
+		follow           bool
+		interval         time.Duration
+		events           bool
+		lockWait         time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "sync",
+		Short: "Sync messages into lion's local store",
+		Long: "Sync fetches conversations and messages from LinkedIn into a local " +
+			"SQLite store ($LION_HOME/store.db by default), so `lion message " +
+			"export` can read them offline without touching the network. It is " +
+			"read-only with respect to LinkedIn — it never posts, sends, or " +
+			"mutates anything there — so it works under --readonly and never " +
+			"prompts.\n\n" +
+			"A full first sync WILL be slow: every request goes through the same " +
+			"rate limiter as every other lion command, with the same conservative " +
+			"pacing. That's the account-safety feature this command exists to keep, " +
+			"not a bug — a sync that hammered LinkedIn as fast as the network " +
+			"allowed is exactly the bot-shaped traffic the rate limiter is here to " +
+			"avoid. Re-running sync is cheap: catch-up mode stops as soon as it " +
+			"reaches a message already in the store.\n\n" +
+			"Unlike wacli, which defaults to following (it holds a live WhatsApp " +
+			"Web socket and receives pushes for free), lion has no push channel: " +
+			"following here means polling LinkedIn on a timer, which is precisely " +
+			"the bot-shaped traffic the rate limiter exists to avoid. So sync " +
+			"defaults to --once, and --follow is opt-in.",
+		Args: usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if once && follow {
+				return usageErr("--once and --follow are mutually exclusive")
+			}
+
+			var afterMs *int64
+			if after != "" {
+				ms, err := parseTimeFlag("after", after)
+				if err != nil {
+					return err
+				}
+				afterMs = &ms
+			}
+			var maxDBSizeBytes int64
+			if maxDBSize != "" {
+				b, err := parseSize(maxDBSize)
+				if err != nil {
+					return err
+				}
+				maxDBSizeBytes = b
+			}
+			if follow && interval <= 0 {
+				return usageErr("--interval must be positive")
+			}
+
+			app := appFrom(cmd)
+			cl, err := app.Client()
+			if err != nil {
+				return err
+			}
+
+			path := storePath
+			if path == "" {
+				path, err = store.DefaultPath()
+				if err != nil {
+					return err
+				}
+			}
+			st, err := store.Open(path)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			// Ctrl-C during a long sync must still leave the store consistent
+			// and report complete:false honestly, rather than a hard kill that
+			// leaves the caller unsure what landed. Each fetched page already
+			// commits in its own transaction (store.WithTx), so cancellation
+			// between pages loses at most the in-flight one.
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+			defer stop()
+
+			progress := newProgressReporter(os.Stderr, events)
+			defer progress.Close()
+
+			if !st.LockSupported() {
+				progress.Warn("no inter-process lock on this platform; a concurrent `lion sync` could interleave writes")
+			}
+			release, err := st.Lock(ctx, lockWait)
+			if err != nil {
+				return err
+			}
+			defer release()
+
+			opts := syncOptions{
+				backfill:         backfill,
+				afterMs:          afterMs,
+				maxConversations: maxConversations,
+				maxMessages:      maxMessages,
+				maxDBSizeBytes:   maxDBSizeBytes,
+			}
+
+			r := app.Renderer()
+			for {
+				summary, passErr := runSyncPass(ctx, cl, st, opts, progress)
+				// Bare JSON objects on stdout, deliberately NOT wrapped in a
+				// wacli-style {"success":...,"data":...} envelope: lion's
+				// other commands already ship bare JSON as their public
+				// --json contract, and a reviewer already rejected one
+				// silent field rename here for breaking automation.
+				// Introducing a second convention alongside that one would
+				// be worse than picking either consistently, so sync and
+				// export follow the rest of lion instead of the reference.
+				if emitErr := emitSyncSummary(r, app.Cfg.JSON, summary); emitErr != nil {
+					if passErr != nil {
+						return errors.Join(passErr, emitErr)
+					}
+					return emitErr
+				}
+				if passErr != nil {
+					return passErr
+				}
+				if !follow {
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(interval):
+				}
+			}
+		},
+	}
+
+	cmd.Flags().BoolVar(&backfill, "backfill", false, "after catching up, page backwards from the oldest stored message until history is exhausted")
+	cmd.Flags().StringVar(&after, "after", "", "only sync conversations/messages at or after this time (RFC3339 or YYYY-MM-DD)")
+	cmd.Flags().IntVar(&maxConversations, "max-conversations", 0, "cap the number of conversations processed this run (0 = no cap)")
+	cmd.Flags().IntVar(&maxMessages, "max-messages", 0, "cap the number of messages fetched this run (0 = no cap)")
+	cmd.Flags().StringVar(&maxDBSize, "max-db-size", "", "stop cleanly before the store would exceed this size (e.g. 500MB, 2GB)")
+	cmd.Flags().StringVar(&storePath, "store", "", "path to the store database (default $LION_HOME/store.db)")
+	cmd.Flags().BoolVar(&once, "once", false, "sync a single pass and exit (the default; accepted explicitly to match wacli)")
+	cmd.Flags().BoolVar(&follow, "follow", false, "keep syncing every --interval instead of exiting after one pass (opt-in — see command help)")
+	cmd.Flags().DurationVar(&interval, "interval", 60*time.Second, "how often to sync again under --follow")
+	cmd.Flags().BoolVar(&events, "events", false, "emit NDJSON progress events on stderr instead of a status line")
+	cmd.Flags().DurationVar(&lockWait, "lock-wait", 0, "wait up to this long for another `lion sync` to release the store lock instead of failing immediately")
+	return cmd
+}
+
+// syncOptions bundles one pass's parameters so runSyncPass doesn't carry a
+// long, error-prone positional-argument list.
+type syncOptions struct {
+	backfill         bool
+	afterMs          *int64
+	maxConversations int
+	maxMessages      int
+	maxDBSizeBytes   int64
+}
+
+// syncSummary is sync's stdout contract: conversations seen/updated,
+// messages added, elapsed time, and complete:true|false. complete is false
+// whenever anything cut the pass short — a budget, the store size cap, an
+// error, or cancellation — so a caller can never mistake a partial sync for
+// a finished one.
+type syncSummary struct {
+	ConversationsSeen    int    `json:"conversations_seen"`
+	ConversationsUpdated int    `json:"conversations_updated"`
+	MessagesAdded        int    `json:"messages_added"`
+	Elapsed              string `json:"elapsed"`
+	Complete             bool   `json:"complete"`
+}
+
+func emitSyncSummary(r *output.Renderer, jsonOut bool, s syncSummary) error {
+	if jsonOut {
+		return r.Emit(s)
+	}
+	return r.Emit(&output.Table{
+		Cols: []string{"CONVERSATIONS_SEEN", "CONVERSATIONS_UPDATED", "MESSAGES_ADDED", "ELAPSED", "COMPLETE"},
+		Rows: [][]string{{
+			fmt.Sprintf("%d", s.ConversationsSeen),
+			fmt.Sprintf("%d", s.ConversationsUpdated),
+			fmt.Sprintf("%d", s.MessagesAdded),
+			s.Elapsed,
+			fmt.Sprintf("%t", s.Complete),
+		}},
+	})
+}
+
+// runSyncPass runs one full sync pass: discover conversations, then catch
+// up (and optionally backfill) each one's messages. It always returns a
+// summary, even on error — the caller emits it either way (see the
+// "partial runs must be honest" rule) — and err is non-nil whenever the
+// pass didn't finish everything it set out to do, in which case
+// summary.Complete is always false.
+func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) (syncSummary, error) {
+	start := time.Now()
+	summary := syncSummary{Complete: true}
+
+	toProcess, err := discoverConversations(ctx, cl, st, opts, progress)
+	if err != nil {
+		summary.Complete = false
+		summary.ConversationsSeen = len(toProcess)
+		summary.Elapsed = formatDuration(time.Since(start))
+		return summary, err
+	}
+	summary.ConversationsSeen = len(toProcess)
+
+	var budget *int
+	if opts.maxMessages > 0 {
+		b := opts.maxMessages
+		budget = &b
+	}
+
+	for _, conv := range toProcess {
+		if ctx.Err() != nil {
+			summary.Complete = false
+			summary.Elapsed = formatDuration(time.Since(start))
+			return summary, ctx.Err()
+		}
+		if budget != nil && *budget <= 0 {
+			progress.Warn("--max-messages reached; stopping before conversation %s", conv.ID)
+			summary.Complete = false
+			break
+		}
+
+		progress.Status("syncing %s (%s)", conv.ID, firstNonEmpty(conv.Participants...))
+		progress.Event("conversation_start", map[string]any{"id": conv.ID, "urn": conv.URN})
+
+		added, err := catchUpMessages(ctx, cl, st, conv, opts, budget, progress)
+		summary.MessagesAdded += added
+		if err != nil {
+			if errors.Is(err, errMaxDBSizeReached) {
+				progress.Warn("%s", err)
+				summary.Complete = false
+				break
+			}
+			summary.Complete = false
+			summary.Elapsed = formatDuration(time.Since(start))
+			return summary, err
+		}
+		if added > 0 {
+			summary.ConversationsUpdated++
+		}
+
+		if opts.backfill {
+			bAdded, err := backfillMessages(ctx, cl, st, conv.ID, opts, budget, progress)
+			summary.MessagesAdded += bAdded
+			if bAdded > 0 && added == 0 {
+				summary.ConversationsUpdated++
+			}
+			if err != nil {
+				if errors.Is(err, errMaxDBSizeReached) {
+					progress.Warn("%s", err)
+					summary.Complete = false
+					break
+				}
+				summary.Complete = false
+				summary.Elapsed = formatDuration(time.Since(start))
+				return summary, err
+			}
+		}
+	}
+
+	progress.Event("sync_complete", map[string]any{
+		"conversations_seen":    summary.ConversationsSeen,
+		"conversations_updated": summary.ConversationsUpdated,
+		"messages_added":        summary.MessagesAdded,
+		"complete":              summary.Complete,
+	})
+	summary.Elapsed = formatDuration(time.Since(start))
+	return summary, nil
+}
+
+// discoverConversations pages newest-to-older through ConversationsPage,
+// upserting each page (one store transaction per page) and collecting the
+// conversations this pass will sync messages for. It stops when
+// --max-conversations is reached, when a page's oldest conversation is
+// already older than --after (pages are newest-first, so nothing further
+// back can pass the filter either), or when there are no more pages.
+func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) ([]voyager.Conversation, error) {
+	var toProcess []voyager.Conversation
+	var createdBefore int64
+
+	for {
+		if ctx.Err() != nil {
+			return toProcess, ctx.Err()
+		}
+		convs, next, err := cl.ConversationsPage(ctx, createdBefore, defaultConversationPageSize)
+		if err != nil {
+			return toProcess, err
+		}
+		if len(convs) == 0 {
+			return toProcess, nil
+		}
+
+		now := time.Now().UnixMilli()
+		err = st.WithTx(ctx, func(tx *store.Tx) error {
+			for _, c := range convs {
+				if c.ID == "" {
+					// conversationIDFromURN couldn't parse this one (an
+					// unexpected URN shape) — nothing to key a row on, so
+					// skip it rather than guess an id (see voyager.Conversation.ID).
+					progress.Warn("skipping a conversation with no parseable id (urn=%q)", c.URN)
+					continue
+				}
+				if err := tx.UpsertConversation(ctx, toStoreConversation(c), now); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return toProcess, err
+		}
+
+		oldestInPage := convs[0].UpdatedAt
+		for _, c := range convs {
+			if c.UpdatedAt < oldestInPage {
+				oldestInPage = c.UpdatedAt
+			}
+			if c.ID == "" {
+				continue
+			}
+			if opts.afterMs != nil && c.UpdatedAt < *opts.afterMs {
+				continue
+			}
+			toProcess = append(toProcess, c)
+			progress.Event("conversation_discovered", map[string]any{"id": c.ID, "urn": c.URN})
+			if opts.maxConversations > 0 && len(toProcess) >= opts.maxConversations {
+				return toProcess, nil
+			}
+		}
+
+		if next == 0 {
+			return toProcess, nil
+		}
+		if opts.afterMs != nil && oldestInPage < *opts.afterMs {
+			return toProcess, nil
+		}
+		createdBefore = next
+	}
+}
+
+// catchUpMessages walks a conversation's messages newest-to-older, one page
+// per store transaction, stopping as soon as a fetched page contains a
+// message already in the store (RecordMessagePage's added count comes back
+// short of the page size) — that's the "already caught up" signal, per
+// sync's catch-up contract. It also stops at --after, at a --max-messages
+// budget, or at --max-db-size.
+func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, err error) {
+	var createdBefore int64
+	for {
+		if ctx.Err() != nil {
+			return added, ctx.Err()
+		}
+		if budget != nil && *budget <= 0 {
+			return added, nil
+		}
+		pageSize := defaultMessagePageSize
+		if budget != nil && *budget < pageSize {
+			pageSize = *budget
+		}
+
+		msgs, next, err := cl.MessagesPage(ctx, conv.ID, createdBefore, pageSize)
+		if err != nil {
+			return added, err
+		}
+		if len(msgs) == 0 {
+			return added, nil
+		}
+
+		pageAdded, err := applyMessagePage(ctx, st, conv.ID, msgs)
+		if err != nil {
+			return added, err
+		}
+		added += pageAdded
+		if budget != nil {
+			*budget -= len(msgs)
+		}
+		progress.Status("syncing %s: +%d messages (%d so far)", conv.ID, pageAdded, added)
+		progress.Event("messages_stored", map[string]any{"conversation_id": conv.ID, "added": pageAdded, "phase": "catch_up"})
+
+		if opts.maxDBSizeBytes > 0 {
+			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
+				return added, err
+			} else if reached {
+				return added, errMaxDBSizeReached
+			}
+		}
+
+		if pageAdded < len(msgs) {
+			return added, nil // hit a message we already had: caught up
+		}
+		if next == 0 {
+			return added, nil
+		}
+		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
+			return added, nil
+		}
+		createdBefore = next
+	}
+}
+
+// backfillMessages continues paging a conversation's messages backwards
+// from where it's already synced to (OldestSynced) until a page comes back
+// empty — the signal that paging reached the true start of the
+// conversation — at which point it marks BackfillDone so a later plain sync
+// knows there's nothing older to fetch. Stopping early (--after, a budget,
+// --max-db-size, or the ConversationsPage/MessagesPage non-decreasing-cursor
+// guard tripping) does NOT set BackfillDone: only actually reaching the
+// start does.
+func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conversationID string, opts syncOptions, budget *int, progress *progressReporter) (added int, err error) {
+	current, ok, err := st.Conversation(ctx, conversationID)
+	if err != nil {
+		return 0, err
+	}
+	if !ok || current.BackfillDone {
+		return 0, nil
+	}
+	var createdBefore int64
+	if current.OldestSynced != nil {
+		createdBefore = *current.OldestSynced
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return added, ctx.Err()
+		}
+		if budget != nil && *budget <= 0 {
+			return added, nil
+		}
+		pageSize := defaultMessagePageSize
+		if budget != nil && *budget < pageSize {
+			pageSize = *budget
+		}
+
+		msgs, next, err := cl.MessagesPage(ctx, conversationID, createdBefore, pageSize)
+		if err != nil {
+			return added, err
+		}
+		if len(msgs) == 0 {
+			now := time.Now().UnixMilli()
+			err := st.WithTx(ctx, func(tx *store.Tx) error {
+				return tx.MarkBackfillDone(ctx, conversationID, now)
+			})
+			if err != nil {
+				return added, err
+			}
+			progress.Event("backfill_done", map[string]any{"conversation_id": conversationID})
+			return added, nil
+		}
+
+		pageAdded, err := applyMessagePage(ctx, st, conversationID, msgs)
+		if err != nil {
+			return added, err
+		}
+		added += pageAdded
+		if budget != nil {
+			*budget -= len(msgs)
+		}
+		progress.Status("backfilling %s: +%d messages (%d so far)", conversationID, pageAdded, added)
+		progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": pageAdded, "phase": "backfill"})
+
+		if opts.maxDBSizeBytes > 0 {
+			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
+				return added, err
+			} else if reached {
+				return added, errMaxDBSizeReached
+			}
+		}
+
+		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
+			return added, nil // hit the user's --after bound, not the true start
+		}
+		if next == 0 {
+			return added, nil // cursor stopped decreasing; see doc comment above
+		}
+		createdBefore = next
+	}
+}
+
+// applyMessagePage upserts one fetched page inside its own transaction, so
+// an interruption right after this call leaves the store holding exactly
+// that page — never half of it.
+func applyMessagePage(ctx context.Context, st *store.Store, conversationID string, msgs []voyager.Message) (added int, err error) {
+	err = st.WithTx(ctx, func(tx *store.Tx) error {
+		var e error
+		added, e = tx.RecordMessagePage(ctx, conversationID, toStoreMessages(msgs, conversationID), time.Now().UnixMilli())
+		return e
+	})
+	return added, err
+}
+
+func storeSizeReached(st *store.Store, maxBytes int64) (bool, error) {
+	size, err := st.SizeBytes()
+	if err != nil {
+		return false, err
+	}
+	return size >= maxBytes, nil
+}
+
+func oldestSentAt(msgs []voyager.Message) int64 {
+	oldest := msgs[0].SentAt
+	for _, m := range msgs[1:] {
+		if m.SentAt < oldest {
+			oldest = m.SentAt
+		}
+	}
+	return oldest
+}
+
+// toStoreConversation translates the voyager API type to the store's
+// persisted type. These are deliberately distinct types (see
+// store.Conversation's doc comment) — this is the one place that bridges
+// them, so a field added to either side has one obvious spot to wire up.
+func toStoreConversation(c voyager.Conversation) store.Conversation {
+	// Indexed by the longer of the two slices, not just Participants: a
+	// participant whose display name didn't resolve (no MiniProfile found
+	// in included[] — see decodeConversations) still has a URN worth
+	// keeping, and ranging over Participants alone would silently drop it.
+	n := len(c.Participants)
+	if len(c.ParticipantURNs) > n {
+		n = len(c.ParticipantURNs)
+	}
+	participants := make([]store.Participant, 0, n)
+	for i := 0; i < n; i++ {
+		var name, urn string
+		if i < len(c.Participants) {
+			name = c.Participants[i]
+		}
+		if i < len(c.ParticipantURNs) {
+			urn = c.ParticipantURNs[i]
+		}
+		participants = append(participants, store.Participant{Name: name, URN: urn})
+	}
+	return store.Conversation{
+		ID:           c.ID,
+		URN:          c.URN,
+		Participants: participants,
+		UpdatedAt:    c.UpdatedAt,
+		Unread:       c.Unread,
+	}
+}
+
+// toStoreMessages translates a page of voyager messages to the store's
+// persisted type, stamping in the conversation id (the events endpoint
+// response doesn't carry it — see voyager.MessagesPage).
+func toStoreMessages(msgs []voyager.Message, conversationID string) []store.Message {
+	out := make([]store.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = store.Message{
+			URN:            m.URN,
+			ConversationID: conversationID,
+			SenderName:     m.From,
+			SenderURN:      m.FromURN,
+			SentAt:         m.SentAt,
+			Body:           m.Text,
+		}
+	}
+	return out
+}
