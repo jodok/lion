@@ -46,6 +46,11 @@ type App struct {
 	// at most once per RunE today, but nothing stops that from changing.
 	clients     []*voyager.Client
 	clientAlias string
+	// clientLiAt is the li_at the clients were built from, handed to
+	// auth.UpdateCookies as a compare-and-swap on session identity so a
+	// concurrent `auth login` that replaced this alias mid-command doesn't get
+	// the old session's cookies spliced onto its record.
+	clientLiAt string
 }
 
 type ctxKey struct{}
@@ -109,6 +114,7 @@ func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 	// account it actually authenticated as.
 	a.clients = append(a.clients, cl)
 	a.clientAlias = cred.Alias
+	a.clientLiAt = cred.LiAt
 	return cl, nil
 }
 
@@ -135,7 +141,7 @@ func (a *App) persistRotatedCookies() {
 			merged[k] = v
 		}
 	}
-	if _, err := auth.UpdateCookies(a.clientAlias, merged); err != nil && a.Cfg.Verbose {
+	if _, err := auth.UpdateCookies(a.clientAlias, a.clientLiAt, merged); err != nil && a.Cfg.Verbose {
 		fmt.Fprintf(os.Stderr, "warning: could not persist rotated session cookies: %v\n", err)
 	}
 }
@@ -221,6 +227,21 @@ func Execute() int {
 	err := root.ExecuteContext(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		// A failed command still rotated cookies on its way to failing, and
+		// most failures say nothing about the session: a 404, a local budget
+		// stop, or a usage error leaves the jar every bit as valid as a
+		// success would. Discarding those rotations would reintroduce exactly
+		// the slow decay this writeback exists to stop, just at a lower rate.
+		//
+		// The exception is a failure that means the session itself is gone.
+		// LinkedIn answers a dead session by clearing the cookie
+		// (Set-Cookie: li_at=delete me, DESIGN.md §3.3), so persisting that
+		// jar would overwrite a good stored credential with the wipe — and a
+		// challenge response is no more trustworthy. Keep what was stored and
+		// let the user re-run `auth login`.
+		if !errors.Is(err, voyager.ErrUnauthorized) && !errors.Is(err, voyager.ErrChallenge) {
+			app.persistRotatedCookies()
+		}
 		return exitCode(err)
 	}
 	// Persisting cookie rotation is wired here rather than as a
@@ -237,12 +258,9 @@ func Execute() int {
 	// obvious symptom beyond sessions quietly going stale again. Calling
 	// persistRotatedCookies directly here instead makes it run exactly
 	// once, whenever the command succeeded, regardless of what any
-	// subcommand does with its own hooks. Only firing on a nil err mirrors
-	// PersistentPostRun's own semantics (it doesn't run after a failing
-	// RunE either): a command that errored may have failed precisely
-	// because the session is no longer good (ErrUnauthorized), so there is
-	// no case where skipping the writeback on failure loses something a
-	// following command actually needed.
+	// subcommand does with its own hooks. It also runs on the failure path
+	// above — a command that failed for an unrelated reason still rotated
+	// cookies worth keeping — with the auth failures carved out there.
 	app.persistRotatedCookies()
 	return ExitOK
 }

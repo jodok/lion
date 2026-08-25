@@ -238,7 +238,7 @@ func TestUpdateCookiesRoundTripsAndRenormalizes(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := UpdateCookies("default", map[string]string{
+	changed, err := UpdateCookies("default", "", map[string]string{
 		"li_at":      "rotated-li-at",
 		"JSESSIONID": "rotated-jsession", // unquoted on purpose
 	})
@@ -283,7 +283,7 @@ func TestUpdateCookiesNoopWhenNothingChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := UpdateCookies("default", map[string]string{
+	changed, err := UpdateCookies("default", "", map[string]string{
 		"li_at":      "same",
 		"JSESSIONID": `"same-jsession"`,
 	})
@@ -307,7 +307,7 @@ func TestUpdateCookiesNoopWhenNothingChanged(t *testing.T) {
 // an empty store) must not surface as an error.
 func TestUpdateCookiesUnknownAliasReturnsFalseNotError(t *testing.T) {
 	isolate(t)
-	changed, err := UpdateCookies("no-such-account", map[string]string{"li_at": "x"})
+	changed, err := UpdateCookies("no-such-account", "", map[string]string{"li_at": "x"})
 	if err != nil {
 		t.Errorf("UpdateCookies(unknown alias) err = %v, want nil", err)
 	}
@@ -316,7 +316,7 @@ func TestUpdateCookiesUnknownAliasReturnsFalseNotError(t *testing.T) {
 	}
 
 	// Also covers the empty-store, empty-alias (resolve-to-default) case.
-	changed, err = UpdateCookies("", map[string]string{"li_at": "x"})
+	changed, err = UpdateCookies("", "", map[string]string{"li_at": "x"})
 	if err != nil {
 		t.Errorf("UpdateCookies(\"\") on empty store err = %v, want nil", err)
 	}
@@ -329,5 +329,62 @@ func TestGetNoAccount(t *testing.T) {
 	isolate(t)
 	if _, err := Get("default"); err != ErrNoAccount {
 		t.Errorf("Get on empty store = %v, want ErrNoAccount", err)
+	}
+}
+
+// TestUpdateCookiesRejectsStaleSession covers the write race the store lock
+// cannot see: a command starts against one session, an `auth login` replaces
+// the same alias mid-command, and the command's writeback then arrives holding
+// the previous session's cookies. Applying them would splice the old session's
+// authentication onto the new account's record, leaving a credential that
+// belongs to neither.
+func TestUpdateCookiesRejectsStaleSession(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-B", "JSESSIONID": `"ajax:b"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Writeback from a client built against the *previous* session.
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A-ROTATED", "lidc": "b=OGST00",
+	})
+	if err != nil {
+		t.Fatalf("UpdateCookies err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("stale writeback was applied; want it dropped")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "SESSION-B" {
+		t.Errorf("li_at = %q, want the newer session's value untouched", got.Cookies["li_at"])
+	}
+	if _, ok := got.Cookies["lidc"]; ok {
+		t.Error("stale writeback leaked a cookie into the newer credential")
+	}
+}
+
+// TestUpdateCookiesAppliesWhenSessionMatches is the other half: a writeback
+// whose baseline still matches the stored session must land.
+func TestUpdateCookiesAppliesWhenSessionMatches(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{"lidc": "b=OGST00"})
+	if err != nil || !changed {
+		t.Fatalf("UpdateCookies = (%v, %v), want (true, nil)", changed, err)
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["lidc"] != "b=OGST00" {
+		t.Errorf("lidc = %q, want the rotation applied", got.Cookies["lidc"])
 	}
 }

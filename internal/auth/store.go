@@ -299,10 +299,13 @@ func Get(alias string) (*Credential, error) {
 // logout, and reuses Credential.normalize() so JSESSIONID ends up
 // re-quoted exactly the way every other write already produces it.
 //
+// baselineLiAt is the li_at the caller's client was built from, used as a
+// compare-and-swap on session identity (see below). Pass "" to skip the check.
+//
 // A missing account (alias not found, or no accounts at all) returns
 // (false, nil) rather than an error — a cookie writeback must never be the
 // thing that fails an otherwise-successful command.
-func UpdateCookies(alias string, rotated map[string]string) (bool, error) {
+func UpdateCookies(alias, baselineLiAt string, rotated map[string]string) (bool, error) {
 	if len(rotated) == 0 {
 		return false, nil
 	}
@@ -321,6 +324,17 @@ func UpdateCookies(alias string, rotated map[string]string) (bool, error) {
 		}
 		c, ok := s.Accounts[resolved]
 		if !ok {
+			return nil
+		}
+		// Compare-and-swap on session identity. The lock stops two writers
+		// from interleaving, but it cannot tell whether what is stored now is
+		// still the session these cookies came from. If an `auth login`
+		// replaced this alias while the command was running, overlaying our
+		// jar would splice the old session's authentication cookies onto the
+		// new account's record and leave a credential belonging to neither.
+		// li_at identifies the session, so a mismatch means this rotation
+		// describes a session nobody is using any more: drop it.
+		if baselineLiAt != "" && c.Cookies["li_at"] != baselineLiAt {
 			return nil
 		}
 		for name, value := range rotated {
