@@ -59,19 +59,31 @@ type Invitation struct {
 
 // Conversation is a messaging thread.
 type Conversation struct {
-	URN          string   `json:"urn"`
+	URN string `json:"urn"`
+	// ID is the raw id segment parsed out of URN (a
+	// urn:li:fs_conversation:<id> URN) — the identifier the events endpoint
+	// path and a filesystem-safe filename both need. Empty when URN doesn't
+	// match the expected prefix, rather than guessing.
+	ID           string   `json:"id,omitempty"`
 	Participants []string `json:"participants"`
-	LastMessage  string   `json:"last_message"`
-	UpdatedAt    int64    `json:"updated_at"` // epoch millis
-	Unread       bool     `json:"unread"`
+	// ParticipantURNs are the participants' MiniProfile URNs, in the same
+	// order as Participants, alongside their display names — a display name
+	// alone isn't a stable identity.
+	ParticipantURNs []string `json:"participant_urns,omitempty"`
+	LastMessage     string   `json:"last_message"`
+	UpdatedAt       int64    `json:"updated_at"` // epoch millis
+	Unread          bool     `json:"unread"`
 }
 
 // Message is a single message within a conversation.
 type Message struct {
-	URN    string `json:"urn"`
-	From   string `json:"from"`
-	Text   string `json:"text"`
-	SentAt int64  `json:"sent_at"` // epoch millis
+	URN  string `json:"urn"`
+	From string `json:"from"`
+	// FromURN is the sender's MiniProfile URN alongside the display name in
+	// From — a display name alone isn't a stable identity.
+	FromURN string `json:"from_urn,omitempty"`
+	Text    string `json:"text"`
+	SentAt  int64  `json:"sent_at"` // epoch millis
 }
 
 // FeedItem is a single post in the feed.
