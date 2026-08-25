@@ -111,18 +111,26 @@ func (a *App) requireWritable() error {
 // without having mutated anything (F15 — an abort is a normal, successful
 // outcome, not a failure).
 //
-// Running with a non-interactive stdin and neither --yes nor --no-input set
-// IS an error (a usageError, exit 2): DESIGN.md requires explicit
-// confirmation for writes, and a non-TTY stdin can't supply one, so there is
-// nothing safe to assume — silently proceeding would be the one thing this
-// finding exists to prevent, and silently declining would surprise a script
-// that expected the write to happen.
+// Running without --yes on a non-interactive stdin IS an error (a usageError,
+// exit 2): DESIGN.md requires explicit confirmation for writes, and a non-TTY
+// stdin can't supply one, so there is nothing safe to assume — silently
+// proceeding would be the one thing this check exists to prevent, and silently
+// declining would surprise a script that expected the write to happen.
 func (a *App) confirm(prompt string) (bool, error) {
-	if a.Cfg.Yes || a.Cfg.NoInput {
+	// Only --yes is consent. --no-input promises lion will not *ask* a
+	// question; that is not the same as answering yes to one. Treating them as
+	// equivalent let any non-interactive script send invites, messages, and
+	// posts to real people with nothing on the command line that says "go
+	// ahead". So --no-input suppresses the prompt and then declines, naming the
+	// flag that does authorize the write.
+	if a.Cfg.Yes {
 		return true, nil
 	}
+	if a.Cfg.NoInput {
+		return false, usageErr("writes need confirmation and --no-input suppresses the prompt; pass --yes to authorize this mutation")
+	}
 	if !isInteractive() {
-		return false, usageErr("writes need confirmation but stdin is not a terminal; pass --yes or --no-input")
+		return false, usageErr("writes need confirmation but stdin is not a terminal; pass --yes")
 	}
 	fmt.Fprintf(os.Stderr, "%s [y/N] ", prompt)
 	s := bufio.NewScanner(os.Stdin)

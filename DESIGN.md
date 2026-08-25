@@ -103,9 +103,14 @@ fixtures (no live account needed to develop).
 - `--dry-run`: every mutation prints the intended request and exits 0 without
   sending.
 - `--readonly`: hard-blocks all mutating commands.
-- Writes prompt for confirmation on a TTY unless `--yes`/`--no-input`.
-- Daily/session action budgets (invites/day, messages/day) enforced locally,
-  tracked in the state file.
+- Writes prompt for confirmation on a TTY unless `--yes`. Only `--yes` is
+  consent: `--no-input` merely promises lion won't *ask*, so it suppresses the
+  prompt and then declines the write (exit 2, naming `--yes`) rather than
+  standing in for a "yes". Otherwise any non-interactive script would mutate
+  real people's inboxes with nothing on the command line authorizing it.
+- Daily/session action budgets (invites/day, messages/day) enforced locally in
+  a rolling 24h window, tracked in the state file and serialized across
+  processes so a shell loop cannot outrun them.
 
 ### 2.3 Output contract (agent-friendly, from gogcli)
 

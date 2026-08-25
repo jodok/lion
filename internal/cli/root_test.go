@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -170,15 +171,19 @@ func TestConfirmYesSkipsPrompt(t *testing.T) {
 	}
 }
 
-// TestConfirmNoInputSkipsPrompt covers the --no-input half of the same rule.
-func TestConfirmNoInputSkipsPrompt(t *testing.T) {
+// TestConfirmNoInputIsNotConsent pins the distinction between "don't ask me"
+// and "yes". --no-input suppressing the prompt must not authorize the write,
+// or any non-interactive script would mutate real people's inboxes without
+// anything on the command line approving it.
+func TestConfirmNoInputIsNotConsent(t *testing.T) {
 	app := &App{Cfg: &config.Config{NoInput: true}}
 	ok, err := app.confirm("proceed?")
-	if err != nil {
-		t.Fatal(err)
+	if ok {
+		t.Error("confirm() with --no-input = true, want false: --no-input is not consent")
 	}
-	if !ok {
-		t.Error("confirm() with --no-input = false, want true")
+	var ue usageError
+	if !errors.As(err, &ue) {
+		t.Errorf("confirm() with --no-input err = %v, want a usageError naming --yes", err)
 	}
 }
 
