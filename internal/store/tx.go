@@ -32,9 +32,12 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 	t := &Tx{tx: sqlTx}
 	if err := fn(t); err != nil {
 		_ = sqlTx.Rollback() // best-effort; the original err is what matters
-		return err
+		return asDatabaseFull(err)
 	}
-	return sqlTx.Commit()
+	if err := sqlTx.Commit(); err != nil {
+		return asDatabaseFull(err)
+	}
+	return nil
 }
 
 // UpsertConversation records (or refreshes) a conversation's discovery-time

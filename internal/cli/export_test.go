@@ -380,6 +380,91 @@ func TestExportRefusesAfterMessagesDirReplacedWithUnrelatedData(t *testing.T) {
 	}
 }
 
+// TestExportRefusesUnownedConversationsFile is a regression test for the
+// unchecked-conversations.jsonl defect: the ownership check used to cover
+// only messages/, so an --output directory holding an unrelated, pre-
+// existing conversations.jsonl (no lion marker anywhere) had it silently
+// truncated and overwritten. Ownership must be judged on the whole archive
+// layout, not just the messages/ subtree, so this must be refused with the
+// pre-existing file left byte-for-byte untouched.
+func TestExportRefusesUnownedConversationsFile(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+	convFile := filepath.Join(dir, "conversations.jsonl")
+	original := "someone else's conversations.jsonl, nothing to do with lion"
+	if err := os.WriteFile(convFile, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected export to refuse a directory with a pre-existing, unmarked conversations.jsonl")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+
+	b, statErr := os.ReadFile(convFile)
+	if statErr != nil {
+		t.Fatalf("conversations.jsonl destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != original {
+		t.Errorf("conversations.jsonl contents = %q, want unchanged %q", b, original)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "messages")); !os.IsNotExist(statErr) {
+		t.Error("messages/ was written despite the refusal — nothing should be written on refusal")
+	}
+}
+
+// TestExportRefusesSymlinkConversationsFile is a regression test for the
+// symlink-follows-through-OpenFile defect: OpenFile(O_TRUNC) follows
+// symlinks, so pointing conversations.jsonl at a symlink to an arbitrary
+// file the exporting user can write let a shared --output directory be
+// used to destroy that file's contents. The export must refuse outright
+// (no marker vouches for this directory) and must never even attempt to
+// open the symlink's target, let alone truncate it.
+func TestExportRefusesSymlinkConversationsFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need elevated privileges to create on windows")
+	}
+	seedExportStore(t)
+	dir := t.TempDir()
+
+	target := filepath.Join(t.TempDir(), "victim.txt")
+	victimContents := "this file must survive the export untouched"
+	if err := os.WriteFile(target, []byte(victimContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	convFile := filepath.Join(dir, "conversations.jsonl")
+	if err := os.Symlink(target, convFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected export to refuse a directory whose conversations.jsonl is a symlink to an unowned file")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+
+	b, statErr := os.ReadFile(target)
+	if statErr != nil {
+		t.Fatalf("symlink target destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != victimContents {
+		t.Errorf("symlink target contents = %q, want unchanged %q", b, victimContents)
+	}
+	fi, lstatErr := os.Lstat(convFile)
+	if lstatErr != nil {
+		t.Fatalf("symlink itself was removed by the refused export: %v", lstatErr)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("conversations.jsonl was replaced with a regular file instead of being left as the original symlink")
+	}
+}
+
 // TestExportStreamsJSONLToStdout is the required stdout-streaming test.
 func TestExportStreamsJSONLToStdout(t *testing.T) {
 	seedExportStore(t)

@@ -116,6 +116,17 @@ func newSyncCmd() *cobra.Command {
 			}
 			defer st.Close()
 
+			// The hard backstop for --max-db-size: SizeBytes() pre-checks
+			// scattered through discovery/catch-up/backfill are what stop a
+			// pass cleanly and early in the common case, but they can't
+			// predict a not-yet-fetched page's own footprint, so a single
+			// large page could still push the store past the advertised
+			// limit. This makes SQLite itself refuse and roll back any
+			// transaction that would exceed it — see store.SetMaxSize.
+			if err := st.SetMaxSize(maxDBSizeBytes); err != nil {
+				return err
+			}
+
 			// Ctrl-C during a long sync must still leave the store consistent
 			// and report complete:false honestly, rather than a hard kill that
 			// leaves the caller unsure what landed. Each fetched page already
@@ -241,10 +252,19 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 
 	toProcess, discComplete, err := discoverConversations(ctx, cl, st, opts, progress)
 	if err != nil {
-		summary.Complete = false
-		summary.ConversationsSeen = len(toProcess)
-		summary.Elapsed = formatDuration(time.Since(start))
-		return summary, err
+		if !errors.Is(err, errMaxDBSizeReached) {
+			summary.Complete = false
+			summary.ConversationsSeen = len(toProcess)
+			summary.Elapsed = formatDuration(time.Since(start))
+			return summary, err
+		}
+		// A store already at --max-db-size, or SQLite's own max_page_count
+		// backstop rejecting a page mid-discovery — the same "truncated, not
+		// failed" treatment as the identical check inside the
+		// per-conversation loop below: warn, fall through with whatever
+		// discovery already committed, and let the pass's own
+		// complete:false summary say so rather than a non-zero exit.
+		progress.Warn("%s", err)
 	}
 	summary.ConversationsSeen = len(toProcess)
 	if !discComplete {
@@ -355,6 +375,19 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 		if ctx.Err() != nil {
 			return toProcess, false, ctx.Err()
 		}
+		if opts.maxDBSizeBytes > 0 {
+			// Same ordering rule as catchUpMessages/backfillMessages: checked
+			// before this page is even fetched, never after it's already been
+			// committed via UpsertConversation. Discovery used to have no
+			// --max-db-size check at all, so a store already at the limit
+			// still got mutated, and kept growing through the whole
+			// discovery walk regardless of the bound.
+			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
+				return toProcess, false, sErr
+			} else if reached {
+				return toProcess, false, errMaxDBSizeReached
+			}
+		}
 		convs, next, err := cl.ConversationsPage(ctx, createdBefore, defaultConversationPageSize)
 		stalled := errors.Is(err, voyager.ErrPaginationStalled)
 		if err != nil && !stalled {
@@ -381,7 +414,15 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 			return nil
 		})
 		if txErr != nil {
-			return toProcess, false, txErr
+			// SizeBytes() is a pre-check, advisory by nature (it can't predict
+			// a not-yet-fetched page's own footprint), so the hard backstop —
+			// SQLite itself refusing a transaction that would exceed
+			// PRAGMA max_page_count, see store.SetMaxSize — is what actually
+			// guarantees the bound when a single page is bigger than the
+			// pre-check anticipated. translateStoreFull folds that into the
+			// same errMaxDBSizeReached truncation every other --max-db-size
+			// stop already reports.
+			return toProcess, false, translateStoreFull(txErr)
 		}
 
 		oldestInPage := convs[0].UpdatedAt
@@ -576,9 +617,24 @@ func conversationBackfillDone(ctx context.Context, st *store.Store, conversation
 // and, indirectly, mirrors what backfillMessages does inline for the same
 // reason further down.
 func markBackfillDone(ctx context.Context, st *store.Store, conversationID string) error {
-	return st.WithTx(ctx, func(tx *store.Tx) error {
+	return translateStoreFull(st.WithTx(ctx, func(tx *store.Tx) error {
 		return tx.MarkBackfillDone(ctx, conversationID, time.Now().UnixMilli())
-	})
+	}))
+}
+
+// translateStoreFull turns store.ErrDatabaseFull — what WithTx returns when
+// SQLite's own PRAGMA max_page_count ceiling (see store.SetMaxSize) rejects
+// and rolls back a transaction that would have exceeded --max-db-size —
+// into errMaxDBSizeReached, so every caller downstream only ever has to
+// recognize the one sentinel already wired into "truncated, not failed"
+// handling, regardless of whether lion's own SizeBytes pre-check or
+// SQLite's hard backstop is what actually stopped this pass. A nil err
+// passes through unchanged.
+func translateStoreFull(err error) error {
+	if errors.Is(err, store.ErrDatabaseFull) {
+		return errMaxDBSizeReached
+	}
+	return err
 }
 
 // backfillMessages continues paging a conversation's messages backwards
@@ -690,7 +746,7 @@ func applyMessagePage(ctx context.Context, st *store.Store, conversationID strin
 		added, e = tx.RecordMessagePage(ctx, conversationID, toStoreMessages(msgs, conversationID), time.Now().UnixMilli())
 		return e
 	})
-	return added, err
+	return added, translateStoreFull(err)
 }
 
 func storeSizeReached(st *store.Store, maxBytes int64) (bool, error) {

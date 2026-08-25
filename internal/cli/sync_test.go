@@ -720,6 +720,54 @@ func TestSyncMaxDBSizeAlreadyAtLimitDoesNotMutate(t *testing.T) {
 	}
 }
 
+// TestSyncMaxDBSizeAlreadyAtLimitBlocksDiscovery is a regression test for
+// discoverConversations having no --max-db-size check of its own: it
+// committed every fetched conversation page via UpsertConversation before
+// --max-db-size was consulted anywhere, so a store already at the
+// configured limit still had discovery mutate it — the previous sibling
+// test only proved the message side stayed untouched, not that "c1" itself
+// was never even written to the conversations table by discovery.
+func TestSyncMaxDBSizeAlreadyAtLimitBlocksDiscovery(t *testing.T) {
+	st := openSyncTestStore(t)
+	ctx := context.Background()
+	err := st.WithTx(ctx, func(tx *store.Tx) error {
+		if err := tx.UpsertConversation(ctx, store.Conversation{ID: "c0", URN: "urn:li:fs_conversation:c0", UpdatedAt: 1}, 1); err != nil {
+			return err
+		}
+		_, err := tx.RecordMessagePage(ctx, "c0", []store.Message{{URN: "seed", ConversationID: "c0", SentAt: 1}}, 1)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit, err := st.SizeBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(ctx, cl, st, syncOptions{maxDBSizeBytes: limit}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: --max-db-size was already at the limit before discovery even ran")
+	}
+	if summary.ConversationsSeen != 0 {
+		t.Errorf("ConversationsSeen = %d, want 0: discovery must not have processed c1 at all", summary.ConversationsSeen)
+	}
+	if _, ok, cErr := st.Conversation(ctx, "c1"); cErr != nil {
+		t.Fatal(cErr)
+	} else if ok {
+		t.Error("conversation c1 was written to the store by discovery despite the store already being at --max-db-size")
+	}
+}
+
 // TestSyncOnceAndFollowAreMutuallyExclusive covers the flag-validation half
 // of the --once/--follow wacli-compat flags, at the full command-dispatch
 // level (no network needed since this fails before building a client).
