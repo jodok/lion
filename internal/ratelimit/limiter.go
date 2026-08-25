@@ -186,41 +186,105 @@ func (l *Limiter) Wait(ctx context.Context, c Class) error {
 		return nil
 	}
 
-	now := l.now()
-	l.resetIfNewDayLocked(now)
+	var now, start time.Time
+	var budgetErr error
 
-	if b.DailyMax > 0 && l.counts[c] >= b.DailyMax {
-		l.mu.Unlock()
-		return ErrDailyBudget
-	}
+	reserve := func() {
+		now = l.now()
+		l.resetIfNewDayLocked(now)
 
-	gap := b.MinGap
-	if b.MaxGap > b.MinGap {
-		gap += time.Duration(l.rnd.Int63n(int64(b.MaxGap - b.MinGap)))
-	}
-
-	// Reserve a slot at or after the class's earliest allowed time. A class
-	// with no recorded nextAt — never run in this process, and nothing
-	// persisted from a prior one — still incurs the full jittered gap: a
-	// freshly started process must not fire its very first mutating action
-	// instantly just because there's no history yet to pace against.
-	start := now
-	if na, seen := l.nextAt[c]; seen {
-		if na.After(start) {
-			start = na
+		if b.DailyMax > 0 && l.counts[c] >= b.DailyMax {
+			budgetErr = ErrDailyBudget
+			return
 		}
-	} else {
-		start = now.Add(gap)
+
+		gap := b.MinGap
+		if b.MaxGap > b.MinGap {
+			gap += time.Duration(l.rnd.Int63n(int64(b.MaxGap - b.MinGap)))
+		}
+
+		// Reserve a slot at or after the class's earliest allowed time. A
+		// class with no recorded nextAt — never run in this process, and
+		// nothing persisted from a prior one — still incurs the full jittered
+		// gap: a freshly started process must not fire its very first mutating
+		// action instantly just because there's no history yet to pace against.
+		start = now
+		if na, seen := l.nextAt[c]; seen {
+			if na.After(start) {
+				start = na
+			}
+		} else {
+			start = now.Add(gap)
+		}
+		l.nextAt[c] = start.Add(gap)
+		l.counts[c]++
+		l.saveLocked()
 	}
-	l.nextAt[c] = start.Add(gap)
-	l.counts[c]++
-	l.saveLocked()
+
+	// Reserving is a read-modify-write of state shared across processes: the
+	// mutex above only orders goroutines, but every `lion` invocation is its
+	// own process. Without an inter-process lock two concurrent runs both read
+	// the same counts, both reserve, and the later write erases the earlier
+	// reservation — reinstating exactly the shell-loop bypass that persisting
+	// the budget exists to prevent. Re-read inside the lock so this run paces
+	// against what other processes have already committed.
+	if l.statePath == "" {
+		reserve()
+	} else {
+		withStateLock(l.statePath, func() {
+			l.load()
+			reserve()
+		})
+	}
 	l.mu.Unlock()
 
+	if budgetErr != nil {
+		return budgetErr
+	}
 	if d := start.Sub(now); d > 0 {
 		return l.sleep(ctx, d)
 	}
 	return nil
+}
+
+// withStateLock runs fn while holding a best-effort inter-process lock for the
+// limiter's state file. Like the credential store's lock it is advisory and
+// time-bounded: after maxWait it proceeds anyway rather than hanging a command,
+// and it only removes a lock file this call actually created — deleting one
+// after giving up would break the mutex for the process still holding it.
+func withStateLock(statePath string, fn func()) {
+	const (
+		retryDelay   = 25 * time.Millisecond
+		maxWait      = 5 * time.Second
+		staleLockAge = 30 * time.Second
+	)
+	lp := statePath + ".lock"
+	deadline := time.Now().Add(maxWait)
+	acquired := false
+	for {
+		f, err := os.OpenFile(lp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			acquired = true
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			break // cannot lock at all (unwritable dir): pace rather than fail
+		}
+		if fi, statErr := os.Stat(lp); statErr == nil && time.Since(fi.ModTime()) > staleLockAge {
+			os.Remove(lp) // steal a stale lock left by a crashed process
+		}
+		// Check the deadline even after stealing, so a lock that keeps being
+		// recreated cannot spin here past maxWait.
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(retryDelay)
+	}
+	if acquired {
+		defer os.Remove(lp)
+	}
+	fn()
 }
 
 // resetIfNewDayLocked zeroes the daily counters when now falls on a

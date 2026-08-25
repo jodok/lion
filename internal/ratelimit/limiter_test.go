@@ -148,3 +148,36 @@ func TestPersistedBudgetResetsOnDayRollover(t *testing.T) {
 		t.Fatalf("day 2: budget should have reset across the rollover, got %v", err)
 	}
 }
+
+// TestConcurrentLimitersDoNotLoseReservations simulates several `lion`
+// processes running at once: each gets its own Limiter over one shared state
+// file. Without an inter-process lock they all read the same counter and the
+// last writer wins, so the daily budget silently over-issues — the shell-loop
+// bypass that persisting the budget is meant to stop.
+func TestConcurrentLimitersDoNotLoseReservations(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "ratelimit.json")
+
+	const procs = 8
+	budgets := map[Class]Budget{Write: {DailyMax: 100, MinGap: 0, MaxGap: 0}}
+
+	var wg sync.WaitGroup
+	for i := 0; i < procs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A distinct Limiter per goroutine stands in for a distinct
+			// process: no shared in-memory mutex, only the file lock.
+			l := NewPersistent(budgets, statePath)
+			if err := l.Wait(context.Background(), Write); err != nil {
+				t.Errorf("Wait: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	final := NewPersistent(budgets, statePath)
+	if got := final.counts[Write]; got != procs {
+		t.Fatalf("persisted write count = %d, want %d (reservations were lost to a cross-process race)", got, procs)
+	}
+}
