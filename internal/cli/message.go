@@ -157,6 +157,19 @@ func newMessageSendCmd() *cobra.Command {
 			r := app.Renderer()
 
 			if cl.DryRun() {
+				// Validate through the real mutation first — see feed post.
+				// It rejects empty text and an empty target, then returns
+				// before any network call, so a preview only appears for a
+				// request the live run would actually attempt.
+				var vErr error
+				if isProfileURN {
+					vErr = cl.SendMessageToProfile(context.Background(), target, text)
+				} else {
+					vErr = cl.SendMessage(context.Background(), target, text)
+				}
+				if vErr != nil {
+					return vErr
+				}
 				if app.Cfg.JSON {
 					return r.Emit(map[string]string{"status": "dry-run", "action": "message.send", "target": target, "body": text})
 				}

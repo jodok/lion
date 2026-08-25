@@ -91,6 +91,15 @@ func newFeedPostCmd() *cobra.Command {
 			r := app.Renderer()
 
 			if cl.DryRun() {
+				// Run the mutation anyway: it validates its inputs and then
+				// short-circuits before any network call (see voyager
+				// Client.post). Rendering the preview without this would let
+				// `--visibility friends --dry-run` report a clean plan that
+				// the live run rejects, which is the opposite of what a
+				// dry-run is for.
+				if err := cl.CreatePost(context.Background(), text, visibility); err != nil {
+					return err
+				}
 				if app.Cfg.JSON {
 					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.post", "visibility": visibility, "text": text})
 				}
@@ -140,6 +149,10 @@ func newFeedCommentCmd() *cobra.Command {
 			r := app.Renderer()
 
 			if cl.DryRun() {
+				// Validate through the real mutation first — see feed post.
+				if err := cl.Comment(context.Background(), urn, text); err != nil {
+					return err
+				}
 				if app.Cfg.JSON {
 					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.comment", "urn": urn, "text": text})
 				}
@@ -187,6 +200,10 @@ func newFeedReactCmd() *cobra.Command {
 			r := app.Renderer()
 
 			if cl.DryRun() {
+				// Validate through the real mutation first — see feed post.
+				if err := cl.React(context.Background(), urn, reactionType); err != nil {
+					return err
+				}
 				if app.Cfg.JSON {
 					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.react", "urn": urn, "type": reactionType})
 				}

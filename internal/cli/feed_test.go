@@ -149,3 +149,30 @@ func TestFeedPostDeclineAbortsWithoutMutating(t *testing.T) {
 		t.Errorf("declined post must not emit any stdout data, got %q", out)
 	}
 }
+
+// TestFeedPostDryRunValidatesVisibility guards a dry-run that lies: the
+// preview used to be rendered without ever calling CreatePost, so an invalid
+// --visibility produced a clean "dry-run" plan and exit 0 while the live run
+// rejected the same command. A dry run that approves what a live run refuses
+// is worse than no dry run.
+func TestFeedPostDryRunValidatesVisibility(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	err := runRoot(t, "feed", "post", "hello", "--visibility", "friends", "--dry-run")
+	if err == nil {
+		t.Fatal("dry-run with an invalid --visibility should fail, as the live run would")
+	}
+	if !strings.Contains(err.Error(), "visibility") {
+		t.Errorf("error = %q, want it to name the invalid visibility", err.Error())
+	}
+}
+
+// TestFeedPostDryRunStillWorksWhenValid confirms the added validation didn't
+// break the ordinary dry-run path.
+func TestFeedPostDryRunStillWorksWhenValid(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	if err := runRoot(t, "feed", "post", "hello", "--visibility", "public", "--dry-run"); err != nil {
+		t.Fatalf("valid dry-run should succeed, got %v", err)
+	}
+}
