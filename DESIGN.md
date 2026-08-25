@@ -310,14 +310,27 @@ in `cli.Execute` rather than a `PersistentPostRun`, because cobra runs only the
 silently disable writeback for its whole subtree. `auth login` stores the
 *post*-validation jar, since the `/me` check can itself rotate a cookie.
 
-Three details worth keeping: writeback is skipped when the command failed (a
-session-wipe response puts `li_at=delete me` in the jar, and persisting that
-would overwrite a good credential with garbage); an empty snapshot value never
-overwrites a stored cookie; and the snapshot reconstructs each cookie's wire
-form, because both cookie parsers move a quoted value's quotes into
-`Cookie.Quoted` instead of leaving them in `Value` — without that, JSESSIONID
-would shed its quotes a little more on every command until the derived
-csrf-token silently stopped matching.
+Four details worth keeping:
+
+1. **Writeback runs after a failed command too, except on `ErrUnauthorized`
+   and `ErrChallenge`.** A 404, a local budget stop, or a usage error leaves
+   the jar exactly as valid as a success would, and dropping those rotations
+   reintroduces the same decay writeback exists to stop. Those two errors are
+   the exception because they are how a dead session reports itself, and
+   LinkedIn answers one by clearing the cookie (`Set-Cookie: li_at=delete me`)
+   — persisting that jar would overwrite a good credential with the wipe.
+2. **A stale writeback is dropped.** `auth.UpdateCookies` takes the `li_at` its
+   client was built from and compares it against what is stored, under the
+   lock. The lock stops interleaved writes but cannot tell that the stored
+   credential is still the same session: if an `auth login` replaced the alias
+   mid-command, applying our jar would splice the old session's authentication
+   onto the new account's record.
+3. **An empty snapshot value never overwrites a stored cookie** — it means the
+   jar never saw that cookie, not that LinkedIn cleared it.
+4. **The snapshot reconstructs each cookie's wire form,** because both cookie
+   parsers move a quoted value's quotes into `Cookie.Quoted` instead of leaving
+   them in `Value`. Without that, JSESSIONID sheds its quotes a little more on
+   every command until the derived csrf-token silently stops matching.
 
 Historical note — earlier open `401`: `profile search` (GraphQL) returns
 `{"data":{"status":401}}` with a *valid* session (not a bot-block, no wipe).
