@@ -60,16 +60,22 @@ func (s *Store) Lock(ctx context.Context, waitFor time.Duration) (release func()
 
 	deadline := time.Now().Add(waitFor)
 	for {
-		release, err := lockfile.TryAcquire(s.LockPath())
+		lock, err := lockfile.TryAcquire(s.LockPath())
 		if err == nil {
 			// Best-effort: a failure to record who's holding the lock must
 			// not fail the lock itself, since the lock (not the info) is
 			// what provides correctness. A losing acquirer just falls back
 			// to a less specific message (see holderSuffix).
+			//
+			// lock.WriteInfo writes through the descriptor TryAcquire
+			// already opened (and, on the symlink check in openLockFile,
+			// validated) rather than reopening s.LockPath() by name — a
+			// second open-by-name here would reintroduce exactly the race
+			// that check exists to close.
 			if info, mErr := json.Marshal(lockHolder{PID: os.Getpid(), Started: time.Now()}); mErr == nil {
-				_ = lockfile.WriteInfo(s.LockPath(), info)
+				_ = lock.WriteInfo(info)
 			}
-			return release, nil
+			return lock.Release, nil
 		}
 		if err != lockfile.ErrLocked {
 			return nil, fmt.Errorf("store: acquire sync lock: %w", err)

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -319,25 +321,104 @@ func writeExportStream(w io.Writer, format string, groups []*exportGroup) error 
 // writeExportFile writes a single-document export to path (a file, not a
 // directory), creating its parent directories 0700 and the file itself
 // 0600 — this is a complete copy of someone's private messages.
+//
+// It publishes through safeWriteFile rather than opening path directly: path
+// is exactly the caller-supplied --output value, so anyone able to pre-place
+// a symlink there (a shared output directory, say) could otherwise redirect
+// an O_TRUNC open onto a file the exporting user can write but shouldn't —
+// the same attack writeConversationsFile's doc comment describes for
+// conversations.jsonl, just at a --output path instead of a fixed filename
+// inside one. See safeWriteFile for why this is the one way this package
+// writes any file, rather than a third hand-rolled O_TRUNC.
 func writeExportFile(path, format string, groups []*exportGroup) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("export: create %s: %w", filepath.Dir(path), err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("export: create %s: %w", dir, err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	_, _, err := safeWriteFile(dir, ".export-*.tmp", filepath.Base(path), 0o600, func(w io.Writer) error {
+		return writeExportStream(w, format, groups)
+	})
+	return err
+}
+
+// safeWriteFile is the one way this package creates or replaces a file at a
+// path it did not itself choose (--output, or a name derived from a
+// caller-controlled conversation id): it writes to a fresh, randomly-named
+// temp file in dir — os.CreateTemp opens with O_CREATE|O_EXCL, so there is
+// nothing at that name yet for an attacker to have pre-placed — then
+// os.Rename's it onto dir/destName. rename(2) replaces whatever directory
+// entry currently occupies that name, file or symlink, without ever
+// dereferencing it, so an existing symlink there is swapped out rather than
+// followed and truncated.
+//
+// Every export write site funnels through this rather than hand-rolling
+// O_CREATE|O_TRUNC: the previous round of this fix closed exactly this hole
+// at one call site (conversations.jsonl) and left two more open
+// (writeExportFile's --output file, and the per-conversation files below) —
+// a single helper is what makes "every file lion writes goes through the
+// safe path" true by construction instead of by remembering to copy it.
+//
+// It returns the size and SHA-256 of what was written so callers that need
+// to verify a file later (writeMessagesDir's manifest) don't have to trust a
+// self-asserted flag — they can check what's actually on disk against what
+// was actually written here.
+func safeWriteFile(dir, tmpPattern, destName string, mode os.FileMode, write func(io.Writer) error) (size int64, sha256Hex string, err error) {
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
-		return fmt.Errorf("export: open %s: %w", path, err)
+		return 0, "", fmt.Errorf("export: create temp file in %s: %w", dir, err)
 	}
-	// os.OpenFile's mode is subject to umask, so an explicit Chmod is what
-	// actually guarantees 0600 rather than something looser.
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpPath)
 	}
-	if err := writeExportStream(f, format, groups); err != nil {
-		f.Close()
-		return err
+	// os.CreateTemp already requests 0600, which umask can't loosen (0600
+	// has no group/other bits to strip) — the explicit Chmod guarantees the
+	// caller-requested mode regardless, matching every other file this
+	// package writes into an export archive.
+	if err := tmp.Chmod(mode); err != nil {
+		cleanup()
+		return 0, "", err
 	}
-	return f.Close()
+	h := sha256.New()
+	n, err := countingWrite(io.MultiWriter(tmp, h), write)
+	if err != nil {
+		cleanup()
+		return 0, "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return 0, "", err
+	}
+	dest := filepath.Join(dir, destName)
+	if err := os.Rename(tmpPath, dest); err != nil {
+		os.Remove(tmpPath)
+		return 0, "", fmt.Errorf("export: publish %s: %w", dest, err)
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// countingWrite runs write against w wrapped to count the bytes that pass
+// through it, so safeWriteFile can report a file's size without a second
+// pass (e.g. os.Stat after the fact, which would itself be a path-based
+// re-check of exactly the kind this whole fix moves away from).
+func countingWrite(w io.Writer, write func(io.Writer) error) (int64, error) {
+	cw := &countingWriter{w: w}
+	if err := write(cw); err != nil {
+		return cw.n, err
+	}
+	return cw.n, nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // writeExportDirectory writes the per-conversation layout: conversations.jsonl
@@ -354,8 +435,13 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 	// --output directory that already holds an unrelated conversations.jsonl
 	// or messages/ tree has to be refused untouched, not partially
 	// overwritten (conversations.jsonl written, then the refusal on
-	// messages/) — see checkOutputDirOwnership and writeMessagesDir.
-	if err := checkOutputDirOwnership(dir); err != nil {
+	// messages/) — see checkOutputDirOwnership and writeMessagesDir. The
+	// returned marker (nil for a fresh --output directory) is what lets
+	// writeMessagesDir delete only the files it can prove a prior lion
+	// export actually created, instead of trusting the marker's mere
+	// presence to authorize wiping the directory.
+	prior, err := checkOutputDirOwnership(dir)
+	if err != nil {
 		return err
 	}
 
@@ -363,52 +449,26 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 		return err
 	}
 
-	return writeMessagesDir(dir, groups)
+	return writeMessagesDir(dir, groups, prior)
 }
 
-// writeConversationsFile publishes conversations.jsonl by writing a fresh
-// temporary file in dir and renaming it into place, rather than opening the
-// destination path directly. dir is a caller-supplied --output path, and
-// OpenFile follows symlinks: opening "dir/conversations.jsonl" directly
-// with O_TRUNC would mean anyone able to pre-place a symlink at that name
-// (a shared output directory, say) redirects the truncating write to
-// whatever file the exporting user can write, anywhere on disk. CreateTemp
-// opens its randomly-named file with O_CREATE|O_EXCL, so there is nothing
-// for an attacker to pre-place, and the final os.Rename replaces whatever
-// dentry — file or symlink — sits at the destination without ever
-// dereferencing it.
+// writeConversationsFile publishes conversations.jsonl via safeWriteFile
+// rather than opening the destination path directly. dir is a
+// caller-supplied --output path, and opening "dir/conversations.jsonl"
+// directly with O_TRUNC would mean anyone able to pre-place a symlink at
+// that name (a shared output directory, say) redirects the truncating write
+// to whatever file the exporting user can write, anywhere on disk.
 func writeConversationsFile(dir string, groups []*exportGroup) error {
-	tmp, err := os.CreateTemp(dir, ".conversations-*.jsonl.tmp")
-	if err != nil {
-		return fmt.Errorf("export: create conversations.jsonl temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	// os.CreateTemp already requests 0600, which umask can't loosen (0600
-	// has no group/other bits to strip) — the explicit Chmod just matches
-	// every other file this package writes into an export archive.
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	enc := json.NewEncoder(tmp)
-	for _, g := range groups {
-		if err := enc.Encode(toExportedConversationMeta(g)); err != nil {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return err
+	_, _, err := safeWriteFile(dir, ".conversations-*.jsonl.tmp", "conversations.jsonl", 0o600, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		for _, g := range groups {
+			if err := enc.Encode(toExportedConversationMeta(g)); err != nil {
+				return err
+			}
 		}
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	dest := filepath.Join(dir, "conversations.jsonl")
-	if err := os.Rename(tmpPath, dest); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("export: publish %s: %w", dest, err)
-	}
-	return nil
+		return nil
+	})
+	return err
 }
 
 // exportMarkerFilename is written inside the messages/ directory itself
@@ -424,17 +484,30 @@ const exportMarkerFilename = ".lion-export.json"
 // opposed to some other tool's file that happened to land at the same path.
 const exportMarkerFormat = "lion-message-export"
 
-// exportMarker is the on-disk shape of exportMarkerFilename. It carries no
-// authorization or security meaning by itself — its only job is letting a
-// later export distinguish "lion wrote this archive directory, safe to
-// replace wholesale" from "this happens to be some other directory that
-// independently contains a messages/ folder or a conversations.jsonl."
-// Because of that, a marker that merely exists is not enough to trust —
-// see checkOutputDirOwnership.
+// exportManifestEntry identifies one file lion wrote into a messages/
+// directory it created, well enough that a later export can tell "this is
+// still exactly what I wrote" from "something else is here now" without
+// trusting either the filename or the marker's mere presence: size catches
+// a truncated or appended-to file cheaply, and the SHA-256 catches anything
+// else, including a same-size substitution.
+type exportManifestEntry struct {
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// exportMarker is the on-disk shape of exportMarkerFilename. Format,
+// Version, and UpdatedAt identify the marker itself as lion's; Files is the
+// manifest of every other file lion wrote alongside it into the same
+// messages/ directory. Neither half authorizes anything by itself — see
+// checkOutputDirOwnership (which validates Format/Version before trusting
+// the marker exists at all) and reconcileMessagesDir (which validates every
+// entry in Files against what's actually on disk before deleting anything).
 type exportMarker struct {
-	Format    string `json:"format"`
-	Version   int    `json:"version"`
-	UpdatedAt string `json:"updated_at"`
+	Format    string                `json:"format"`
+	Version   int                   `json:"version"`
+	UpdatedAt string                `json:"updated_at"`
+	Files     []exportManifestEntry `json:"files"`
 }
 
 // exportMarkerVersion is bumped if the marker's own shape (not the export
@@ -445,7 +518,10 @@ const exportMarkerVersion = 1
 // conversations.jsonl file or its messages/ subdirectory unless a prior
 // lion export already created THAT EXACT archive layout
 // (exportMarkerFilename present *inside* messages/ itself, not merely
-// somewhere at dir's root).
+// somewhere at dir's root). On success it returns the marker found there —
+// nil if dir has neither conversations.jsonl nor messages/ yet, non-nil
+// (with its Files manifest) otherwise — for writeMessagesDir to reconcile
+// against before it deletes anything.
 //
 // The marker used to live at dir's root, next to messages/ rather than
 // inside it, and its mere existence was trusted without reading its
@@ -457,6 +533,13 @@ const exportMarkerVersion = 1
 // directory it vouches for — and actually validating its contents — ties
 // the check to the exact tree about to be removed, so it can only ever be
 // stale in a way that's still safe: gone along with whatever it protected.
+// A parsed, correctly-formatted marker STILL isn't enough on its own to
+// authorize deleting anything, though: it is exactly as forgeable as any
+// other file lion didn't just write, since nothing stops another process
+// with write access to dir from copying or hand-writing one. That is what
+// Files exists to close — see reconcileMessagesDir, which is the only place
+// deletion actually happens and which trusts the manifest only file-by-file,
+// never the marker's format/version match alone.
 //
 // --output happily accepts any existing directory a caller names, including
 // a normal one that already contains an unrelated messages/ folder, or an
@@ -469,7 +552,7 @@ const exportMarkerVersion = 1
 // check — lion never had a separate notion of "owns conversations.jsonl"
 // and one file's ownership can't be judged any more strongly than the
 // marker that vouches for the whole layout allows.
-func checkOutputDirOwnership(dir string) error {
+func checkOutputDirOwnership(dir string) (*exportMarker, error) {
 	messagesDir := filepath.Join(dir, "messages")
 	convPath := filepath.Join(dir, "conversations.jsonl")
 
@@ -479,14 +562,31 @@ func checkOutputDirOwnership(dir string) error {
 	// symlink might resolve to.
 	messagesPresent, err := lexists(messagesDir)
 	if err != nil {
-		return fmt.Errorf("export: stat %s: %w", messagesDir, err)
+		return nil, fmt.Errorf("export: stat %s: %w", messagesDir, err)
 	}
 	convPresent, err := lexists(convPath)
 	if err != nil {
-		return fmt.Errorf("export: stat %s: %w", convPath, err)
+		return nil, fmt.Errorf("export: stat %s: %w", convPath, err)
 	}
 	if !messagesPresent && !convPresent {
-		return nil
+		return nil, nil
+	}
+
+	if messagesPresent {
+		// The marker read below (os.ReadFile, which follows symlinks) is
+		// only safe to trust once messagesDir itself is confirmed to be a
+		// real directory: if "messages" were a symlink, reading through it
+		// would read whatever the attacker's target contains, and every
+		// later operation that walks messagesDir (reconcileMessagesDir)
+		// would then be walking and deleting inside that target instead of
+		// the archive directory the caller actually asked for.
+		fi, err := os.Lstat(messagesDir)
+		if err != nil {
+			return nil, fmt.Errorf("export: stat %s: %w", messagesDir, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return nil, unownedOutputDirErr(dir)
+		}
 	}
 
 	markerPath := filepath.Join(messagesDir, exportMarkerFilename)
@@ -495,7 +595,7 @@ func checkOutputDirOwnership(dir string) error {
 		// No messages/ tree at all, or one with no marker in it: either way
 		// there is nothing here proving lion wrote whatever currently
 		// occupies conversations.jsonl or messages/.
-		return unownedOutputDirErr(dir)
+		return nil, unownedOutputDirErr(dir)
 	}
 	var m exportMarker
 	// An unparseable, foreign (wrong Format), or version-mismatched marker
@@ -503,9 +603,9 @@ func checkOutputDirOwnership(dir string) error {
 	// trusted to authorize replacing whatever actually occupies
 	// conversations.jsonl or messages/ right now.
 	if err := json.Unmarshal(buf, &m); err != nil || m.Format != exportMarkerFormat || m.Version != exportMarkerVersion {
-		return unownedOutputDirErr(dir)
+		return nil, unownedOutputDirErr(dir)
 	}
-	return nil
+	return &m, nil
 }
 
 // lexists reports whether path already has something at it, following the
@@ -531,21 +631,27 @@ func unownedOutputDirErr(dir string) error {
 // and replaced together, atomically, by the same rename that publishes the
 // rest of the export — see checkOutputDirOwnership for why the marker
 // must live inside the directory it protects rather than beside it.
-func writeExportMarker(messagesDir string) error {
+//
+// files is the manifest of every other file this run wrote into messagesDir
+// (see exportManifestEntry) — recording it here is what lets a later
+// export's reconcileMessagesDir delete only files it can prove this run
+// created, rather than trusting the marker's format/version alone.
+func writeExportMarker(messagesDir string, files []exportManifestEntry) error {
 	m := exportMarker{
 		Format:    exportMarkerFormat,
 		Version:   exportMarkerVersion,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		Files:     files,
 	}
 	buf, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(messagesDir, exportMarkerFilename)
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
-		return fmt.Errorf("export: write %s: %w", path, err)
-	}
-	return nil
+	_, _, err = safeWriteFile(messagesDir, ".marker-*.tmp", exportMarkerFilename, 0o600, func(w io.Writer) error {
+		_, err := w.Write(buf)
+		return err
+	})
+	return err
 }
 
 // ensureOutputDir makes sure dir exists, creating it 0700 only when this
@@ -582,22 +688,27 @@ func ensureOutputDir(dir string) error {
 
 // writeMessagesDir stages every conversation's messages/<id>.jsonl file into
 // a fresh temporary directory inside dir, then swaps it into place as
-// dir/messages with a pair of renames, rather than reusing whatever was
-// already at dir/messages and only writing this run's files into it. A
-// second export into the same --output directory with a narrower filter
-// (e.g. --after, or --conversation) legitimately writes fewer files than a
-// prior, broader export did — reusing the directory in place would leave
-// the excluded conversations' files sitting there, and an archive that
-// silently retains messages the caller just asked to exclude is a privacy
-// bug, not untidiness. Swapping the whole directory in guarantees the
-// archive's contents match exactly this export, every time.
+// dir/messages, rather than reusing whatever was already at dir/messages and
+// only writing this run's files into it. A second export into the same
+// --output directory with a narrower filter (e.g. --after, or
+// --conversation) legitimately writes fewer files than a prior, broader
+// export did — reusing the directory in place would leave the excluded
+// conversations' files sitting there, and an archive that silently retains
+// messages the caller just asked to exclude is a privacy bug, not
+// untidiness. Swapping the whole directory in guarantees the archive's
+// contents match exactly this export, every time.
 //
-// The RemoveAll below is only reachable once checkOutputDirOwnership (the
-// caller, writeExportDirectory, always runs it first) has confirmed either
-// there's no pre-existing messages/ tree, or that the one there carries
-// lion's own export marker — never an unrelated directory a caller happened
-// to already have at --output.
-func writeMessagesDir(dir string, groups []*exportGroup) error {
+// prior is whatever checkOutputDirOwnership found (nil for a fresh --output
+// directory). It is passed through to reconcileMessagesDir, which is the
+// only place any pre-existing messages/ tree is ever deleted — file by file,
+// and only files prior's manifest actually accounts for. This function never
+// calls RemoveAll on messagesDir itself: an export marker only proves lion
+// wrote *some* archive here at some point, not that everything sitting in
+// the directory today is still that archive's, and treating it as blanket
+// deletion authority is exactly the bug this whole fix closes (a copied or
+// hand-written marker would otherwise make an unrelated messages/ tree look
+// lion-owned and wipeable).
+func writeMessagesDir(dir string, groups []*exportGroup, prior *exportMarker) error {
 	staging, err := os.MkdirTemp(dir, ".messages-")
 	if err != nil {
 		return fmt.Errorf("export: stage messages dir: %w", err)
@@ -611,57 +722,160 @@ func writeMessagesDir(dir string, groups []*exportGroup) error {
 		return err
 	}
 
+	manifest := make([]exportManifestEntry, 0, len(groups))
 	for _, g := range groups {
-		msgPath := filepath.Join(staging, sanitizeConversationFilename(g.id)+".jsonl")
-		mf, err := os.OpenFile(msgPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		name := sanitizeConversationFilename(g.id) + ".jsonl"
+		size, sum, err := safeWriteFile(staging, ".msg-*.jsonl.tmp", name, 0o600, func(w io.Writer) error {
+			menc := json.NewEncoder(w)
+			for _, m := range g.messages {
+				if err := menc.Encode(toExportedMessage(m)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 		if err != nil {
 			os.RemoveAll(staging)
 			return err
 		}
-		if err := mf.Chmod(0o600); err != nil {
-			mf.Close()
-			os.RemoveAll(staging)
-			return err
-		}
-		menc := json.NewEncoder(mf)
-		for _, m := range g.messages {
-			if err := menc.Encode(toExportedMessage(m)); err != nil {
-				mf.Close()
-				os.RemoveAll(staging)
-				return err
-			}
-		}
-		if err := mf.Close(); err != nil {
-			os.RemoveAll(staging)
-			return err
-		}
+		manifest = append(manifest, exportManifestEntry{Name: name, Size: size, SHA256: sum})
 	}
 
-	// The marker is staged alongside this run's message files, not written
-	// separately afterward, so the rename below publishes both together —
-	// there's never a window where messages/ exists without the marker that
-	// vouches for it, or vice versa.
-	if err := writeExportMarker(staging); err != nil {
+	// The marker (with this run's manifest) is staged alongside the message
+	// files it describes, not written separately afterward, so the rename
+	// below publishes both together — there's never a window where
+	// messages/ exists without the marker that vouches for it, or vice
+	// versa.
+	if err := writeExportMarker(staging, manifest); err != nil {
 		os.RemoveAll(staging)
 		return err
 	}
 
 	messagesDir := filepath.Join(dir, "messages")
-	// A directory rename can't replace a non-empty existing directory, so
-	// the swap is two renames rather than one atomic syscall. The window
-	// between them is process-local — export is a single-shot CLI command,
-	// not a long-lived service with concurrent readers of a half-swapped
-	// archive — so this is safe in practice even though it isn't a single
-	// atomic operation.
-	if err := os.RemoveAll(messagesDir); err != nil {
+	// Validated, file-by-file removal of exactly what prior's manifest
+	// accounts for — see reconcileMessagesDir. staging is left untouched by
+	// this call (it only ever touches messagesDir), so a refusal here still
+	// leaves a full, valid staged export behind for the caller to inspect or
+	// retry against a different --output, rather than losing the work.
+	if err := reconcileMessagesDir(messagesDir, prior); err != nil {
 		os.RemoveAll(staging)
-		return fmt.Errorf("export: remove stale %s: %w", messagesDir, err)
+		return err
 	}
 	if err := os.Rename(staging, messagesDir); err != nil {
 		os.RemoveAll(staging)
 		return fmt.Errorf("export: swap in %s: %w", messagesDir, err)
 	}
 	return nil
+}
+
+// reconcileMessagesDir is the only place this package ever deletes a
+// pre-existing messages/ directory, and it never uses RemoveAll: every entry
+// present in messagesDir must either be the marker file itself or a name
+// prior's manifest lists, with a size and SHA-256 that still match what the
+// manifest recorded — otherwise this refuses and deletes nothing at all,
+// leaving messagesDir exactly as it was. Only once every entry has been
+// verified does it remove them, one by one, and finally the (now provably
+// empty) directory itself.
+//
+// This is deliberately two passes over the directory rather than
+// delete-as-you-verify: a mismatch discovered halfway through must never
+// leave the directory partially destroyed, since a caller who gets a
+// refusal error is relying on "nothing happened" to decide what to do next.
+func reconcileMessagesDir(messagesDir string, prior *exportMarker) error {
+	present, err := lexists(messagesDir)
+	if err != nil {
+		return fmt.Errorf("export: stat %s: %w", messagesDir, err)
+	}
+	if !present {
+		return nil // first export into this --output directory: nothing to remove
+	}
+	if prior == nil {
+		// Unreachable in the current call graph: writeExportDirectory always
+		// runs checkOutputDirOwnership first, which refuses before this
+		// point whenever messagesDir exists without a valid marker. Kept as
+		// a hard stop rather than assumed dead code — silently falling
+		// through to delete an unaccounted-for directory here, on some
+		// future refactor that skips the ownership check, is exactly the
+		// bug this fix exists to close.
+		return unownedOutputDirErr(filepath.Dir(messagesDir))
+	}
+
+	// checkOutputDirOwnership already confirmed messagesDir is a real
+	// directory (not a symlink) as of that call; re-confirming here costs
+	// nothing and means this function is safe to call on its own, not only
+	// as writeMessagesDir's second step after that check.
+	fi, err := os.Lstat(messagesDir)
+	if err != nil {
+		return fmt.Errorf("export: stat %s: %w", messagesDir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return unownedOutputDirErr(filepath.Dir(messagesDir))
+	}
+
+	entries, err := os.ReadDir(messagesDir)
+	if err != nil {
+		return fmt.Errorf("export: read %s: %w", messagesDir, err)
+	}
+	byName := make(map[string]exportManifestEntry, len(prior.Files))
+	for _, f := range prior.Files {
+		byName[f.Name] = f
+	}
+
+	// Pass 1: verify every entry before deleting anything.
+	for _, e := range entries {
+		if e.Name() == exportMarkerFilename {
+			continue
+		}
+		want, ok := byName[e.Name()]
+		if !ok {
+			return usageErr("%s contains %q, which lion's last export into this directory did not create; refusing to delete anything there — remove it manually, or export to an empty directory", messagesDir, e.Name())
+		}
+		if e.Type()&os.ModeSymlink != 0 || !e.Type().IsRegular() {
+			return usageErr("%s in %s is not a regular file; refusing to delete anything there", e.Name(), messagesDir)
+		}
+		full := filepath.Join(messagesDir, e.Name())
+		size, sum, err := hashFile(full)
+		if err != nil {
+			return fmt.Errorf("export: verify %s: %w", full, err)
+		}
+		if size != want.Size || sum != want.SHA256 {
+			return usageErr("%s does not match what lion's last export recorded for it; refusing to delete anything in %s", full, messagesDir)
+		}
+	}
+
+	// Pass 2: every entry checked out above — delete them, then the
+	// directory itself. os.Remove rather than os.RemoveAll on the directory
+	// is a deliberate fail-safe: if this loop somehow missed an entry (it
+	// shouldn't — entries is exactly what ReadDir returned above), Remove
+	// refuses on a non-empty directory instead of recursing through
+	// whatever that entry turned out to be.
+	for _, e := range entries {
+		full := filepath.Join(messagesDir, e.Name())
+		if err := os.Remove(full); err != nil {
+			return fmt.Errorf("export: remove %s: %w", full, err)
+		}
+	}
+	if err := os.Remove(messagesDir); err != nil {
+		return fmt.Errorf("export: remove %s: %w", messagesDir, err)
+	}
+	return nil
+}
+
+// hashFile reads path (already confirmed a regular, non-symlink directory
+// entry by reconcileMessagesDir's caller) and returns its size and
+// hex-encoded SHA-256, for comparison against an exportManifestEntry.
+func hashFile(path string) (size int64, sha256Hex string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // isDirTarget reports whether path should be treated as a directory

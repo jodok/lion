@@ -16,6 +16,6 @@ func acquire(path string) (release func(), err error) {
 	return nil, errUnsupported
 }
 
-func tryAcquire(path string) (release func(), err error) {
+func tryAcquire(path string) (*Lock, error) {
 	return nil, errUnsupported
 }

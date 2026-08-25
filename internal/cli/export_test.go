@@ -261,9 +261,23 @@ func TestExportRefusesUnownedMessagesDirectory(t *testing.T) {
 
 // TestExportReplacesOwnedMessagesDirectoryCleanly is the required companion
 // test: a directory lion itself previously exported into (the marker is
-// present) must still be replaced cleanly on a later export, with no stale
-// files left over — the marker gates destruction of an UNOWNED directory,
-// it must not block lion from re-exporting into its own.
+// present, and its manifest accounts for every file actually there) must
+// still be replaced cleanly on a later, narrower export, with files the new
+// run no longer produces dropped rather than left stale — the marker (and
+// the manifest it now carries) gates destruction of an UNOWNED or
+// UNACCOUNTED-FOR directory, it must not block lion from re-exporting into
+// its own.
+//
+// This used to seed the "stale" file by writing it directly into messages/
+// with os.WriteFile, standing in for a leftover from a prior, broader lion
+// export. That is no longer a valid way to simulate one: reconcileMessagesDir
+// now checks every file it's about to delete against the manifest the prior
+// export actually recorded, so a file that didn't come from lion itself is
+// indistinguishable from an attacker's plant and correctly refused — see
+// TestExportRefusesUntrackedFileEvenInsideOwnedMessagesDir for that case. The
+// legitimate version of "stale file gets dropped" is a second export that
+// itself produces fewer files than the first (a narrower --conversation
+// filter), which is what this test now exercises.
 func TestExportReplacesOwnedMessagesDirectoryCleanly(t *testing.T) {
 	seedExportStore(t)
 	dir := t.TempDir()
@@ -274,23 +288,107 @@ func TestExportReplacesOwnedMessagesDirectoryCleanly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "messages", exportMarkerFilename)); err != nil {
 		t.Fatalf("export marker missing from messages/ after the first export: %v", err)
 	}
-	staleFile := filepath.Join(dir, "messages", "leftover-from-a-prior-lion-run.jsonl")
-	if err := os.WriteFile(staleFile, []byte(`{"stale":true}`), 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); err != nil {
+		t.Fatalf("messages/c2.jsonl missing after the first export: %v", err)
 	}
 
-	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
-		t.Fatalf("second export into the same, lion-owned directory: %v", err)
+	// A second, narrower export into the same --output directory legitimately
+	// produces fewer files than the first (c1 only, not c2) — it must still
+	// replace the directory cleanly rather than leaving c2.jsonl behind.
+	if err := runRoot(t, "message", "export", "--conversation", "c1", "--output", dir); err != nil {
+		t.Fatalf("second, narrower export into the same, lion-owned directory: %v", err)
 	}
 
-	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
-		t.Errorf("stale file survived a re-export into a lion-owned directory (err = %v)", err)
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("c2.jsonl (excluded by the second export's --conversation filter) survived (err = %v)", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "messages", "c1.jsonl")); err != nil {
 		t.Errorf("messages/c1.jsonl missing after the re-export: %v", err)
 	}
+}
+
+// TestExportRefusesUntrackedFileEvenInsideOwnedMessagesDir is the required
+// regression test for finding #1 (the forgeable-marker / RemoveAll defect):
+// a marker's format/version matching lion's own must no longer be enough to
+// authorize wiping the whole messages/ directory — only files the marker's
+// own manifest accounts for, with a size and hash that still match, may be
+// deleted. A file sitting in an otherwise lion-owned messages/ directory
+// that lion's last export there did NOT create and record — whether it's an
+// attacker's plant in a shared output directory, or just a file a human
+// dropped in — must block the next export entirely and leave the directory
+// untouched, not be silently swept away along with the files lion actually
+// recognizes.
+func TestExportRefusesUntrackedFileEvenInsideOwnedMessagesDir(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	untracked := filepath.Join(dir, "messages", "not-in-the-manifest.jsonl")
+	if err := os.WriteFile(untracked, []byte(`{"planted":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected the second export to refuse: messages/ contains a file its own marker never recorded")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+
+	// Nothing in the directory — including the files the marker DID
+	// legitimately account for — may be touched by a refused export.
+	b, statErr := os.ReadFile(untracked)
+	if statErr != nil {
+		t.Fatalf("untracked file destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != `{"planted":true}` {
+		t.Errorf("untracked file contents = %q, want unchanged", b)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c1.jsonl")); err != nil {
+		t.Errorf("messages/c1.jsonl (legitimately lion's own) destroyed by the refused export: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); err != nil {
-		t.Errorf("messages/c2.jsonl missing after the re-export: %v", err)
+		t.Errorf("messages/c2.jsonl (legitimately lion's own) destroyed by the refused export: %v", err)
+	}
+}
+
+// TestExportRefusesTamperedManifestedFile is the manifest-hash counterpart
+// to TestExportRefusesUntrackedFileEvenInsideOwnedMessagesDir: a file whose
+// NAME is listed in the prior marker's manifest, but whose current content
+// no longer matches the size/SHA-256 recorded there, must be refused just
+// as hard as a file the manifest never mentions at all — a same-name
+// substitution (e.g. an attacker's file swapped in under a legitimate
+// conversation's filename) must not be trusted just because the name
+// matches.
+func TestExportRefusesTamperedManifestedFile(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	tampered := filepath.Join(dir, "messages", "c1.jsonl")
+	if err := os.WriteFile(tampered, []byte(`{"tampered":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected the second export to refuse: c1.jsonl no longer matches what the marker recorded")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+
+	b, statErr := os.ReadFile(tampered)
+	if statErr != nil {
+		t.Fatalf("tampered file destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != `{"tampered":true}` {
+		t.Errorf("tampered file contents = %q, want unchanged", b)
 	}
 }
 
@@ -462,6 +560,68 @@ func TestExportRefusesSymlinkConversationsFile(t *testing.T) {
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
 		t.Error("conversations.jsonl was replaced with a regular file instead of being left as the original symlink")
+	}
+}
+
+// TestExportSingleFileOutputRefusesToFollowSymlink is the required
+// regression test for finding #2: a single-file `--output <file>` export (as
+// opposed to the directory layout) used to open the destination path
+// directly with O_TRUNC, which follows a symlink. Pre-placing a symlink at
+// a predictable export path in a shared directory would let it truncate and
+// overwrite whatever the symlink pointed at with the exporting user's
+// private message data. writeExportFile must instead publish through the
+// same temp-file-plus-rename helper the directory layout uses (safeWriteFile),
+// so the export succeeds — there is no ownership/marker concept for a bare
+// --output file, only the symlink-safety requirement — but the symlink's
+// target is never opened, and the destination ends up a regular file with
+// the export's own content, not the symlink dereferenced and truncated.
+func TestExportSingleFileOutputRefusesToFollowSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need elevated privileges to create on windows")
+	}
+	seedExportStore(t)
+
+	target := filepath.Join(t.TempDir(), "victim.txt")
+	victimContents := "this file must survive the export untouched"
+	if err := os.WriteFile(target, []byte(victimContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "export.json")
+	if err := os.Symlink(target, outPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runRoot(t, "message", "export", "--output", outPath); err != nil {
+		t.Fatalf("export to a symlinked --output path: %v", err)
+	}
+
+	b, statErr := os.ReadFile(target)
+	if statErr != nil {
+		t.Fatalf("symlink target destroyed or removed by the export: %v", statErr)
+	}
+	if string(b) != victimContents {
+		t.Errorf("symlink target contents = %q, want unchanged %q", b, victimContents)
+	}
+
+	fi, lstatErr := os.Lstat(outPath)
+	if lstatErr != nil {
+		t.Fatalf("lstat %s: %v", outPath, lstatErr)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("--output path is still a symlink; want it replaced with a regular file by the publish rename")
+	}
+	var env exportEnvelope
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", outPath, err)
+	}
+	if err := json.Unmarshal(got, &env); err != nil {
+		t.Fatalf("--output content not valid JSON: %v\ncontent: %s", err, got)
+	}
+	if len(env.Conversations) != 2 {
+		t.Errorf("conversations in --output file = %d, want 2", len(env.Conversations))
 	}
 }
 

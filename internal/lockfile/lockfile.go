@@ -40,8 +40,41 @@ func Acquire(path string) (release func(), err error) {
 // uses instead of Acquire: an interactive command failing fast (or waiting a
 // bounded, user-chosen amount via --lock-wait) is far more useful than one
 // that blocks indefinitely with no feedback.
-func TryAcquire(path string) (release func(), err error) {
+//
+// It returns a *Lock rather than a bare release func because the store
+// lock's holder-info payload (see Lock.WriteInfo) must be written through
+// the exact descriptor opened here — path derives from the configurable
+// --store flag, so re-opening it by name to write that payload would let
+// anyone able to swap a symlink in after acquisition redirect the write.
+func TryAcquire(path string) (*Lock, error) {
 	return tryAcquire(path)
+}
+
+// Lock is a held lock returned by TryAcquire. It keeps the descriptor that
+// was opened (and, on unix, flock'd) at acquire time so WriteInfo can
+// publish through that same descriptor instead of reopening path by name.
+type Lock struct {
+	f       *os.File
+	release func()
+}
+
+// Release releases the lock and closes its descriptor.
+func (l *Lock) Release() {
+	l.release()
+}
+
+// WriteInfo overwrites the lock file's content with b, through the
+// descriptor obtained when the lock was acquired — never by reopening the
+// path by name, which would race a symlink swapped in after acquisition
+// (see TryAcquire's doc comment).
+func (l *Lock) WriteInfo(b []byte) error {
+	if err := l.f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := l.f.WriteAt(b, 0); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Supported reports whether this platform has a real inter-process lock.
@@ -52,30 +85,24 @@ func Supported() bool {
 	return supported
 }
 
-// WriteInfo overwrites path's content with b. It is meant to be called only
-// by the current lock holder, immediately after Acquire/TryAcquire
-// succeeds, so a concurrent acquirer that loses the race can read back who
-// is holding the lock (see ReadInfo) instead of seeing a bare "locked".
-//
-// It does not itself take the lock — the caller already holds it — and a
-// failure here is the caller's to handle; this package doesn't decide
-// whether an unwritable info payload should block proceeding, since the
-// lock itself (not the info) is what provides correctness.
-func WriteInfo(path string, b []byte) error {
-	// O_TRUNC here is safe precisely because the caller already holds the
-	// flock: nothing else can be reading path in a way that a torn write
-	// would corrupt for a concurrent *holder* (there can only be one), and a
-	// concurrent *waiter* calling ReadInfo is documented as best-effort/racy.
-	return os.WriteFile(path, b, 0o600)
-}
-
 // ReadInfo best-effort reads whatever the current holder (if any) wrote via
-// WriteInfo. It never blocks and never takes the lock itself — it's a
+// Lock.WriteInfo. It never blocks and never takes the lock itself — it's a
 // diagnostic peek for a human-readable message, not a synchronization
 // primitive — so the content it returns can be empty, stale, or torn by a
 // concurrent WriteInfo. A missing file or any read error simply yields no
 // info, which callers should treat as "unknown holder" rather than propagate.
+//
+// Unlike WriteInfo, this genuinely has no held descriptor to write through —
+// it runs in a process that lost the race for the lock, possibly before the
+// winner has created the file at all — so it can only reopen path by name.
+// The Lstat guard below still refuses to follow a symlink there: reading
+// through one can't corrupt anything, but it could hang forever on a FIFO an
+// attacker planted at the lock path, which would turn a "best-effort
+// diagnostic" into a hang.
 func ReadInfo(path string) []byte {
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil
