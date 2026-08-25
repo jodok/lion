@@ -23,10 +23,11 @@ import (
 //     logged-in browser's network tab. They are centralized here on purpose so
 //     that refresh is a one-file change. (See DESIGN.md §"queryId maintenance".)
 const (
-	// queryIDProfile fetches a member profile by identity. Verified 2026-07-06.
-	queryIDProfile = "voyagerIdentityDashProfiles.b5c27c04968c409fc0ed3546575b9b7a"
 	// queryIDSearchClusters runs blended/entity search. Verified 2026-07-06.
 	queryIDSearchClusters = "voyagerSearchDashClusters.a7a0567fa66c52d645b5ff2f960b92aa"
+	// queryIDProfile (voyagerIdentityDashProfiles.b5c27c04968c409fc0ed3546575b9b7a)
+	// is reserved for a future modern-profile GraphQL surface; Profile()
+	// currently returns ErrNotFound instead of calling it (see profile.go).
 )
 
 // getGraphQL issues a Voyager GraphQL GET. variables is the pre-assembled

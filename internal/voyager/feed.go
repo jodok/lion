@@ -59,23 +59,44 @@ type feedUpdateRaw struct {
 	CreatedAt int64 `json:"createdAt"`
 }
 
-// decodeFeed flattens updatesV2 results, keeping the fields lion surfaces.
+// feedEnvelope captures the ordered element references from a feed
+// response. Each element carries a "*feedUpdate" URN reference — Voyager's
+// convention for a not-yet-resolved reference field, matching the pattern
+// connectionsEnvelope and /me use for "*miniProfile" — rather than an
+// inline update; the actual UpdateV2 lives in included[] and is resolved
+// via the entity index.
+type feedEnvelope struct {
+	Data struct {
+		Elements []struct {
+			UpdateRef string `json:"*feedUpdate"`
+		} `json:"elements"`
+	} `json:"data"`
+}
+
+// decodeFeed resolves the feed's ordered `data.elements` references against
+// the `included[]` entity index, returning items in the server's own
+// (reverse-chronological) order and capped at max.
 //
-// NOTE (known limitation, flagged in review): this returns every UpdateV2 in the
-// normalized `included` cache rather than following the feed's ordered result
-// references under `data`. `included` can hold extra entities for rendering, so
-// unrelated updates may appear and ordering is not guaranteed. Resolving the
-// ordered `data` result URNs requires a live-captured feed payload to model the
-// exact shape — do that alongside endpoint verification. For now we de-duplicate
-// by URN and cap at max.
+// Earlier versions of this decoder returned every UpdateV2 found in
+// `included[]` instead of following `data.elements`. `included` can hold
+// extra entities for rendering, so that scanned in unrelated updates and
+// lost the server's ordering; following the ordered references fixes both.
 func decodeFeed(body []byte, max int) ([]FeedItem, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
 		return nil, err
 	}
+	var env feedEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("decode feed: %w", err)
+	}
 	var out []FeedItem
 	seen := make(map[string]bool)
-	for _, raw := range idx.ofType("com.linkedin.voyager.feed.render.UpdateV2") {
+	for _, el := range env.Data.Elements {
+		raw, ok := idx.get(el.UpdateRef)
+		if !ok {
+			continue
+		}
 		var u feedUpdateRaw
 		if err := decodeInto(raw, &u); err != nil {
 			continue
@@ -95,6 +116,11 @@ func decodeFeed(body []byte, max int) ([]FeedItem, error) {
 		if max > 0 && len(out) >= max {
 			break
 		}
+	}
+	// Shape-drift guard — see decodeConnections. An empty feed and a feed this
+	// decoder can no longer read look identical to the caller otherwise.
+	if len(out) == 0 && len(idx.ofType(typeUpdateV2)) > 0 {
+		return nil, fmt.Errorf("feed response shape not recognized: %d update(s) returned but none referenced by data.elements; the decoder likely needs updating for a changed Voyager response shape: %w", len(idx.ofType(typeUpdateV2)), ErrNotFound)
 	}
 	return out, nil
 }

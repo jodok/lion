@@ -1,6 +1,14 @@
 {
   "data": {
-    "metadata": {}
+    "metadata": {},
+    "elements": [
+      {
+        "*feedUpdate": "urn:li:fs_updateV2:(urn:li:activity:7000000000000000002,FEED_DETAIL,EMPTY,DEFAULT,false)"
+      },
+      {
+        "*feedUpdate": "urn:li:fs_updateV2:(urn:li:activity:7000000000000000001,FEED_DETAIL,EMPTY,DEFAULT,false)"
+      }
+    ]
   },
   "included": [
     {
@@ -40,6 +48,25 @@
         }
       },
       "createdAt": 1717100000000
+    },
+    {
+      "$type": "com.linkedin.voyager.feed.render.UpdateV2",
+      "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7000000000000000099,FEED_DETAIL,EMPTY,DEFAULT,false)",
+      "actor": {
+        "name": "Aux Cached"
+      },
+      "commentary": {
+        "text": {
+          "text": "Not part of the feed's own ordering — must not be returned."
+        }
+      },
+      "socialDetail": {
+        "totalSocialActivityCounts": {
+          "numLikes": 0,
+          "numComments": 0
+        }
+      },
+      "createdAt": 1717200000000
     }
   ]
 }
