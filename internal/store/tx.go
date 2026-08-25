@@ -49,7 +49,32 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 // insert, FirstSeenAt and LastSyncedAt are both set to firstSeenAt (the
 // caller's clock reading) since there is nothing more specific to record yet.
 func (t *Tx) UpsertConversation(ctx context.Context, c Conversation, firstSeenAt int64) error {
-	participantsJSON, err := json.Marshal(c.Participants)
+	// Participants are resolved from a page's included[], which is per-page, so
+	// a later page can return this conversation with some — or all — of its
+	// members unresolved: decodeConversations emits Participant{Name:"", URN}
+	// for a reference whose MiniProfile wasn't in that page. A blank must never
+	// overwrite a name already known, or a routine partial re-sync would strip
+	// names off a thread permanently.
+	//
+	// This is a per-participant merge (keyed by URN), which SQL's ON CONFLICT
+	// can't express — the previous all-or-nothing CASE only protected against a
+	// wholly-empty incoming list and still let a partially-resolved page blank
+	// out the members it happened to miss. So read the stored participants and
+	// merge in Go. Safe against a concurrent writer because this runs inside
+	// the caller's transaction (one sync holds the store lock anyway).
+	var existingJSON sql.NullString
+	err := t.tx.QueryRowContext(ctx, `SELECT participants FROM conversations WHERE id = ?`, c.ID).Scan(&existingJSON)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("store: read participants for %s: %w", c.ID, err)
+	}
+	merged := c.Participants
+	if existingJSON.Valid && existingJSON.String != "" {
+		var existing []Participant
+		if jerr := json.Unmarshal([]byte(existingJSON.String), &existing); jerr == nil {
+			merged = mergeParticipants(existing, c.Participants)
+		}
+	}
+	participantsJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("store: encode participants: %w", err)
 	}
@@ -58,15 +83,7 @@ func (t *Tx) UpsertConversation(ctx context.Context, c Conversation, firstSeenAt
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			urn          = excluded.urn,
-			-- Same reasoning as the message upsert: participants are resolved
-			-- from the page's included[], so a later page can return this
-			-- conversation with nobody resolved. Keeping the empty list would
-			-- turn a named thread into an anonymous one on re-sync, so an empty
-			-- incoming list leaves the stored one alone.
-			participants = CASE
-				WHEN excluded.participants IN ('[]', 'null', '') THEN conversations.participants
-				ELSE excluded.participants
-			END,
+			participants = excluded.participants,
 			updated_at   = excluded.updated_at,
 			unread       = excluded.unread
 	`, c.ID, c.URN, string(participantsJSON), c.UpdatedAt, boolToInt(c.Unread), firstSeenAt, firstSeenAt)
@@ -74,6 +91,39 @@ func (t *Tx) UpsertConversation(ctx context.Context, c Conversation, firstSeenAt
 		return fmt.Errorf("store: upsert conversation %s: %w", c.ID, err)
 	}
 	return nil
+}
+
+// mergeParticipants combines a stored participant list with an incoming one,
+// keyed by URN, keeping the incoming order and identities but never letting an
+// incoming empty Name overwrite a name already stored. A participant present
+// only in the stored list is retained (a page can omit someone entirely, which
+// is not evidence they left the thread); one present only incoming is added.
+func mergeParticipants(existing, incoming []Participant) []Participant {
+	nameByURN := make(map[string]string, len(existing))
+	for _, p := range existing {
+		if p.URN != "" && p.Name != "" {
+			nameByURN[p.URN] = p.Name
+		}
+	}
+	seen := make(map[string]bool, len(incoming))
+	out := make([]Participant, 0, len(incoming)+len(existing))
+	for _, p := range incoming {
+		if p.Name == "" && p.URN != "" {
+			if kept, ok := nameByURN[p.URN]; ok {
+				p.Name = kept
+			}
+		}
+		out = append(out, p)
+		if p.URN != "" {
+			seen[p.URN] = true
+		}
+	}
+	for _, p := range existing {
+		if p.URN != "" && !seen[p.URN] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // ErrConversationNotFound is returned by RecordMessagePage/MarkBackfillDone

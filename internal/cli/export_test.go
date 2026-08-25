@@ -386,3 +386,31 @@ func TestExportJSONLZeroMatchPreservesExistingArchive(t *testing.T) {
 		t.Error("previous archive was modified by a zero-match export")
 	}
 }
+
+// TestExportRefusesToOverwriteTheStore covers a self-destruct: export
+// publishes with rename, so --output pointing at the open store.db would
+// replace it, and once the SQLite handle closes the unlinked old database is
+// gone — the synced archive destroyed by the command meant to preserve it.
+func TestExportRefusesToOverwriteTheStore(t *testing.T) {
+	seedExportStore(t)
+	path, err := store.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{path, path + "-wal", path + "-shm"} {
+		if err := runRoot(t, "message", "export", "--format", "jsonl", "--output", target); err == nil {
+			t.Errorf("export --output %q should be refused", target)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("store was destroyed: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("store size changed from %d to %d", len(before), len(after))
+	}
+}

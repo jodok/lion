@@ -108,6 +108,12 @@ func newMessageExportCmd() *cobra.Command {
 				}
 			}
 
+			if outputPath != "" {
+				if err := refuseStoreOverwrite(outputPath, st.Path()); err != nil {
+					return err
+				}
+			}
+
 			filter := store.MessageFilter{
 				ConversationID: conversationID,
 				After:          afterMs,
@@ -518,4 +524,35 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
+}
+
+// refuseStoreOverwrite rejects an --output that resolves to the open store
+// database or one of its SQLite sidecars. Export publishes with rename, so on
+// unix the finished export would replace store.db's directory entry; the old
+// database, still open, becomes an unlinked inode that vanishes when the
+// handle closes, leaving the synced archive gone and the path holding
+// JSON/JSONL instead. Compared by resolved absolute path so "./store.db",
+// "$LION_HOME/store.db", and a symlink to it are all caught.
+func refuseStoreOverwrite(outputPath, storePath string) error {
+	out, err := filepath.Abs(outputPath)
+	if err != nil {
+		return fmt.Errorf("export: resolve --output %q: %w", outputPath, err)
+	}
+	if resolved, err := filepath.EvalSymlinks(out); err == nil {
+		out = resolved
+	}
+	base, err := filepath.Abs(storePath)
+	if err != nil {
+		return fmt.Errorf("export: resolve store path: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if out == base+suffix {
+			return fmt.Errorf("export: --output %q is the message store itself (or a sidecar of it); "+
+				"exporting onto the store would destroy it — choose a different path", outputPath)
+		}
+	}
+	return nil
 }
