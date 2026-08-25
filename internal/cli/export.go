@@ -378,24 +378,27 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 		return err
 	}
 
-	if err := writeMessagesDir(dir, groups); err != nil {
-		return err
-	}
-	return writeExportMarker(dir)
+	return writeMessagesDir(dir, groups)
 }
 
-// exportMarkerFilename is written at the root of a --output directory the
-// first time lion writes the export layout there. It's what
-// checkMessagesDirOwnership consults before writeMessagesDir is ever
-// allowed to destroy an existing messages/ tree — see both functions'
-// comments for why an unmarked directory must be refused, not deleted.
+// exportMarkerFilename is written inside the messages/ directory itself
+// (not at the --output directory's root — see checkMessagesDirOwnership's
+// doc comment for why that distinction is the whole point) the first time
+// lion writes the export layout there. It's what checkMessagesDirOwnership
+// consults before writeMessagesDir is ever allowed to destroy an existing
+// messages/ tree.
 const exportMarkerFilename = ".lion-export.json"
+
+// exportMarkerFormat identifies exportMarker's contents as lion's own, as
+// opposed to some other tool's file that happened to land at the same path.
+const exportMarkerFormat = "lion-message-export"
 
 // exportMarker is the on-disk shape of exportMarkerFilename. It carries no
 // authorization or security meaning by itself — its only job is letting a
-// later export distinguish "lion wrote this directory, safe to replace
-// messages/ wholesale" from "this happens to be some other directory that
-// independently contains a messages/ folder."
+// later export distinguish "lion wrote this messages/ directory, safe to
+// replace wholesale" from "this happens to be some other directory that
+// independently contains a messages/ folder." Because of that, a marker
+// that merely exists is not enough to trust — see checkMessagesDirOwnership.
 type exportMarker struct {
 	Format    string `json:"format"`
 	Version   int    `json:"version"`
@@ -407,15 +410,28 @@ type exportMarker struct {
 const exportMarkerVersion = 1
 
 // checkMessagesDirOwnership refuses to let writeMessagesDir touch dir's
-// messages/ subdirectory unless a prior lion export already created it
-// (exportMarkerFilename present at dir's root). --output happily accepts
-// any existing directory a caller names, including a normal one that
-// already contains an unrelated messages/ folder for its own reasons —
-// writeMessagesDir's swap-in-place approach used to RemoveAll that
-// unconditionally, silently destroying whatever was there. This is the
+// messages/ subdirectory unless a prior lion export already created THAT
+// EXACT tree (exportMarkerFilename present *inside* messages/ itself, not
+// merely somewhere at dir's root).
+//
+// The marker used to live at dir's root, next to messages/ rather than
+// inside it, and its mere existence was trusted without reading its
+// contents. Both of those were the bug: a root-level marker survives a
+// caller later deleting messages/ and replacing it with unrelated data
+// (nothing then re-examines whether messages/ itself was ever lion's), and
+// an unparsed marker trusts a copied, foreign, or corrupt file just as much
+// as a genuine one. Keying ownership on a marker that lives inside the
+// directory it vouches for — and actually validating its contents — ties
+// the check to the exact tree about to be removed, so it can only ever be
+// stale in a way that's still safe: gone along with whatever it protected.
+//
+// --output happily accepts any existing directory a caller names, including
+// a normal one that already contains an unrelated messages/ folder for its
+// own reasons — writeMessagesDir's swap-in-place approach used to RemoveAll
+// that unconditionally, silently destroying whatever was there. This is the
 // guard that turns that into a refusal instead: nothing gets deleted or
-// written past this point unless the directory is either empty of a
-// messages/ tree, or one lion itself is known to have created.
+// written past this point unless messages/ doesn't exist yet, or the one
+// that does carries a marker lion itself is known to have written into it.
 func checkMessagesDirOwnership(dir string) error {
 	messagesDir := filepath.Join(dir, "messages")
 	if _, err := os.Stat(messagesDir); err != nil {
@@ -424,23 +440,38 @@ func checkMessagesDirOwnership(dir string) error {
 		}
 		return fmt.Errorf("export: stat %s: %w", messagesDir, err)
 	}
-	markerPath := filepath.Join(dir, exportMarkerFilename)
-	if _, err := os.Stat(markerPath); err != nil {
+	markerPath := filepath.Join(messagesDir, exportMarkerFilename)
+	buf, err := os.ReadFile(markerPath)
+	if err != nil {
 		if os.IsNotExist(err) {
-			return usageErr("%s already contains a messages/ directory that lion did not create; pick an empty directory or a different --output path", dir)
+			return unownedMessagesDirErr(dir)
 		}
-		return fmt.Errorf("export: stat %s: %w", markerPath, err)
+		return fmt.Errorf("export: read %s: %w", markerPath, err)
+	}
+	var m exportMarker
+	// An unparseable, foreign (wrong Format), or version-mismatched marker
+	// means "not ours": a stale, copied, or corrupt file must never be
+	// trusted to authorize deleting whatever actually occupies messages/
+	// right now.
+	if err := json.Unmarshal(buf, &m); err != nil || m.Format != exportMarkerFormat || m.Version != exportMarkerVersion {
+		return unownedMessagesDirErr(dir)
 	}
 	return nil
 }
 
-// writeExportMarker (re)writes exportMarkerFilename at dir's root once this
-// export has successfully written (or replaced) the directory layout, so a
-// later re-export into the same --output directory passes
-// checkMessagesDirOwnership and can safely swap messages/ again.
-func writeExportMarker(dir string) error {
+func unownedMessagesDirErr(dir string) error {
+	return usageErr("%s already contains a messages/ directory that lion did not create; pick an empty directory or a different --output path", dir)
+}
+
+// writeExportMarker writes exportMarkerFilename inside messagesDir (the
+// staging directory that writeMessagesDir is about to swap in as dir's
+// messages/) so the marker and the tree it vouches for are always written
+// and replaced together, atomically, by the same rename that publishes the
+// rest of the export — see checkMessagesDirOwnership for why the marker
+// must live inside the directory it protects rather than beside it.
+func writeExportMarker(messagesDir string) error {
 	m := exportMarker{
-		Format:    "lion-message-export",
+		Format:    exportMarkerFormat,
 		Version:   exportMarkerVersion,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -448,7 +479,7 @@ func writeExportMarker(dir string) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, exportMarkerFilename)
+	path := filepath.Join(messagesDir, exportMarkerFilename)
 	if err := os.WriteFile(path, buf, 0o600); err != nil {
 		return fmt.Errorf("export: write %s: %w", path, err)
 	}
@@ -542,6 +573,15 @@ func writeMessagesDir(dir string, groups []*exportGroup) error {
 			os.RemoveAll(staging)
 			return err
 		}
+	}
+
+	// The marker is staged alongside this run's message files, not written
+	// separately afterward, so the rename below publishes both together —
+	// there's never a window where messages/ exists without the marker that
+	// vouches for it, or vice versa.
+	if err := writeExportMarker(staging); err != nil {
+		os.RemoveAll(staging)
+		return err
 	}
 
 	messagesDir := filepath.Join(dir, "messages")

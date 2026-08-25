@@ -618,6 +618,108 @@ func TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp(t *testing.T) {
 	}
 }
 
+// TestSyncAfterFiltersStoredMessagesButPaginationStillAdvances is the
+// required --after correctness test: a single fetched page whose messages
+// straddle the --after cutoff must store only the messages at or after it,
+// while the pagination decisions (the cursor, whether the walk reached a
+// genuine stopping point) still key off the page the server actually
+// returned. Before this fix, the whole page was committed and --after was
+// only ever consulted afterward to decide whether to fetch another page —
+// so every older message on a straddling page silently landed in the store
+// (and, from there, in any export).
+func TestSyncAfterFiltersStoredMessagesButPaginationStillAdvances(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		// One page straddling the cutoff (--after=150): m2 (200) is at or
+		// after it, m1 (100) is strictly older. A second page would only be
+		// fetched if the straddling page didn't correctly signal "reached
+		// the cutoff" — make it look like more new history so the test
+		// fails loudly (extra messages_added, extra call) rather than
+		// silently if pagination doesn't stop here.
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+			messagesPageJSON([][2]any{{"m0", int64(50)}}))
+	cl := newFixtureClient(rt)
+
+	afterMs := int64(150)
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{afterMs: &afterMs}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.MessagesAdded != 1 {
+		t.Errorf("MessagesAdded = %d, want 1 (only m2 is at or after --after)", summary.MessagesAdded)
+	}
+	if got := rt.callCount("/messaging/conversations/c1/events"); got != 1 {
+		t.Errorf("events endpoint called %d times, want 1 (pagination must stop once the page's oldest message is before --after)", got)
+	}
+
+	msgs, err := st.Messages(context.Background(), store.MessageFilter{ConversationID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].URN != "m2" {
+		t.Errorf("stored messages = %+v, want only m2 — m1 predates --after and must never have been stored", msgs)
+	}
+}
+
+// TestSyncMaxDBSizeAlreadyAtLimitDoesNotMutate is the required --max-db-size
+// regression test: a store already at (or past) the configured limit must
+// not be mutated at all — no page may be applied, however small — and the
+// pass must report complete:false, rather than the size only being checked
+// after a page had already landed (the defect: checking post-commit means
+// the very first page of a run always lands even when the store started
+// over the limit, since "after this page" has no counterpart before the
+// first page exists to check after).
+func TestSyncMaxDBSizeAlreadyAtLimitDoesNotMutate(t *testing.T) {
+	st := openSyncTestStore(t)
+	ctx := context.Background()
+	// Seed something for the store to already hold, so this isn't simply an
+	// empty-database edge case.
+	err := st.WithTx(ctx, func(tx *store.Tx) error {
+		if err := tx.UpsertConversation(ctx, store.Conversation{ID: "c0", URN: "urn:li:fs_conversation:c0", UpdatedAt: 1}, 1); err != nil {
+			return err
+		}
+		_, err := tx.RecordMessagePage(ctx, "c0", []store.Message{{URN: "seed", ConversationID: "c0", SentAt: 1}}, 1)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit, err := st.SizeBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m1", int64(100)}}))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(ctx, cl, st, syncOptions{maxDBSizeBytes: limit}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: --max-db-size was already at the limit before this run started")
+	}
+	if summary.MessagesAdded != 0 {
+		t.Errorf("MessagesAdded = %d, want 0: a store already at --max-db-size must not be mutated at all", summary.MessagesAdded)
+	}
+	msgs, err := st.Messages(ctx, store.MessageFilter{ConversationID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("c1 messages = %d, want 0: the page must never have been applied once the store was already at the limit", len(msgs))
+	}
+}
+
 // TestSyncOnceAndFollowAreMutuallyExclusive covers the flag-validation half
 // of the --once/--follow wacli-compat flags, at the full command-dispatch
 // level (no network needed since this fails before building a client).

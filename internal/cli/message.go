@@ -47,6 +47,26 @@ func newMessageListCmd() *cobra.Command {
 	return cmd
 }
 
+// conversationOutput is the exact JSON shape `lion message list` has shipped
+// since v1.0.0: participants as a plain array of display-name strings.
+// voyager.Conversation now pairs each participant with its MiniProfile URN
+// internally (see Participant's doc comment), and the newer store/sync/
+// export/history-coverage surfaces render that richer pair directly because
+// they have no shipped contract to protect — but serializing
+// voyager.Conversation straight to this command's JSON output would leak
+// that internal shape change into a published contract and break every
+// consumer reading .participants[0] as a string. Rendering through this
+// explicit DTO instead means a future change to voyager.Conversation can't
+// silently do that again. Do not add fields here: this type's shape is
+// exactly v1.0.0's, byte for byte.
+type conversationOutput struct {
+	URN          string   `json:"urn"`
+	Participants []string `json:"participants"`
+	LastMessage  string   `json:"last_message"`
+	UpdatedAt    int64    `json:"updated_at"`
+	Unread       bool     `json:"unread"`
+}
+
 // renderConversations wraps every LinkedIn-controlled free-text field (via
 // wrapConversation — see untrusted.go) once and renders it identically for
 // every output format — JSON included — so --wrap-untrusted is honored
@@ -57,7 +77,17 @@ func renderConversations(r *output.Renderer, jsonOut bool, convs []voyager.Conve
 		convs[i] = wrapConversation(r, convs[i])
 	}
 	if jsonOut {
-		return r.Emit(convs)
+		out := make([]conversationOutput, len(convs))
+		for i, cv := range convs {
+			out[i] = conversationOutput{
+				URN:          cv.URN,
+				Participants: participantNames(cv.Participants),
+				LastMessage:  cv.LastMessage,
+				UpdatedAt:    cv.UpdatedAt,
+				Unread:       cv.Unread,
+			}
+		}
+		return r.Emit(out)
 	}
 	t := &output.Table{Cols: []string{"URN", "PARTICIPANTS", "UNREAD", "LAST_MESSAGE"}}
 	for _, cv := range convs {

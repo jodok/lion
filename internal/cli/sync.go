@@ -443,6 +443,23 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 		if budget != nil && *budget <= 0 {
 			return added, false, nil
 		}
+		if opts.maxDBSizeBytes > 0 {
+			// Checked before this page is even fetched, never after it's
+			// already committed — the defect this guards against was
+			// exactly that ordering: a store already at --max-db-size kept
+			// growing because the check only ran once a page had already
+			// landed. SizeBytes() only reflects what's actually durable on
+			// disk, so this can't predict a not-yet-fetched page's own
+			// footprint in advance and stop that specific page from
+			// landing — but nothing further is ever attempted once the
+			// bound is reached, and a store already at the limit is never
+			// touched at all.
+			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
+				return added, false, sErr
+			} else if reached {
+				return added, false, errMaxDBSizeReached
+			}
+		}
 		pageSize := defaultMessagePageSize
 		if budget != nil && *budget < pageSize {
 			pageSize = *budget
@@ -467,7 +484,19 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 			return added, true, nil
 		}
 
-		pageAdded, aErr := applyMessagePage(ctx, st, conv.ID, msgs)
+		// toStore, not msgs, is what actually gets persisted below — every
+		// pagination/completeness decision from here on (the stalled check,
+		// the duplicate-page check, next, the --after cutoff itself) keeps
+		// reading msgs, the page the server actually returned, never
+		// toStore. Filtering only decides what applyMessagePage is allowed
+		// to write; conflating the two would make a --after-trimmed page
+		// look like a short or duplicate page to that cursor logic, which
+		// has nothing to do with why it was trimmed.
+		toStore := msgs
+		if opts.afterMs != nil {
+			toStore = messagesAtOrAfter(msgs, *opts.afterMs)
+		}
+		pageAdded, aErr := applyMessagePage(ctx, st, conv.ID, toStore)
 		if aErr != nil {
 			return added, false, aErr
 		}
@@ -478,19 +507,11 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 		progress.Status("syncing %s: +%d messages (%d so far)", conv.ID, pageAdded, added)
 		progress.Event("messages_stored", map[string]any{"conversation_id": conv.ID, "added": pageAdded, "phase": "catch_up"})
 
-		if opts.maxDBSizeBytes > 0 {
-			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
-				return added, false, err
-			} else if reached {
-				return added, false, errMaxDBSizeReached
-			}
-		}
-
 		// stalled must be checked before the duplicate-page branch below: a
 		// server that ignores createdBefore keeps re-serving the same page,
 		// which — once this loop has already stored it once — looks
 		// identical to a legitimate "caught up" duplicate (pageAdded <
-		// len(msgs), or even pageAdded == 0). Checking the dup case first
+		// len(toStore), or even pageAdded == 0). Checking the dup case first
 		// would silently treat a stalled cursor as a successful catch-up,
 		// bypassing ErrPaginationStalled's guard in exactly the failure
 		// mode it exists to catch.
@@ -498,7 +519,7 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 			progress.Warn("messages pagination cursor did not advance for conversation %s; older messages may not have been fetched", conv.ID)
 			return added, false, nil
 		}
-		if pageAdded < len(msgs) {
+		if pageAdded < len(toStore) {
 			// This page reconnected with a message already in the store —
 			// proof catch-up has caught this conversation up to whatever
 			// newest range was previously synced. It is NOT proof the
@@ -511,6 +532,12 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 			// is what actually resumes from OldestSynced (see
 			// backfillMessages) — but report the pass incomplete so the
 			// summary doesn't claim a full archive that isn't one.
+			//
+			// Comparing against len(toStore) rather than len(msgs) matters
+			// once --after is set: toStore can be shorter than msgs simply
+			// because older messages were trimmed, which is not evidence of
+			// a duplicate and must not be misread as one — the cutoff check
+			// below is what correctly recognizes that case.
 			done, dErr := conversationBackfillDone(ctx, st, conv.ID)
 			if dErr != nil {
 				return added, false, dErr
@@ -588,6 +615,15 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 		if budget != nil && *budget <= 0 {
 			return added, false, nil
 		}
+		if opts.maxDBSizeBytes > 0 {
+			// See catchUpMessages' identical guard for why this runs before
+			// the page is fetched rather than after it's already committed.
+			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
+				return added, false, sErr
+			} else if reached {
+				return added, false, errMaxDBSizeReached
+			}
+		}
 		pageSize := defaultMessagePageSize
 		if budget != nil && *budget < pageSize {
 			pageSize = *budget
@@ -606,7 +642,14 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 			return added, true, nil
 		}
 
-		pageAdded, aErr := applyMessagePage(ctx, st, conversationID, msgs)
+		// See catchUpMessages' identical split: toStore is what actually
+		// gets persisted, but next/stalled/the --after check below all keep
+		// reading the unfiltered msgs the server returned.
+		toStore := msgs
+		if opts.afterMs != nil {
+			toStore = messagesAtOrAfter(msgs, *opts.afterMs)
+		}
+		pageAdded, aErr := applyMessagePage(ctx, st, conversationID, toStore)
 		if aErr != nil {
 			return added, false, aErr
 		}
@@ -616,14 +659,6 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 		}
 		progress.Status("backfilling %s: +%d messages (%d so far)", conversationID, pageAdded, added)
 		progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": pageAdded, "phase": "backfill"})
-
-		if opts.maxDBSizeBytes > 0 {
-			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
-				return added, false, err
-			} else if reached {
-				return added, false, errMaxDBSizeReached
-			}
-		}
 
 		// Ordering audit (see catchUpMessages' equivalent comment, added for
 		// the same class of bug): unlike catchUpMessages, none of the
@@ -664,6 +699,25 @@ func storeSizeReached(st *store.Store, maxBytes int64) (bool, error) {
 		return false, err
 	}
 	return size >= maxBytes, nil
+}
+
+// messagesAtOrAfter filters msgs down to those at or after cutoff,
+// preserving order. It exists solely to decide what applyMessagePage is
+// allowed to persist — see catchUpMessages/backfillMessages, which
+// deliberately keep using the unfiltered page for their own pagination and
+// completeness decisions. Without this filter, any page whose messages
+// straddle --after got stored in full: the cutoff was only ever checked
+// afterward, against the page's oldest timestamp, to decide whether to
+// fetch another page — never against each message to decide whether it
+// should have been written at all.
+func messagesAtOrAfter(msgs []voyager.Message, cutoff int64) []voyager.Message {
+	out := make([]voyager.Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.SentAt >= cutoff {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func oldestSentAt(msgs []voyager.Message) int64 {

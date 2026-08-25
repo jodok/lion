@@ -46,7 +46,10 @@ func TestRenderMessagesWrapsJSON(t *testing.T) {
 
 // TestRenderConversationsWrapsParticipantNameJSON is the defect regression
 // test: an attacker who puts injection text in a participant's name (rather
-// than the last-message preview) must still be wrapped in JSON output.
+// than the last-message preview) must still be wrapped in JSON output. It
+// decodes into a bare []string, not []voyager.Participant, matching the
+// v1.0.0 output contract that conversationOutput preserves (see
+// TestMessageListJSONParticipantsAreStrings for the contract guard itself).
 func TestRenderConversationsWrapsParticipantNameJSON(t *testing.T) {
 	var buf bytes.Buffer
 	r := output.New(&buf, output.FormatJSON, true)
@@ -54,12 +57,58 @@ func TestRenderConversationsWrapsParticipantNameJSON(t *testing.T) {
 	if err := renderConversations(r, true, convs); err != nil {
 		t.Fatal(err)
 	}
-	var got []voyager.Conversation
+	var got []struct {
+		Participants []string `json:"participants"`
+	}
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got[0].Participants) != 1 || !strings.HasPrefix(got[0].Participants[0].Name, "<untrusted nonce=") {
+	if len(got[0].Participants) != 1 || !strings.HasPrefix(got[0].Participants[0], "<untrusted nonce=") {
 		t.Errorf("Participants in JSON = %v, want wrapped", got[0].Participants)
+	}
+}
+
+// TestMessageListJSONParticipantsAreStrings is the contract-guard regression
+// test for the v1.0.0 --json shape: `lion message list` shipped with
+// "participants" as an array of plain display-name strings, and existing
+// consumers read .participants[0] as a string. voyager.Conversation was
+// later retyped internally to pair each participant with its MiniProfile
+// URN (see Participant's doc comment), but that richer shape must never
+// leak into this command's output — see conversationOutput in message.go.
+// This decodes into raw JSON (not voyager.Conversation) so a
+// participant_urns field or an object-shaped participant would be caught
+// here rather than silently absorbed by a lenient target type.
+func TestMessageListJSONParticipantsAreStrings(t *testing.T) {
+	var buf bytes.Buffer
+	r := output.New(&buf, output.FormatJSON, true)
+	convs := []voyager.Conversation{{
+		URN:          "urn:li:fs_conversation:c1",
+		Participants: []voyager.Participant{{Name: "Grace Hopper", URN: "urn:li:fs_miniProfile:grace"}},
+		LastMessage:  "hi",
+		UpdatedAt:    100,
+		Unread:       true,
+	}}
+	if err := renderConversations(r, true, convs); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	participants, ok := got[0]["participants"].([]any)
+	if !ok || len(participants) != 1 {
+		t.Fatalf("participants = %v, want a one-element array", got[0]["participants"])
+	}
+	name, ok := participants[0].(string)
+	if !ok {
+		t.Fatalf("participants[0] = %T (%v), want a plain string — this is lion's shipped v1.0.0 --json contract and must not change", participants[0], participants[0])
+	}
+	if !strings.Contains(name, "Grace Hopper") {
+		t.Errorf("participants[0] = %q, want it to contain the display name", name)
+	}
+	if _, hasURNs := got[0]["participant_urns"]; hasURNs {
+		t.Error("a participant_urns field leaked into the v1.0.0-shaped output")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -270,8 +271,8 @@ func TestExportReplacesOwnedMessagesDirectoryCleanly(t *testing.T) {
 	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
 		t.Fatalf("first export: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, exportMarkerFilename)); err != nil {
-		t.Fatalf("export marker missing after the first export: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "messages", exportMarkerFilename)); err != nil {
+		t.Fatalf("export marker missing from messages/ after the first export: %v", err)
 	}
 	staleFile := filepath.Join(dir, "messages", "leftover-from-a-prior-lion-run.jsonl")
 	if err := os.WriteFile(staleFile, []byte(`{"stale":true}`), 0o600); err != nil {
@@ -290,6 +291,92 @@ func TestExportReplacesOwnedMessagesDirectoryCleanly(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); err != nil {
 		t.Errorf("messages/c2.jsonl missing after the re-export: %v", err)
+	}
+}
+
+// TestExportRefusesCorruptOrForeignMarker is a required regression test for
+// the stale/copied-marker defect: a messages/ directory that does carry a
+// file at the marker path, but one that's unparseable or doesn't identify
+// itself as lion's own (wrong format/version), must be refused exactly like
+// a directory with no marker at all — the marker's mere presence must never
+// be enough to trust it, since a copied or hand-crafted file at that path
+// costs an attacker (or a stale leftover) nothing to produce.
+func TestExportRefusesCorruptOrForeignMarker(t *testing.T) {
+	for name, contents := range map[string]string{
+		"corrupt JSON":   `{"format": "lion-message-export", "version": 1,`, // truncated
+		"foreign format": `{"format": "some-other-tool", "version": 1, "updated_at": "2026-01-01T00:00:00Z"}`,
+		"wrong version":  fmt.Sprintf(`{"format": %q, "version": 99, "updated_at": "2026-01-01T00:00:00Z"}`, exportMarkerFormat),
+	} {
+		t.Run(name, func(t *testing.T) {
+			seedExportStore(t)
+			dir := t.TempDir()
+			messagesDir := filepath.Join(dir, "messages")
+			if err := os.MkdirAll(messagesDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(messagesDir, "not-lions.txt")
+			if err := os.WriteFile(sentinel, []byte("someone else's file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(messagesDir, exportMarkerFilename), []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := runRoot(t, "message", "export", "--output", dir)
+			if err == nil {
+				t.Fatal("expected export to refuse a messages/ directory with a corrupt/foreign marker")
+			}
+			if exitCode(err) != ExitUsage {
+				t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+			}
+			if _, statErr := os.Stat(sentinel); statErr != nil {
+				t.Errorf("sentinel file destroyed by the refused export: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestExportRefusesAfterMessagesDirReplacedWithUnrelatedData is the required
+// regression test for the stale-root-marker defect: a marker that lived at
+// the --output directory's root (rather than inside messages/ itself)
+// survived the user deleting messages/ and dropping unrelated data in its
+// place, so the next export would RemoveAll that unrelated data on the
+// strength of a marker that no longer described what was actually there.
+// Moving the marker inside messages/ means deleting messages/ deletes the
+// marker with it, so a later export into the same --output directory must
+// refuse rather than destroy whatever now occupies that path.
+func TestExportRefusesAfterMessagesDirReplacedWithUnrelatedData(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	messagesDir := filepath.Join(dir, "messages")
+	if err := os.RemoveAll(messagesDir); err != nil {
+		t.Fatalf("remove messages/: %v", err)
+	}
+	if err := os.MkdirAll(messagesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(messagesDir, "not-lions-either.txt")
+	if err := os.WriteFile(unrelated, []byte("unrelated data the user put here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected the second export to refuse: messages/ was replaced with data lion never marked")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+	b, statErr := os.ReadFile(unrelated)
+	if statErr != nil {
+		t.Fatalf("unrelated data destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != "unrelated data the user put here" {
+		t.Errorf("unrelated file contents = %q, want unchanged", b)
 	}
 }
 
