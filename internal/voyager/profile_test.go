@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jodok/lion/internal/ratelimit"
 )
 
 // fixtureTransport serves recorded Voyager responses based on the request URL.
@@ -37,8 +39,17 @@ func (f *fixtureTransport) Do(_ context.Context, req *Request) (*Response, error
 func newTestClient(t *testing.T, routes map[string]string) (*Client, *fixtureTransport) {
 	t.Helper()
 	ft := &fixtureTransport{routes: routes}
-	c := New("li_at_test", `"jsession_test"`, WithTransport(ft))
+	c := New("li_at_test", `"jsession_test"`, WithTransport(ft), WithLimiter(noopLimiter()))
 	return c, ft
+}
+
+// noopLimiter returns a Limiter with no configured budgets, so Wait is a
+// no-op for every class (see ratelimit.TestUnknownClassIsNoop). Fixture- and
+// error-path-backed tests don't hit a real network, so they shouldn't pay
+// the client's default human-pacing jitter, nor touch the persisted state
+// file a default client would use.
+func noopLimiter() *ratelimit.Limiter {
+	return ratelimit.New(nil)
 }
 
 func TestMe(t *testing.T) {

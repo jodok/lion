@@ -47,11 +47,14 @@ type Connection struct {
 // Invitation is an incoming or outgoing connection request.
 type Invitation struct {
 	InvitationURN string `json:"invitation_urn"`
-	SharedSecret  string `json:"shared_secret"`
-	FromName      string `json:"from_name"`
-	FromPublicID  string `json:"from_public_id"`
-	Message       string `json:"message,omitempty"`
-	Incoming      bool   `json:"incoming"`
+	// SharedSecret is only needed internally to call AcceptInvitation; it
+	// must never leak into `--json` output, so it is excluded from
+	// marshaling rather than merely renamed.
+	SharedSecret string `json:"-"`
+	FromName     string `json:"from_name"`
+	FromPublicID string `json:"from_public_id"`
+	Message      string `json:"message,omitempty"`
+	Incoming     bool   `json:"incoming"`
 }
 
 // Conversation is a messaging thread.

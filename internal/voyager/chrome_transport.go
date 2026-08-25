@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -100,5 +101,32 @@ func (t *chromeTransport) Do(ctx context.Context, req *Request) (*Response, erro
 	if err != nil {
 		return nil, err
 	}
-	return &Response{StatusCode: resp.StatusCode, Body: b}, nil
+	return &Response{
+		StatusCode: resp.StatusCode,
+		Body:       b,
+		Headers:    cloneFHTTPHeader(resp.Header),
+		FinalURL:   fhttpFinalURL(resp.Request, req.URL),
+	}, nil
+}
+
+// cloneFHTTPHeader converts fhttp's response header map into the stdlib
+// http.Header the rest of lion works with; both are map[string][]string
+// under an fhttp/net-http-specific named type, so this is a plain copy.
+func cloneFHTTPHeader(h fhttp.Header) http.Header {
+	out := make(http.Header, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
+}
+
+// fhttpFinalURL mirrors transport.go's finalURL for fhttp's request/response
+// types: tls-client follows redirects (see NewChromeTransport) and, like
+// net/http, sets Response.Request to the last request actually sent, so its
+// URL reflects any redirect target.
+func fhttpFinalURL(lastReq *fhttp.Request, requested string) string {
+	if lastReq != nil && lastReq.URL != nil {
+		return lastReq.URL.String()
+	}
+	return requested
 }
