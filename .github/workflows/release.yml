@@ -1,0 +1,80 @@
+name: release
+
+# Builds binaries and publishes a GitHub release when a v* tag is pushed.
+#
+# Unix only, deliberately. lion's action budgets exist to keep a real LinkedIn
+# account from looking like a bot, and they are only enforced across concurrent
+# invocations by an flock (internal/ratelimit/flock_unix.go). A non-unix build
+# still runs — it falls back to a per-process limiter — but a shell loop there
+# would outrun the daily cap, and shipping a binary whose main safety guarantee
+# is quietly weaker is worse than not shipping it. Windows needs a real lock
+# implementation first.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          version="${GITHUB_REF_NAME}"
+          out="lion_${version}_${GOOS}_${GOARCH}"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/jodok/lion/internal/cli.version=${version}" \
+            -o "dist/${out}/lion" ./cmd/lion
+          cp README.md DESIGN.md "dist/${out}/"
+          tar -C dist -czf "dist/${out}.tar.gz" "${out}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
