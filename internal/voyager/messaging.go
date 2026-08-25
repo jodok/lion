@@ -183,41 +183,43 @@ func decodeConversations(body []byte) ([]Conversation, error) {
 
 	out := make([]Conversation, 0, len(raw.Data.Elements))
 	for _, el := range raw.Data.Elements {
-		var names []string
-		var urns []string
+		// Built as one paired slice, not two parallel ones: each
+		// participant reference always has a URN (captured directly off the
+		// reference, not through included[] resolution), but its display
+		// name only resolves when included[] happens to carry that
+		// participant's MiniProfile. Appending both fields onto the same
+		// Participant value — even when the name lookup below misses and
+		// leaves Name empty — is what keeps a name from ever landing next
+		// to the wrong participant's URN (see Participant's doc comment).
+		var participants []Participant
 		for _, p := range el.Participants {
 			urn := p.MiniProfile.EntityUrn
-			if urn != "" {
-				// Captured directly off the participant reference, not
-				// through the included[] resolution below: the URN is
-				// already present in the payload whether or not the
-				// MiniProfile it points at also happens to be embedded.
-				urns = append(urns, urn)
+			if urn == "" {
+				continue
 			}
+			var name string
 			if ent, ok := idx.get(urn); ok {
 				var mp struct {
 					FirstName string `json:"firstName"`
 					LastName  string `json:"lastName"`
 				}
 				if err := decodeInto(ent, &mp); err == nil {
-					if name := strings.TrimSpace(mp.FirstName + " " + mp.LastName); name != "" {
-						names = append(names, name)
-					}
+					name = strings.TrimSpace(mp.FirstName + " " + mp.LastName)
 				}
 			}
+			participants = append(participants, Participant{Name: name, URN: urn})
 		}
 		var lastMsg string
 		if n := len(el.Events); n > 0 {
 			lastMsg = el.Events[n-1].EventContent.MessageEvent.Body
 		}
 		out = append(out, Conversation{
-			URN:             el.EntityUrn,
-			ID:              conversationIDFromURN(el.EntityUrn),
-			Participants:    names,
-			ParticipantURNs: urns,
-			LastMessage:     lastMsg,
-			UpdatedAt:       el.LastActivityAt,
-			Unread:          el.Unread,
+			URN:          el.EntityUrn,
+			ID:           conversationIDFromURN(el.EntityUrn),
+			Participants: participants,
+			LastMessage:  lastMsg,
+			UpdatedAt:    el.LastActivityAt,
+			Unread:       el.Unread,
 		})
 	}
 	// Shape-drift guard, mirroring decodeConnections/decodeFeed. Unlike those

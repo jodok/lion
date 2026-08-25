@@ -350,6 +350,14 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 	if err := ensureOutputDir(dir); err != nil {
 		return err
 	}
+	// Must run before anything below touches the directory's contents: a
+	// --output directory that already holds an unrelated messages/ tree has
+	// to be refused untouched, not partially overwritten (conversations.jsonl
+	// written, then the refusal) — see checkMessagesDirOwnership and
+	// writeMessagesDir.
+	if err := checkMessagesDirOwnership(dir); err != nil {
+		return err
+	}
 
 	cf, err := os.OpenFile(filepath.Join(dir, "conversations.jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -370,7 +378,81 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 		return err
 	}
 
-	return writeMessagesDir(dir, groups)
+	if err := writeMessagesDir(dir, groups); err != nil {
+		return err
+	}
+	return writeExportMarker(dir)
+}
+
+// exportMarkerFilename is written at the root of a --output directory the
+// first time lion writes the export layout there. It's what
+// checkMessagesDirOwnership consults before writeMessagesDir is ever
+// allowed to destroy an existing messages/ tree — see both functions'
+// comments for why an unmarked directory must be refused, not deleted.
+const exportMarkerFilename = ".lion-export.json"
+
+// exportMarker is the on-disk shape of exportMarkerFilename. It carries no
+// authorization or security meaning by itself — its only job is letting a
+// later export distinguish "lion wrote this directory, safe to replace
+// messages/ wholesale" from "this happens to be some other directory that
+// independently contains a messages/ folder."
+type exportMarker struct {
+	Format    string `json:"format"`
+	Version   int    `json:"version"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// exportMarkerVersion is bumped if the marker's own shape (not the export
+// layout) ever needs to change in a way a reader must distinguish.
+const exportMarkerVersion = 1
+
+// checkMessagesDirOwnership refuses to let writeMessagesDir touch dir's
+// messages/ subdirectory unless a prior lion export already created it
+// (exportMarkerFilename present at dir's root). --output happily accepts
+// any existing directory a caller names, including a normal one that
+// already contains an unrelated messages/ folder for its own reasons —
+// writeMessagesDir's swap-in-place approach used to RemoveAll that
+// unconditionally, silently destroying whatever was there. This is the
+// guard that turns that into a refusal instead: nothing gets deleted or
+// written past this point unless the directory is either empty of a
+// messages/ tree, or one lion itself is known to have created.
+func checkMessagesDirOwnership(dir string) error {
+	messagesDir := filepath.Join(dir, "messages")
+	if _, err := os.Stat(messagesDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("export: stat %s: %w", messagesDir, err)
+	}
+	markerPath := filepath.Join(dir, exportMarkerFilename)
+	if _, err := os.Stat(markerPath); err != nil {
+		if os.IsNotExist(err) {
+			return usageErr("%s already contains a messages/ directory that lion did not create; pick an empty directory or a different --output path", dir)
+		}
+		return fmt.Errorf("export: stat %s: %w", markerPath, err)
+	}
+	return nil
+}
+
+// writeExportMarker (re)writes exportMarkerFilename at dir's root once this
+// export has successfully written (or replaced) the directory layout, so a
+// later re-export into the same --output directory passes
+// checkMessagesDirOwnership and can safely swap messages/ again.
+func writeExportMarker(dir string) error {
+	m := exportMarker{
+		Format:    "lion-message-export",
+		Version:   exportMarkerVersion,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	buf, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, exportMarkerFilename)
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		return fmt.Errorf("export: write %s: %w", path, err)
+	}
+	return nil
 }
 
 // ensureOutputDir makes sure dir exists, creating it 0700 only when this
@@ -416,6 +498,12 @@ func ensureOutputDir(dir string) error {
 // silently retains messages the caller just asked to exclude is a privacy
 // bug, not untidiness. Swapping the whole directory in guarantees the
 // archive's contents match exactly this export, every time.
+//
+// The RemoveAll below is only reachable once checkMessagesDirOwnership (the
+// caller, writeExportDirectory, always runs it first) has confirmed either
+// there's no pre-existing messages/ tree, or that the one there carries
+// lion's own export marker — never an unrelated directory a caller happened
+// to already have at --output.
 func writeMessagesDir(dir string, groups []*exportGroup) error {
 	staging, err := os.MkdirTemp(dir, ".messages-")
 	if err != nil {

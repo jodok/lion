@@ -21,7 +21,7 @@ func TestConversations(t *testing.T) {
 	if first.URN != "urn:li:fs_conversation:2-YWJjMTIz" {
 		t.Errorf("urn = %q", first.URN)
 	}
-	if len(first.Participants) != 1 || first.Participants[0] != "Grace Hopper" {
+	if len(first.Participants) != 1 || first.Participants[0].Name != "Grace Hopper" {
 		t.Errorf("participants = %+v", first.Participants)
 	}
 	if first.LastMessage != "Are you free for a quick call this week?" {
@@ -41,7 +41,7 @@ func TestConversationsUnreadOnly(t *testing.T) {
 	if len(convs) != 1 {
 		t.Fatalf("got %d unread conversations, want 1", len(convs))
 	}
-	if convs[0].Participants[0] != "Grace Hopper" {
+	if convs[0].Participants[0].Name != "Grace Hopper" {
 		t.Errorf("unread conversation = %+v", convs[0])
 	}
 }
@@ -126,8 +126,55 @@ func TestConversationsIncludesIDAndParticipantURNs(t *testing.T) {
 	if first.ID != "2-YWJjMTIz" {
 		t.Errorf("ID = %q, want 2-YWJjMTIz (parsed from the fs_conversation URN)", first.ID)
 	}
-	if len(first.ParticipantURNs) != 1 || first.ParticipantURNs[0] != "urn:li:fs_miniProfile:ACoAAA1" {
-		t.Errorf("ParticipantURNs = %+v, want [urn:li:fs_miniProfile:ACoAAA1]", first.ParticipantURNs)
+	if len(first.Participants) != 1 || first.Participants[0].URN != "urn:li:fs_miniProfile:ACoAAA1" {
+		t.Errorf("Participants = %+v, want [{Grace Hopper urn:li:fs_miniProfile:ACoAAA1}]", first.Participants)
+	}
+}
+
+// TestDecodeConversationsParticipantPairingSurvivesUnresolvedFirst is the
+// mispairing regression test: when the *first* participant's MiniProfile
+// doesn't resolve via included[] but the *second* one does, the second
+// participant's name must land on the second participant's own URN — never
+// cross-paired onto the first, which is exactly what happened under the old
+// two-parallel-slices shape (a name was appended only when included[]
+// resolved, while a URN was appended unconditionally, so a single miss
+// among several participants silently shifted every later index).
+func TestDecodeConversationsParticipantPairingSurvivesUnresolvedFirst(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"elements": [
+				{
+					"entityUrn": "urn:li:fs_conversation:2-abc",
+					"unread": false,
+					"lastActivityAt": 1000,
+					"participants": [
+						{"miniProfile": {"entityUrn": "urn:li:fs_miniProfile:unresolved"}},
+						{"miniProfile": {"entityUrn": "urn:li:fs_miniProfile:ACoAAA1"}}
+					],
+					"events": []
+				}
+			]
+		},
+		"included": [
+			{"$type": "com.linkedin.voyager.identity.shared.MiniProfile", "entityUrn": "urn:li:fs_miniProfile:ACoAAA1", "firstName": "Grace", "lastName": "Hopper"}
+		]
+	}`)
+	convs, err := decodeConversations(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(convs) != 1 {
+		t.Fatalf("got %d conversations, want 1", len(convs))
+	}
+	participants := convs[0].Participants
+	if len(participants) != 2 {
+		t.Fatalf("got %d participants, want 2", len(participants))
+	}
+	if participants[0].URN != "urn:li:fs_miniProfile:unresolved" || participants[0].Name != "" {
+		t.Errorf("participants[0] = %+v, want {Name:\"\" URN:urn:li:fs_miniProfile:unresolved} (unresolved name stays on ITS OWN urn)", participants[0])
+	}
+	if participants[1].URN != "urn:li:fs_miniProfile:ACoAAA1" || participants[1].Name != "Grace Hopper" {
+		t.Errorf("participants[1] = %+v, want {Name:\"Grace Hopper\" URN:urn:li:fs_miniProfile:ACoAAA1} (never cross-paired onto participant[0])", participants[1])
 	}
 }
 

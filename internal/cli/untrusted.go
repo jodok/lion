@@ -47,9 +47,11 @@ func wrapInvitation(r *output.Renderer, inv voyager.Invitation) voyager.Invitati
 // element-by-element rather than as a whole joined string.
 func wrapConversation(r *output.Renderer, c voyager.Conversation) voyager.Conversation {
 	if len(c.Participants) > 0 {
-		wrapped := make([]string, len(c.Participants))
+		wrapped := make([]voyager.Participant, len(c.Participants))
 		for i, p := range c.Participants {
-			wrapped[i] = r.Untrusted(p)
+			// URN is lion's own structured identifier, not free text — only
+			// Name (the display name someone else set) gets wrapped.
+			wrapped[i] = voyager.Participant{Name: r.Untrusted(p.Name), URN: p.URN}
 		}
 		c.Participants = wrapped
 	}

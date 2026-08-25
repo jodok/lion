@@ -57,6 +57,21 @@ type Invitation struct {
 	Incoming     bool   `json:"incoming"`
 }
 
+// Participant is one participant of a Conversation, carrying a display name
+// paired with the MiniProfile URN it came from. This exists as a single
+// struct rather than two parallel slices (a prior shape this replaced)
+// because a participant's URN is always known — it's read directly off the
+// participant reference — while the display name only resolves when
+// included[] happens to carry that participant's MiniProfile (see
+// decodeConversations). Pairing them means an unresolved name is simply an
+// empty Name on THAT participant's own entry, not a missing slice element
+// that silently shifts every later index — which is exactly how a name
+// could end up attached to the wrong participant's URN under the old shape.
+type Participant struct {
+	Name string `json:"name"`
+	URN  string `json:"urn"`
+}
+
 // Conversation is a messaging thread.
 type Conversation struct {
 	URN string `json:"urn"`
@@ -64,15 +79,13 @@ type Conversation struct {
 	// urn:li:fs_conversation:<id> URN) — the identifier the events endpoint
 	// path and a filesystem-safe filename both need. Empty when URN doesn't
 	// match the expected prefix, rather than guessing.
-	ID           string   `json:"id,omitempty"`
-	Participants []string `json:"participants"`
-	// ParticipantURNs are the participants' MiniProfile URNs, in the same
-	// order as Participants, alongside their display names — a display name
-	// alone isn't a stable identity.
-	ParticipantURNs []string `json:"participant_urns,omitempty"`
-	LastMessage     string   `json:"last_message"`
-	UpdatedAt       int64    `json:"updated_at"` // epoch millis
-	Unread          bool     `json:"unread"`
+	ID string `json:"id,omitempty"`
+	// Participants pairs each participant's display name with their
+	// MiniProfile URN — see the Participant doc comment.
+	Participants []Participant `json:"participants"`
+	LastMessage  string        `json:"last_message"`
+	UpdatedAt    int64         `json:"updated_at"` // epoch millis
+	Unread       bool          `json:"unread"`
 }
 
 // Message is a single message within a conversation.

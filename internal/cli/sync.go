@@ -273,7 +273,7 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 			break
 		}
 
-		progress.Status("syncing %s (%s)", conv.ID, firstNonEmpty(conv.Participants...))
+		progress.Status("syncing %s (%s)", conv.ID, firstParticipantName(conv.Participants))
 		progress.Event("conversation_start", map[string]any{"id": conv.ID, "urn": conv.URN})
 
 		added, caughtUp, err := catchUpMessages(ctx, cl, st, conv, opts, budget, progress)
@@ -425,12 +425,14 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 // budget, or at --max-db-size.
 //
 // The returned bool is true only when the walk reached a genuine stopping
-// point (a known message, an empty page, or --after) — it is false when a
-// --max-messages budget ran out before that, or when MessagesPage reported
-// ErrPaginationStalled, since in both cases this conversation may still have
-// older messages sync never fetched. A caller must fold that into the pass's
-// complete:false summary field; it is not itself a returned error, matching
-// --max-db-size's existing "truncated, not failed" treatment via
+// point (an empty page, or --after) — it is false when a --max-messages
+// budget ran out before that, when MessagesPage reported
+// ErrPaginationStalled, or when it stopped on an already-known message
+// without the conversation's history having actually reached its true start
+// (see the pageAdded < len(msgs) branch below for why hitting a known
+// message alone isn't proof of that). A caller must fold that into the
+// pass's complete:false summary field; it is not itself a returned error,
+// matching --max-db-size's existing "truncated, not failed" treatment via
 // errMaxDBSizeReached below.
 func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
 	var createdBefore int64
@@ -452,6 +454,16 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 			return added, false, err
 		}
 		if len(msgs) == 0 {
+			// A genuine end-of-history signal, same as backfillMessages'
+			// own empty-page case: catch-up can reach it directly for a
+			// conversation whose entire history fits before ever hitting a
+			// duplicate (e.g. a brand new conversation, or one short enough
+			// that a single pass covers it). Marking BackfillDone here too
+			// means a later plain sync never needs --backfill to know
+			// there's nothing older left for this conversation.
+			if err := markBackfillDone(ctx, st, conv.ID); err != nil {
+				return added, false, err
+			}
 			return added, true, nil
 		}
 
@@ -474,14 +486,41 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 			}
 		}
 
-		if pageAdded < len(msgs) {
-			return added, true, nil // hit a message we already had: caught up
-		}
+		// stalled must be checked before the duplicate-page branch below: a
+		// server that ignores createdBefore keeps re-serving the same page,
+		// which — once this loop has already stored it once — looks
+		// identical to a legitimate "caught up" duplicate (pageAdded <
+		// len(msgs), or even pageAdded == 0). Checking the dup case first
+		// would silently treat a stalled cursor as a successful catch-up,
+		// bypassing ErrPaginationStalled's guard in exactly the failure
+		// mode it exists to catch.
 		if stalled {
 			progress.Warn("messages pagination cursor did not advance for conversation %s; older messages may not have been fetched", conv.ID)
 			return added, false, nil
 		}
+		if pageAdded < len(msgs) {
+			// This page reconnected with a message already in the store —
+			// proof catch-up has caught this conversation up to whatever
+			// newest range was previously synced. It is NOT proof the
+			// conversation's full history (back to its true start) is held:
+			// that range could itself be the product of an earlier
+			// interrupted or --max-messages-capped run that never reached
+			// an empty page. Trust "caught up" as "conversation fully
+			// synced" only when a prior pass already walked all the way
+			// back (BackfillDone); otherwise stop here — a --backfill pass
+			// is what actually resumes from OldestSynced (see
+			// backfillMessages) — but report the pass incomplete so the
+			// summary doesn't claim a full archive that isn't one.
+			done, dErr := conversationBackfillDone(ctx, st, conv.ID)
+			if dErr != nil {
+				return added, false, dErr
+			}
+			return added, done, nil
+		}
 		if next == 0 {
+			if err := markBackfillDone(ctx, st, conv.ID); err != nil {
+				return added, false, err
+			}
 			return added, true, nil
 		}
 		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
@@ -489,6 +528,30 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 		}
 		createdBefore = next
 	}
+}
+
+// conversationBackfillDone reports whether a previous pass already walked a
+// conversation's history all the way back to an empty page (see
+// MarkBackfillDone). catchUpMessages consults this before trusting a
+// duplicate-page stop as genuine completion — see that function's doc
+// comment.
+func conversationBackfillDone(ctx context.Context, st *store.Store, conversationID string) (bool, error) {
+	conv, ok, err := st.Conversation(ctx, conversationID)
+	if err != nil {
+		return false, err
+	}
+	return ok && conv.BackfillDone, nil
+}
+
+// markBackfillDone records that paging a conversation's messages backwards
+// reached a genuine empty page, in its own transaction. It's shared by
+// catchUpMessages (which can reach this directly for a short conversation)
+// and, indirectly, mirrors what backfillMessages does inline for the same
+// reason further down.
+func markBackfillDone(ctx context.Context, st *store.Store, conversationID string) error {
+	return st.WithTx(ctx, func(tx *store.Tx) error {
+		return tx.MarkBackfillDone(ctx, conversationID, time.Now().UnixMilli())
+	})
 }
 
 // backfillMessages continues paging a conversation's messages backwards
@@ -536,11 +599,7 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 			return added, false, err
 		}
 		if len(msgs) == 0 {
-			now := time.Now().UnixMilli()
-			err := st.WithTx(ctx, func(tx *store.Tx) error {
-				return tx.MarkBackfillDone(ctx, conversationID, now)
-			})
-			if err != nil {
+			if err := markBackfillDone(ctx, st, conversationID); err != nil {
 				return added, false, err
 			}
 			progress.Event("backfill_done", map[string]any{"conversation_id": conversationID})
@@ -566,6 +625,13 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 			}
 		}
 
+		// Ordering audit (see catchUpMessages' equivalent comment, added for
+		// the same class of bug): unlike catchUpMessages, none of the
+		// branches below ever report success (added, true, nil) — every one
+		// returns added, false, nil (or an error) — so there's no "treat a
+		// stalled page as a duplicate-triggered success" hazard here for
+		// stalled to be checked ahead of. The order among them only changes
+		// which stderr warning fires, not the returned completeness.
 		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
 			return added, false, nil // hit the user's --after bound, not the true start
 		}
@@ -610,29 +676,32 @@ func oldestSentAt(msgs []voyager.Message) int64 {
 	return oldest
 }
 
+// firstParticipantName returns the first resolved display name among a
+// conversation's participants, for a one-line progress status. A
+// participant whose MiniProfile never resolved (empty Name — see
+// voyager.Conversation.Participants) is skipped rather than shown as blank.
+func firstParticipantName(participants []voyager.Participant) string {
+	for _, p := range participants {
+		if p.Name != "" {
+			return p.Name
+		}
+	}
+	return ""
+}
+
 // toStoreConversation translates the voyager API type to the store's
 // persisted type. These are deliberately distinct types (see
 // store.Conversation's doc comment) — this is the one place that bridges
 // them, so a field added to either side has one obvious spot to wire up.
 func toStoreConversation(c voyager.Conversation) store.Conversation {
-	// Indexed by the longer of the two slices, not just Participants: a
-	// participant whose display name didn't resolve (no MiniProfile found
-	// in included[] — see decodeConversations) still has a URN worth
-	// keeping, and ranging over Participants alone would silently drop it.
-	n := len(c.Participants)
-	if len(c.ParticipantURNs) > n {
-		n = len(c.ParticipantURNs)
-	}
-	participants := make([]store.Participant, 0, n)
-	for i := 0; i < n; i++ {
-		var name, urn string
-		if i < len(c.Participants) {
-			name = c.Participants[i]
-		}
-		if i < len(c.ParticipantURNs) {
-			urn = c.ParticipantURNs[i]
-		}
-		participants = append(participants, store.Participant{Name: name, URN: urn})
+	// A direct pairwise copy, not an index-zip: voyager.Conversation
+	// already pairs each participant's name with its URN in a single
+	// Participant value (see that type's doc comment for why parallel
+	// slices were the defect this replaced), so there's no alignment to
+	// get wrong here anymore.
+	participants := make([]store.Participant, len(c.Participants))
+	for i, p := range c.Participants {
+		participants[i] = store.Participant{Name: p.Name, URN: p.URN}
 	}
 	return store.Conversation{
 		ID:           c.ID,

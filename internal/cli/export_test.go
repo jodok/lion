@@ -218,6 +218,81 @@ func TestExportOutputDirectoryDropsStaleFiles(t *testing.T) {
 	}
 }
 
+// TestExportRefusesUnownedMessagesDirectory is the required regression test
+// for the RemoveAll-destroys-unowned-directory defect: --output accepts any
+// existing directory, and export used to unconditionally RemoveAll
+// dir/messages before staging its own copy in. Pointing --output at a
+// directory that already has an unrelated messages/ folder (never created
+// by lion — no export marker at the directory root) must refuse the export
+// outright, leaving that folder and everything in it untouched.
+func TestExportRefusesUnownedMessagesDirectory(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+	unrelatedMessages := filepath.Join(dir, "messages")
+	if err := os.MkdirAll(unrelatedMessages, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(unrelatedMessages, "not-lions.txt")
+	if err := os.WriteFile(sentinel, []byte("someone else's file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRoot(t, "message", "export", "--output", dir)
+	if err == nil {
+		t.Fatal("expected export to refuse a directory with a pre-existing, unmarked messages/ folder")
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exitCode(%v) = %d, want ExitUsage", err, exitCode(err))
+	}
+
+	// Nothing about the unrelated directory must have been touched.
+	b, statErr := os.ReadFile(sentinel)
+	if statErr != nil {
+		t.Fatalf("sentinel file destroyed by the refused export: %v", statErr)
+	}
+	if string(b) != "someone else's file" {
+		t.Errorf("sentinel file contents = %q, want unchanged", b)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "conversations.jsonl")); !os.IsNotExist(statErr) {
+		t.Error("conversations.jsonl was written despite the refusal — nothing should be written on refusal")
+	}
+}
+
+// TestExportReplacesOwnedMessagesDirectoryCleanly is the required companion
+// test: a directory lion itself previously exported into (the marker is
+// present) must still be replaced cleanly on a later export, with no stale
+// files left over — the marker gates destruction of an UNOWNED directory,
+// it must not block lion from re-exporting into its own.
+func TestExportReplacesOwnedMessagesDirectoryCleanly(t *testing.T) {
+	seedExportStore(t)
+	dir := t.TempDir()
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, exportMarkerFilename)); err != nil {
+		t.Fatalf("export marker missing after the first export: %v", err)
+	}
+	staleFile := filepath.Join(dir, "messages", "leftover-from-a-prior-lion-run.jsonl")
+	if err := os.WriteFile(staleFile, []byte(`{"stale":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("second export into the same, lion-owned directory: %v", err)
+	}
+
+	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
+		t.Errorf("stale file survived a re-export into a lion-owned directory (err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c1.jsonl")); err != nil {
+		t.Errorf("messages/c1.jsonl missing after the re-export: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); err != nil {
+		t.Errorf("messages/c2.jsonl missing after the re-export: %v", err)
+	}
+}
+
 // TestExportStreamsJSONLToStdout is the required stdout-streaming test.
 func TestExportStreamsJSONLToStdout(t *testing.T) {
 	seedExportStore(t)

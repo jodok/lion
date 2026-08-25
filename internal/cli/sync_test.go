@@ -445,6 +445,179 @@ func TestSyncStalledMessagesCursorReportsIncomplete(t *testing.T) {
 	}
 }
 
+// TestSyncPlainRerunAfterInterruptedInitialSyncReportsIncomplete is the
+// required interrupted-initial-sync test: a first sync capped by
+// --max-messages leaves older history unfetched (BackfillDone stays
+// false). A later plain `sync` (no --backfill) re-fetches the same newest
+// page — now entirely duplicates — and must not claim the pass complete
+// just because that page contained no new messages: the older history
+// below OldestSynced was never walked, plain sync never asked to walk it
+// (--backfill is opt-in), and it remains permanently missing from any
+// export unless the summary is honest about that.
+func TestSyncPlainRerunAfterInterruptedInitialSyncReportsIncomplete(t *testing.T) {
+	st := openSyncTestStore(t)
+
+	// Run 1: capped mid-conversation, exactly like a real interrupted or
+	// --max-messages-limited initial sync.
+	rt1 := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+	first, err := runSyncPass(context.Background(), newFixtureClient(rt1), st, syncOptions{maxMessages: 2}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("first (capped) run: %v", err)
+	}
+	if first.Complete {
+		t.Error("first run Complete = true, want false: --max-messages cut it short")
+	}
+	if first.MessagesAdded != 2 {
+		t.Fatalf("first run MessagesAdded = %d, want 2", first.MessagesAdded)
+	}
+
+	// Run 2: plain sync, no --max-messages, no --backfill. Nothing changed
+	// on the server, so the newest page it fetches is exactly what run 1
+	// already stored — entirely duplicates.
+	rt2 := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+	second, err := runSyncPass(context.Background(), newFixtureClient(rt2), st, syncOptions{}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("second (plain) run: %v", err)
+	}
+	if second.Complete {
+		t.Error("second run Complete = true, want false: older history below OldestSynced was never fetched (BackfillDone is still false)")
+	}
+	if second.MessagesAdded != 0 {
+		t.Errorf("second run MessagesAdded = %d, want 0 (the fetched page was entirely duplicates)", second.MessagesAdded)
+	}
+	if got := rt2.callCount("/messaging/conversations/c1/events"); got != 1 {
+		t.Errorf("events endpoint called %d times, want 1 (plain sync must still stop at the duplicate page, not loop)", got)
+	}
+
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil || !ok {
+		t.Fatalf("Conversation: ok=%v err=%v", ok, err)
+	}
+	if conv.BackfillDone {
+		t.Error("BackfillDone = true, want false: paging never actually reached an empty page")
+	}
+}
+
+// TestSyncBackfillResumesFromOldestSyncedAfterInterruptedInitialSync is the
+// companion resumption test: once the caller does pass --backfill on a
+// later run, sync must actually walk backward from the conversation's
+// OldestSynced (not just flip a flag) and fetch the older history the
+// interrupted first run never reached — and must still report the pass
+// incomplete when that walk itself never reaches a genuine empty page.
+func TestSyncBackfillResumesFromOldestSyncedAfterInterruptedInitialSync(t *testing.T) {
+	st := openSyncTestStore(t)
+
+	rt1 := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+	if _, err := runSyncPass(context.Background(), newFixtureClient(rt1), st, syncOptions{maxMessages: 2}, discardProgress(t)); err != nil {
+		t.Fatalf("first (capped) run: %v", err)
+	}
+
+	rt2 := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			// Call 1 (catch-up, createdBefore=0): the same newest page run 1
+			// already stored — entirely duplicates, so catch-up stops here
+			// (see the plain-rerun test above) without ever calling this
+			// route again itself.
+			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}),
+			// Call 2 (backfill, resuming from OldestSynced=300): genuinely
+			// older, new-to-the-store messages.
+			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+			// Call 3 (backfill continues from 100): the server re-serves the
+			// same page instead of a true empty one — modeling a
+			// conversation whose paging never actually reaches its true
+			// start. MessagesPage's own stalled-cursor guard trips here
+			// (oldest=100 no longer decreases below createdBefore=100),
+			// which is what must end the walk, not a fabricated empty page.
+			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
+	second, err := runSyncPass(context.Background(), newFixtureClient(rt2), st, syncOptions{backfill: true}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("second (backfill) run: %v", err)
+	}
+	if second.MessagesAdded != 2 {
+		t.Errorf("second run MessagesAdded = %d, want 2 (m2 and m1, fetched by resuming from OldestSynced)", second.MessagesAdded)
+	}
+	if second.Complete {
+		t.Error("second run Complete = true, want false: the backfill walk stalled before ever reaching a genuine empty page")
+	}
+
+	msgs, err := st.Messages(context.Background(), store.MessageFilter{ConversationID: "c1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("stored messages for c1 = %d, want 4 (m1..m4): the second run must continue from the oldest stored message, not just re-confirm what run 1 already had", len(msgs))
+	}
+
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil || !ok {
+		t.Fatalf("Conversation: ok=%v err=%v", ok, err)
+	}
+	if conv.OldestSynced == nil || *conv.OldestSynced != 100 {
+		t.Errorf("OldestSynced = %v, want 100 (the walk reached m1 before stalling)", conv.OldestSynced)
+	}
+	if conv.BackfillDone {
+		t.Error("BackfillDone = true, want false: paging never actually reached an empty page")
+	}
+}
+
+// TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp is the required
+// stalled-vs-duplicate-ordering test: a page that looks like a legitimate
+// "caught up" duplicate (pageAdded < len(msgs)) but was ALSO served because
+// the server ignored createdBefore (ErrPaginationStalled) must be reported
+// incomplete. Checking the duplicate condition before stalled would treat
+// the stall as a successful catch-up and silently stop looking for older
+// history — exactly the failure mode the stalled guard exists to catch.
+func TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			// Call 1 (createdBefore=0, no stall guard active yet): both
+			// messages are genuinely new.
+			messagesPageJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
+			// Call 2 (createdBefore=200): re-serves m2 alone. m2 is already
+			// stored (from call 1), so this page is entirely duplicates
+			// (pageAdded=0 < len=1) -- AND its oldest (200) does not
+			// decrease below createdBefore (200), which is simultaneously
+			// the exact ErrPaginationStalled condition.
+			messagesPageJSON([][2]any{{"m2", int64(200)}}))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: the duplicate page was also a stalled cursor, not a genuine catch-up")
+	}
+	if summary.MessagesAdded != 2 {
+		t.Errorf("MessagesAdded = %d, want 2 (m1 and m2, both added from call 1)", summary.MessagesAdded)
+	}
+	if got := rt.callCount("/messaging/conversations/c1/events"); got != 2 {
+		t.Errorf("events endpoint called %d times, want 2 (must stop once the stall is detected, not loop)", got)
+	}
+}
+
 // TestSyncOnceAndFollowAreMutuallyExclusive covers the flag-validation half
 // of the --once/--follow wacli-compat flags, at the full command-dispatch
 // level (no network needed since this fails before building a client).

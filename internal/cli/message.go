@@ -63,12 +63,23 @@ func renderConversations(r *output.Renderer, jsonOut bool, convs []voyager.Conve
 	for _, cv := range convs {
 		t.Rows = append(t.Rows, []string{
 			cv.URN,
-			strings.Join(cv.Participants, ", "),
+			strings.Join(participantNames(cv.Participants), ", "),
 			strconv.FormatBool(cv.Unread),
 			cv.LastMessage,
 		})
 	}
 	return r.Emit(t)
+}
+
+// participantNames extracts each participant's display name for the table
+// rendering path above; JSON output serializes the full name+urn pairs
+// unchanged.
+func participantNames(participants []voyager.Participant) []string {
+	names := make([]string, len(participants))
+	for i, p := range participants {
+		names[i] = p.Name
+	}
+	return names
 }
 
 func newMessageReadCmd() *cobra.Command {
