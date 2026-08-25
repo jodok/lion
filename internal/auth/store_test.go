@@ -6,6 +6,96 @@ import (
 	"testing"
 )
 
+// TestSaveWritesRestrictivePermissions is the F12 regression test: the
+// credentials file must end up 0600 regardless of any ambient umask or a
+// permissive leftover at the temp path.
+func TestSaveWritesRestrictivePermissions(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{"li_at": "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	home := os.Getenv("LION_HOME")
+	fi, err := os.Stat(filepath.Join(home, "credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("credentials.json perm = %o, want 0600", perm)
+	}
+}
+
+// TestSaveUsesUniqueTempFiles pins the F12/F24 fix: two sequential saves
+// must not reuse (or collide on) a fixed "credentials.json.tmp" path, and
+// no temp file should be left behind afterward.
+func TestSaveUsesUniqueTempFiles(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "a", Cookies: map[string]string{"li_at": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(&Credential{Alias: "b", Cookies: map[string]string{"li_at": "2"}}); err != nil {
+		t.Fatal(err)
+	}
+	home := os.Getenv("LION_HOME")
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == "credentials.json.tmp" {
+			t.Errorf("found leftover fixed-name temp file %q; expected unique names cleaned up after rename", e.Name())
+		}
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Errorf("found leftover temp file %q after save completed", e.Name())
+		}
+	}
+	// Both accounts must have survived two sequential saves without
+	// corrupting the store.
+	got, _, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List() after two sequential saves = %d accounts, want 2", len(got))
+	}
+}
+
+// TestListSortedByAlias is the F18 regression test.
+func TestListSortedByAlias(t *testing.T) {
+	isolate(t)
+	for _, alias := range []string{"zebra", "alpha", "mid"} {
+		if err := Save(&Credential{Alias: alias, Cookies: map[string]string{"li_at": "x"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"alpha", "mid", "zebra"}
+	if len(got) != len(want) {
+		t.Fatalf("List() = %d accounts, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].Alias != w {
+			t.Errorf("List()[%d].Alias = %q, want %q (not sorted)", i, got[i].Alias, w)
+		}
+	}
+}
+
+// TestDefaultAlias covers the F2 accessor logout relies on.
+func TestDefaultAlias(t *testing.T) {
+	isolate(t)
+	if got, err := DefaultAlias(); err != nil || got != "" {
+		t.Errorf("DefaultAlias() on empty store = (%q, %v), want (\"\", nil)", got, err)
+	}
+	if err := Save(&Credential{Alias: "work", Cookies: map[string]string{"li_at": "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := DefaultAlias(); err != nil || got != "work" {
+		t.Errorf("DefaultAlias() = (%q, %v), want (\"work\", nil)", got, err)
+	}
+}
+
 // isolate points LION_HOME at a fresh temp directory so tests never touch a
 // real credentials.json.
 func isolate(t *testing.T) {

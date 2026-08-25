@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/jodok/lion/internal/output"
+	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +32,7 @@ func newFeedReadCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "read",
 		Short: "Read the chronological feed",
-		Args:  cobra.NoArgs,
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()
@@ -41,23 +43,33 @@ func newFeedReadCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			r := app.Renderer()
-			if app.Cfg.JSON {
-				return r.Emit(items)
-			}
-			t := &output.Table{Cols: []string{"URN", "AUTHOR", "TEXT", "LIKES", "COMMENTS"}}
-			for _, it := range items {
-				t.Rows = append(t.Rows, []string{
-					it.URN,
-					it.AuthorName,
-					r.Untrusted(it.Text),
-					fmt.Sprintf("%d", it.Likes),
-					fmt.Sprintf("%d", it.Comments),
-				})
-			}
-			return r.Emit(t)
+			return renderFeedItems(app.Renderer(), app.Cfg.JSON, items)
 		},
 	}
+}
+
+// renderFeedItems wraps every LinkedIn-controlled free-text field (via
+// wrapFeedItem — see untrusted.go) once and renders it identically for
+// every output format — JSON included — so --wrap-untrusted is honored
+// consistently (F17), covering the author's name as well as the post text.
+func renderFeedItems(r *output.Renderer, jsonOut bool, items []voyager.FeedItem) error {
+	for i := range items {
+		items[i] = wrapFeedItem(r, items[i])
+	}
+	if jsonOut {
+		return r.Emit(items)
+	}
+	t := &output.Table{Cols: []string{"URN", "AUTHOR", "TEXT", "LIKES", "COMMENTS"}}
+	for _, it := range items {
+		t.Rows = append(t.Rows, []string{
+			it.URN,
+			it.AuthorName,
+			it.Text,
+			fmt.Sprintf("%d", it.Likes),
+			fmt.Sprintf("%d", it.Comments),
+		})
+	}
+	return r.Emit(t)
 }
 
 func newFeedPostCmd() *cobra.Command {
@@ -65,7 +77,7 @@ func newFeedPostCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "post <text...>",
 		Short: "Publish a text post to the feed",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  usageArgs(cobra.MinimumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			if err := app.requireWritable(); err != nil {
@@ -76,10 +88,27 @@ func newFeedPostCmd() *cobra.Command {
 				return err
 			}
 			text := joinArgs(args)
+			r := app.Renderer()
+
+			if cl.DryRun() {
+				if app.Cfg.JSON {
+					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.post", "visibility": visibility, "text": text})
+				}
+				return r.Emit(&output.Table{Cols: []string{"STATUS", "VISIBILITY", "TEXT"}, Rows: [][]string{{"dry-run", visibility, text}}})
+			}
+
+			ok, err := app.confirm(fmt.Sprintf("About to publish a %s post. Proceed?", visibility))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				fmt.Fprintln(os.Stderr, "aborted: post not published")
+				return nil
+			}
+
 			if err := cl.CreatePost(context.Background(), text, visibility); err != nil {
 				return err
 			}
-			r := app.Renderer()
 			if app.Cfg.JSON {
 				return r.Emit(map[string]string{"status": "posted", "visibility": visibility})
 			}
@@ -96,7 +125,7 @@ func newFeedCommentCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "comment <urn> <text...>",
 		Short: "Comment on a feed object",
-		Args:  cobra.MinimumNArgs(2),
+		Args:  usageArgs(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			if err := app.requireWritable(); err != nil {
@@ -108,10 +137,27 @@ func newFeedCommentCmd() *cobra.Command {
 			}
 			urn := args[0]
 			text := joinArgs(args[1:])
+			r := app.Renderer()
+
+			if cl.DryRun() {
+				if app.Cfg.JSON {
+					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.comment", "urn": urn, "text": text})
+				}
+				return r.Emit(&output.Table{Cols: []string{"STATUS", "URN", "TEXT"}, Rows: [][]string{{"dry-run", urn, text}}})
+			}
+
+			ok, err := app.confirm(fmt.Sprintf("About to comment on %s. Proceed?", urn))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				fmt.Fprintln(os.Stderr, "aborted: comment not posted")
+				return nil
+			}
+
 			if err := cl.Comment(context.Background(), urn, text); err != nil {
 				return err
 			}
-			r := app.Renderer()
 			if app.Cfg.JSON {
 				return r.Emit(map[string]string{"status": "commented", "urn": urn})
 			}
@@ -127,7 +173,7 @@ func newFeedReactCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "react <urn>",
 		Short: "React to a feed object",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			if err := app.requireWritable(); err != nil {
@@ -138,10 +184,27 @@ func newFeedReactCmd() *cobra.Command {
 				return err
 			}
 			urn := args[0]
+			r := app.Renderer()
+
+			if cl.DryRun() {
+				if app.Cfg.JSON {
+					return r.Emit(map[string]string{"status": "dry-run", "action": "feed.react", "urn": urn, "type": reactionType})
+				}
+				return r.Emit(&output.Table{Cols: []string{"STATUS", "URN", "TYPE"}, Rows: [][]string{{"dry-run", urn, reactionType}}})
+			}
+
+			ok, err := app.confirm(fmt.Sprintf("About to react (%s) to %s. Proceed?", reactionType, urn))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				fmt.Fprintln(os.Stderr, "aborted: reaction not sent")
+				return nil
+			}
+
 			if err := cl.React(context.Background(), urn, reactionType); err != nil {
 				return err
 			}
-			r := app.Renderer()
 			if app.Cfg.JSON {
 				return r.Emit(map[string]string{"status": "reacted", "urn": urn, "type": reactionType})
 			}
@@ -158,7 +221,7 @@ func newFeedEngagementCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "engagement <urn>",
 		Short: "Show like/comment counts for a feed object",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()

@@ -103,9 +103,14 @@ fixtures (no live account needed to develop).
 - `--dry-run`: every mutation prints the intended request and exits 0 without
   sending.
 - `--readonly`: hard-blocks all mutating commands.
-- Writes prompt for confirmation on a TTY unless `--yes`/`--no-input`.
-- Daily/session action budgets (invites/day, messages/day) enforced locally,
-  tracked in the state file.
+- Writes prompt for confirmation on a TTY unless `--yes`. Only `--yes` is
+  consent: `--no-input` merely promises lion won't *ask*, so it suppresses the
+  prompt and then declines the write (exit 2, naming `--yes`) rather than
+  standing in for a "yes". Otherwise any non-interactive script would mutate
+  real people's inboxes with nothing on the command line authorizing it.
+- Daily/session action budgets (invites/day, messages/day) enforced locally in
+  a rolling 24h window, tracked in the state file and serialized across
+  processes so a shell loop cannot outrun them.
 
 ### 2.3 Output contract (agent-friendly, from gogcli)
 
@@ -115,6 +120,30 @@ fixtures (no live account needed to develop).
   post text) in delimiters so downstream LLMs treat it as data, not
   instructions.
 - Stable exit codes documented in `--help` and `lion schema --json`.
+- `--wrap-untrusted` tags each block with a fresh random nonce
+  (`<untrusted nonce=HEX>...</untrusted nonce=HEX>`) rather than a fixed
+  delimiter, so LinkedIn-controlled text containing a literal
+  `</untrusted>` can't forge the boundary and escape the wrapper. It applies
+  uniformly to `--json`, `--plain`, and table output — free-text fields are
+  wrapped once before rendering, not only in the human-readable table path.
+
+### 2.4 Configuration file & environment (v1, minimal)
+
+Precedence, narrowest to widest: defaults < config file < environment <
+flags (a flag always wins; an explicit flag beats env/file even when its
+value equals the default).
+
+- `--config PATH` (default `$LION_HOME/config.json`) points at an optional
+  JSON file. Recognized keys: `account`, `readonly` (bool), `output`
+  (`"json"`, `"plain"`, or omitted for the default table format). A missing
+  file is not an error; a malformed one is.
+- Environment: `LION_ACCOUNT`, `LION_READONLY`, `LION_OUTPUT` (`json`|`plain`).
+  `LION_READONLY` accepts `true/false`, `1/0`, `yes/no`, `on/off` (any case);
+  unset or empty falls through to the config file. Anything else is an error
+  rather than a silent `false` — this variable gates every mutation, so a typo
+  like `ture` must not quietly hand back write access.
+- Everything else (rate-limit budgets, dry-run, yes, no-input, wrap-untrusted,
+  max, verbose) is flag-only in v1 — no file/env equivalent yet.
 
 ---
 

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -129,6 +130,20 @@ func load() (*store, error) {
 	return &s, nil
 }
 
+// save writes the store atomically: marshal, write to a fresh unique temp
+// file in the same directory (so the final rename is same-filesystem and
+// atomic), then rename over the real path.
+//
+// The temp file is unique per call (os.CreateTemp's random suffix) rather
+// than a fixed "credentials.json.tmp" name for two reasons: (1) a
+// pre-existing file at a fixed tmp path could have been left with permissive
+// mode by something else and os.WriteFile does not change an existing
+// file's mode, so the "restrictive permissions" the old code claimed weren't
+// actually guaranteed; (2) two concurrent lion processes writing the same
+// fixed tmp path could interleave their writes and rename over a corrupted
+// file. A unique name avoids both. os.CreateTemp already creates the file
+// 0600, but we chmod explicitly so that guarantee doesn't silently depend on
+// the stdlib's current default.
 func (s *store) save() error {
 	p, err := credPath()
 	if err != nil {
@@ -138,12 +153,93 @@ func (s *store) save() error {
 	if err != nil {
 		return err
 	}
-	// Write atomically with restrictive permissions.
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	dir := filepath.Dir(p)
+	f, err := os.CreateTemp(dir, "credentials.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Best-effort cleanup if we bail before the rename below; a no-op once
+	// the rename has succeeded (nothing left at tmp to remove).
+	defer os.Remove(tmp)
+
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p)
+}
+
+// withLock runs fn while holding a best-effort advisory lock on the
+// credential store, serializing concurrent load-modify-save cycles (e.g. two
+// `lion auth login`/`logout` invocations racing) so one doesn't clobber the
+// other's write with a load taken before the other's save.
+//
+// This is a plain O_CREATE|O_EXCL lock file rather than flock/syscall locking
+// so it stays portable with no cgo/build-tag split. It is advisory only —
+// nothing stops a process that doesn't call withLock from writing directly —
+// but it closes the common race between well-behaved lion invocations, which
+// is the case that actually happens in practice (a user or script running
+// two lion commands close together). A lock older than staleLockAge is
+// assumed to be left over from a crashed process and is stolen rather than
+// wedging the store forever; a process that can't acquire the lock within
+// maxWait proceeds without it rather than hanging or failing a command that
+// would otherwise succeed — the unique-temp-file fix in save() above is the
+// remaining backstop if two writers do overlap.
+func withLock(fn func() error) error {
+	lp, err := lockPath()
+	if err != nil {
+		return err
+	}
+	const (
+		retryDelay   = 25 * time.Millisecond
+		maxWait      = 5 * time.Second
+		staleLockAge = 30 * time.Second
+	)
+	deadline := time.Now().Add(maxWait)
+	acquired := false
+	for {
+		f, err := os.OpenFile(lp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			acquired = true
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if fi, statErr := os.Stat(lp); statErr == nil && time.Since(fi.ModTime()) > staleLockAge {
+			os.Remove(lp) // steal a stale lock left by a crashed process
+		}
+		// Fall through to the deadline check even after stealing, so a lock
+		// that keeps being recreated cannot spin here past maxWait.
+		if time.Now().After(deadline) {
+			break // proceed unlocked rather than hang or fail outright
+		}
+		time.Sleep(retryDelay)
+	}
+	// Only clean up a lock this call actually created. Removing it after
+	// giving up would delete a lock another process still holds, turning a
+	// missed wait into a broken mutex for everyone else.
+	if acquired {
+		defer os.Remove(lp)
+	}
+	return fn()
+}
+
+func lockPath() (string, error) {
+	home, err := config.EnsureHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "credentials.json.lock"), nil
 }
 
 // Save stores (or replaces) a credential and, if it is the first account,
@@ -156,15 +252,17 @@ func Save(c *Credential) error {
 		c.SavedAt = time.Now()
 	}
 	c.normalize()
-	s, err := load()
-	if err != nil {
-		return err
-	}
-	s.Accounts[c.Alias] = c
-	if s.Default == "" {
-		s.Default = c.Alias
-	}
-	return s.save()
+	return withLock(func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		s.Accounts[c.Alias] = c
+		if s.Default == "" {
+			s.Default = c.Alias
+		}
+		return s.save()
+	})
 }
 
 // Get returns the credential for alias, or the default account when alias is
@@ -187,7 +285,9 @@ func Get(alias string) (*Credential, error) {
 	return c, nil
 }
 
-// List returns all stored credentials and the default alias.
+// List returns all stored credentials and the default alias, sorted by
+// alias so callers (e.g. `auth status`) get stable, deterministic output
+// instead of Go's randomized map iteration order.
 func List() ([]*Credential, string, error) {
 	s, err := load()
 	if err != nil {
@@ -197,26 +297,39 @@ func List() ([]*Credential, string, error) {
 	for _, c := range s.Accounts {
 		out = append(out, c)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
 	return out, s.Default, nil
+}
+
+// DefaultAlias returns the store's recorded default account alias, or "" if
+// no accounts have been saved yet.
+func DefaultAlias() (string, error) {
+	s, err := load()
+	if err != nil {
+		return "", err
+	}
+	return s.Default, nil
 }
 
 // Delete removes an account. If it was the default, another (arbitrary)
 // account becomes the default.
 func Delete(alias string) error {
-	s, err := load()
-	if err != nil {
-		return err
-	}
-	if _, ok := s.Accounts[alias]; !ok {
-		return ErrNoAccount
-	}
-	delete(s.Accounts, alias)
-	if s.Default == alias {
-		s.Default = ""
-		for a := range s.Accounts {
-			s.Default = a
-			break
+	return withLock(func() error {
+		s, err := load()
+		if err != nil {
+			return err
 		}
-	}
-	return s.save()
+		if _, ok := s.Accounts[alias]; !ok {
+			return ErrNoAccount
+		}
+		delete(s.Accounts, alias)
+		if s.Default == alias {
+			s.Default = ""
+			for a := range s.Accounts {
+				s.Default = a
+				break
+			}
+		}
+		return s.save()
+	})
 }
