@@ -285,6 +285,100 @@ func Get(alias string) (*Credential, error) {
 	return c, nil
 }
 
+// UpdateCookies overlays rotated cookie values onto alias's stored
+// credential (empty alias resolves to the store's default, matching Get)
+// and saves it only if something actually changed. The CLI calls this after
+// every command that built a client, so a no-op write on the common case —
+// a command whose session didn't rotate anything this run — would mean
+// touching disk and taking the store lock on essentially every invocation;
+// skipping the save when nothing changed avoids that churn and the lock
+// contention it would create against a concurrent `auth login`/`logout`.
+//
+// It goes through the same withLock + atomic save() path as Save/Delete so
+// this writeback can't interleave with (or clobber) a concurrent login or
+// logout, and reuses Credential.normalize() so JSESSIONID ends up
+// re-quoted exactly the way every other write already produces it.
+//
+// baselineLiAt is the li_at the caller's client was built from, used as a
+// compare-and-swap on session identity (see below). Pass "" to skip the check.
+//
+// A missing account (alias not found, or no accounts at all) returns
+// (false, nil) rather than an error — a cookie writeback must never be the
+// thing that fails an otherwise-successful command.
+func UpdateCookies(alias, baselineLiAt string, rotated map[string]string) (bool, error) {
+	if len(rotated) == 0 {
+		return false, nil
+	}
+	var changed bool
+	err := withLock(func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		resolved := alias
+		if resolved == "" {
+			resolved = s.Default
+		}
+		if resolved == "" {
+			return nil
+		}
+		c, ok := s.Accounts[resolved]
+		if !ok {
+			return nil
+		}
+		// Compare-and-swap on session identity. The lock stops two writers
+		// from interleaving, but it cannot tell whether what is stored now is
+		// still the session these cookies came from. If an `auth login`
+		// replaced this alias while the command was running, overlaying our
+		// jar would splice the old session's authentication cookies onto the
+		// new account's record and leave a credential belonging to neither.
+		// li_at identifies the session, so a mismatch means this rotation
+		// describes a session nobody is using any more: drop it.
+		if baselineLiAt != "" && c.Cookies["li_at"] != baselineLiAt {
+			return nil
+		}
+		// rotated is the jar's full state, not a patch, so a name it omits has
+		// expired or been dropped rather than merely not been seen — the
+		// Cloudflare __cf_bm does exactly this on its short TTL. Replacing the
+		// set therefore lets an expired cookie actually go away; merging would
+		// resurrect it and re-seed the dead value on every later run.
+		//
+		// Guarded on li_at being present: a jar without the session cookie is
+		// not a credential worth writing, and persisting one would turn a
+		// recoverable "session expired, log in again" into a corrupted record.
+		next := make(map[string]string, len(rotated))
+		for name, value := range rotated {
+			if value == "" {
+				continue
+			}
+			next[name] = value
+		}
+		if next["li_at"] == "" {
+			return nil
+		}
+		if len(next) == len(c.Cookies) {
+			same := true
+			for name, value := range next {
+				if c.Cookies[name] != value {
+					same = false
+					break
+				}
+			}
+			if same {
+				return nil
+			}
+		}
+		changed = true
+		c.Cookies = next
+		c.normalize()
+		return s.save()
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
 // List returns all stored credentials and the default alias, sorted by
 // alias so callers (e.g. `auth status`) get stable, deterministic output
 // instead of Go's randomized map iteration order.

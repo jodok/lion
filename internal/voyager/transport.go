@@ -27,6 +27,16 @@ type Transport interface {
 	Do(ctx context.Context, req *Request) (*Response, error)
 }
 
+// CookieSnapshotter is an optional Transport capability: a transport that
+// owns a cookie jar can return its current cookies, including values
+// LinkedIn rotated in via Set-Cookie during the process's lifetime, so the
+// CLI can persist them for the next invocation rather than reloading the
+// stale snapshot `auth login` stored (DESIGN.md §3.3 — JSESSIONID, li_at,
+// and lidc rotate continuously, and the Cloudflare __cf_bm cookie expires).
+type CookieSnapshotter interface {
+	Snapshot() map[string]string
+}
+
 // Request is a transport-agnostic HTTP request. Body is a byte slice (nil for
 // GET) so a retry can resend it without re-buffering.
 type Request struct {
@@ -91,6 +101,40 @@ func newStdlibTransport(cookies map[string]string) *stdlibTransport {
 		http:    &http.Client{Timeout: 30 * time.Second, Jar: jar},
 		cookies: cookies,
 	}
+}
+
+// Snapshot implements CookieSnapshotter for stdlibTransport, reading back
+// whatever the jar currently holds for linkedin.com — including any cookies
+// the server rotated in via Set-Cookie during this process's requests.
+func (t *stdlibTransport) Snapshot() map[string]string {
+	if t.http.Jar == nil {
+		return nil
+	}
+	return cookiesToMap(t.http.Jar.Cookies(linkedInCookieURL))
+}
+
+// cookiesToMap converts a cookie jar's cookies into lion's name->value map.
+// net/http's (and fhttp's, used by chrome_transport.go) cookie parser strips
+// a value's surrounding quotes into the Quoted flag rather than leaving them
+// in Value, so this reconstructs the wire form via cookieWireValue —
+// otherwise a snapshot would silently drop JSESSIONID's required quoting.
+func cookiesToMap(cookies []*http.Cookie) map[string]string {
+	out := make(map[string]string, len(cookies))
+	for _, c := range cookies {
+		out[c.Name] = cookieWireValue(c.Value, c.Quoted)
+	}
+	return out
+}
+
+// cookieWireValue reconstructs a cookie value exactly as it appeared on the
+// wire from a parsed Cookie's (Value, Quoted) pair, shared by both
+// stdlibTransport (net/http.Cookie) and chromeTransport (fhttp.Cookie) since
+// both types define the same two fields.
+func cookieWireValue(value string, quoted bool) string {
+	if quoted {
+		return `"` + value + `"`
+	}
+	return value
 }
 
 func (t *stdlibTransport) Do(ctx context.Context, req *Request) (*Response, error) {

@@ -295,11 +295,49 @@ in-browser, and a wrong csrf yields `403 "CSRF check failed"` — a different er
 — so csrf and the query are correct. The binary's imported snapshot simply
 decayed: `/me` worked at login and then `401`'d ~15 min later. LinkedIn rotates
 `JSESSIONID`/`li_at`/`lidc` and expires the Cloudflare `__cf_bm`, so a one-shot
-cookie snapshot is short-lived. **Fix (task #19): persist rotated cookies from
-each response's `Set-Cookie` back into the credential store** (the transport jar
-already captures them within a process; lion must write them back so the next
-invocation starts fresh, like a browser). Snapshot import stays the entry point;
-writeback keeps it alive.
+cookie snapshot is short-lived. **Fixed (task #19, cookie writeback):** rotated
+cookies are persisted back into the credential store, so the next invocation
+starts from a fresh jar the way a browser would. Snapshot import stays the
+entry point; writeback keeps it alive.
+
+The seam: a `Transport` may implement the optional `CookieSnapshotter`
+capability (`Snapshot() map[string]string`), which both the Chrome and stdlib
+transports do by reading their jar. `Client.Cookies()` overlays that live
+snapshot onto the static cookie set, and the CLI merges the result into the
+stored credential via `auth.UpdateCookies` after a successful command — wired
+in `cli.Execute` rather than a `PersistentPostRun`, because cobra runs only the
+*nearest* such hook in the tree, so a future vertical adding its own would
+silently disable writeback for its whole subtree. `auth login` stores the
+*post*-validation jar, since the `/me` check can itself rotate a cookie.
+
+Four details worth keeping:
+
+1. **Writeback runs after a failed command too, except on `ErrUnauthorized`
+   and `ErrChallenge`.** A 404, a local budget stop, or a usage error leaves
+   the jar exactly as valid as a success would, and dropping those rotations
+   reintroduces the same decay writeback exists to stop. Those two errors are
+   the exception because they are how a dead session reports itself, and
+   LinkedIn answers one by clearing the cookie (`Set-Cookie: li_at=delete me`)
+   — persisting that jar would overwrite a good credential with the wipe.
+2. **A stale writeback is dropped.** `auth.UpdateCookies` takes the `li_at` its
+   client was built from and compares it against what is stored, under the
+   lock. The lock stops interleaved writes but cannot tell that the stored
+   credential is still the same session: if an `auth login` replaced the alias
+   mid-command, applying our jar would splice the old session's authentication
+   onto the new account's record.
+3. **The jar's snapshot replaces the stored cookie set; it is not merged into
+   it.** The jar was seeded with exactly the stored cookies, so it already is
+   "everything we started with, plus rotations, minus anything that expired" —
+   and that last part is why merging is wrong. A name the jar omits has been
+   dropped or has expired (the Cloudflare `__cf_bm` does this on its short
+   TTL); overlaying onto the stored set would resurrect the dead value and
+   re-seed it on every later run. Empty values are skipped, and a set without
+   `li_at` is refused outright rather than written — a session-less credential
+   turns a recoverable "log in again" into a corrupted record.
+4. **The snapshot reconstructs each cookie's wire form,** because both cookie
+   parsers move a quoted value's quotes into `Cookie.Quoted` instead of leaving
+   them in `Value`. Without that, JSESSIONID sheds its quotes a little more on
+   every command until the derived csrf-token silently stops matching.
 
 Historical note — earlier open `401`: `profile search` (GraphQL) returns
 `{"data":{"status":401}}` with a *valid* session (not a bot-block, no wipe).

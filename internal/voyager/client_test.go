@@ -30,6 +30,93 @@ func (s *sequenceTransport) Do(_ context.Context, _ *Request) (*Response, error)
 	return &Response{StatusCode: 500}, nil
 }
 
+// snapshotTransport is a fixture Transport that also implements
+// CookieSnapshotter, standing in for chromeTransport/stdlibTransport's live
+// jar without needing a real one.
+type snapshotTransport struct {
+	sequenceTransport
+	snapshot map[string]string
+}
+
+func (s *snapshotTransport) Snapshot() map[string]string { return s.snapshot }
+
+// TestCookiesOverlaysSnapshotOverStatic pins the merge rule: the transport's
+// live jar (a stand-in for cookies LinkedIn rotated in mid-session) wins
+// per-name over the static cookies passed at construction, while a name only
+// present in the static set is preserved.
+func TestCookiesUsesSnapshotAsAuthoritativeSet(t *testing.T) {
+	// The jar is seeded with the static cookies, so its contents are already
+	// "what we started with, plus rotations, minus anything that expired".
+	// bcookie is deliberately absent from the snapshot: it must NOT come back
+	// from the static set, or an expired cookie would be resurrected and
+	// re-seeded on every later run.
+	st := &snapshotTransport{snapshot: map[string]string{
+		"li_at":      "li_at_test",
+		"JSESSIONID": `"rotated:1"`, // rotated mid-session
+		"lidc":       "dc-2",        // picked up mid-session
+	}}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st),
+		WithCookies(map[string]string{"bcookie": "static-b"}))
+	got := c.Cookies()
+	want := map[string]string{
+		"li_at":      "li_at_test",
+		"JSESSIONID": `"rotated:1"`,
+		"lidc":       "dc-2",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Cookies() = %#v, want %#v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("Cookies()[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+	if _, ok := got["bcookie"]; ok {
+		t.Error("a cookie the jar dropped was resurrected from the static set")
+	}
+}
+
+// TestCookiesWithoutSnapshotterReturnsStaticCopy covers a transport that
+// doesn't implement CookieSnapshotter (e.g. a plain fixture transport in
+// other tests): Cookies() must fall back to a copy of the static set rather
+// than panicking or returning nothing.
+func TestCookiesWithoutSnapshotterReturnsStaticCopy(t *testing.T) {
+	st := &sequenceTransport{}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st))
+	got := c.Cookies()
+	want := map[string]string{"li_at": "li_at_test", "JSESSIONID": `"jsession_test"`}
+	if len(got) != len(want) || got["li_at"] != want["li_at"] || got["JSESSIONID"] != want["JSESSIONID"] {
+		t.Errorf("Cookies() = %#v, want %#v", got, want)
+	}
+	// The returned map must not alias the client's internal cookies.
+	got["li_at"] = "mutated"
+	if c.cookies["li_at"] != "li_at_test" {
+		t.Errorf("Cookies() returned a map aliasing internal state; c.cookies[li_at] = %q", c.cookies["li_at"])
+	}
+}
+
+// TestCookiesEmptySnapshotValueDoesNotEraseStored guards the specific
+// footgun an overlay-by-default merge would otherwise have: a transport
+// whose jar never saw a particular cookie rotate reports it back as "" (the
+// zero value for a name it never observed), and that must never blank out a
+// good cookie the static set already had.
+func TestCookiesSkipsEmptySnapshotValues(t *testing.T) {
+	// A jar entry with no value carries nothing worth persisting, so it is
+	// dropped rather than written. auth.UpdateCookies then refuses the whole
+	// set for lacking li_at, which is the safe outcome: better to keep the
+	// stored credential and let the user re-authenticate than to write a
+	// session-less record.
+	st := &snapshotTransport{snapshot: map[string]string{"li_at": "", "lidc": "dc-2"}}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st))
+	got := c.Cookies()
+	if _, ok := got["li_at"]; ok {
+		t.Errorf("Cookies()[li_at] = %q, want the empty entry dropped", got["li_at"])
+	}
+	if got["lidc"] != "dc-2" {
+		t.Errorf("Cookies()[lidc] = %q, want dc-2", got["lidc"])
+	}
+}
+
 // F19: a POST that 500s must be attempted exactly once. Retrying a
 // non-idempotent write whose response was merely lost in transit risks
 // duplicating a sent message/invite/comment/post.

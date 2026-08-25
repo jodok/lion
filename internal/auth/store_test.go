@@ -224,9 +224,227 @@ func TestLoadSynthesizesCookiesForOldCredentialsFile(t *testing.T) {
 	}
 }
 
+// TestUpdateCookiesRoundTripsAndRenormalizes covers the cookie-writeback
+// happy path: a rotated value overlays the stored credential, is persisted,
+// and JSESSIONID's wire quoting is corrected by the same normalize() path
+// every other write goes through, even when the rotated value arrived
+// unquoted.
+func TestUpdateCookiesRoundTripsAndRenormalizes(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at":      "orig-li-at",
+		"JSESSIONID": `"orig-jsession"`,
+		"bcookie":    "b1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", "", map[string]string{
+		"li_at":      "rotated-li-at",
+		"JSESSIONID": "rotated-jsession", // unquoted on purpose
+		"bcookie":    "b1",               // still in the jar, so still stored
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("UpdateCookies() changed = false, want true")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "rotated-li-at" {
+		t.Errorf("Cookies[li_at] = %q, want rotated-li-at", got.Cookies["li_at"])
+	}
+	if got.Cookies["JSESSIONID"] != `"rotated-jsession"` {
+		t.Errorf("Cookies[JSESSIONID] = %q, want quoted rotated-jsession", got.Cookies["JSESSIONID"])
+	}
+	// A cookie the jar still holds is carried through unchanged.
+	if got.Cookies["bcookie"] != "b1" {
+		t.Errorf("Cookies[bcookie] = %q, want b1", got.Cookies["bcookie"])
+	}
+}
+
+// TestUpdateCookiesNoopWhenNothingChanged pins the "must not write" half of
+// the contract: a rotated map that already matches what's stored must
+// report changed=false and must not touch the file on disk (checked via
+// mtime, since a rewrite would bump it even with identical content).
+func TestUpdateCookiesNoopWhenNothingChanged(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at":      "same",
+		"JSESSIONID": `"same-jsession"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	home := os.Getenv("LION_HOME")
+	path := filepath.Join(home, "credentials.json")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := UpdateCookies("default", "", map[string]string{
+		"li_at":      "same",
+		"JSESSIONID": `"same-jsession"`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Error("UpdateCookies() changed = true, want false when nothing actually changed")
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("credentials.json was rewritten (mtime %v -> %v) despite no change", before.ModTime(), after.ModTime())
+	}
+}
+
+// TestUpdateCookiesUnknownAliasReturnsFalseNotError is the "must never break
+// a command" requirement: a writeback for an account that doesn't exist (or
+// an empty store) must not surface as an error.
+func TestUpdateCookiesUnknownAliasReturnsFalseNotError(t *testing.T) {
+	isolate(t)
+	changed, err := UpdateCookies("no-such-account", "", map[string]string{"li_at": "x"})
+	if err != nil {
+		t.Errorf("UpdateCookies(unknown alias) err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("UpdateCookies(unknown alias) changed = true, want false")
+	}
+
+	// Also covers the empty-store, empty-alias (resolve-to-default) case.
+	changed, err = UpdateCookies("", "", map[string]string{"li_at": "x"})
+	if err != nil {
+		t.Errorf("UpdateCookies(\"\") on empty store err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("UpdateCookies(\"\") on empty store changed = true, want false")
+	}
+}
+
 func TestGetNoAccount(t *testing.T) {
 	isolate(t)
 	if _, err := Get("default"); err != ErrNoAccount {
 		t.Errorf("Get on empty store = %v, want ErrNoAccount", err)
+	}
+}
+
+// TestUpdateCookiesRejectsStaleSession covers the write race the store lock
+// cannot see: a command starts against one session, an `auth login` replaces
+// the same alias mid-command, and the command's writeback then arrives holding
+// the previous session's cookies. Applying them would splice the old session's
+// authentication onto the new account's record, leaving a credential that
+// belongs to neither.
+func TestUpdateCookiesRejectsStaleSession(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-B", "JSESSIONID": `"ajax:b"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Writeback from a client built against the *previous* session.
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A-ROTATED", "lidc": "b=OGST00",
+	})
+	if err != nil {
+		t.Fatalf("UpdateCookies err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("stale writeback was applied; want it dropped")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "SESSION-B" {
+		t.Errorf("li_at = %q, want the newer session's value untouched", got.Cookies["li_at"])
+	}
+	if _, ok := got.Cookies["lidc"]; ok {
+		t.Error("stale writeback leaked a cookie into the newer credential")
+	}
+}
+
+// TestUpdateCookiesAppliesWhenSessionMatches is the other half: a writeback
+// whose baseline still matches the stored session must land.
+func TestUpdateCookiesAppliesWhenSessionMatches(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`, "lidc": "b=OGST00",
+	})
+	if err != nil || !changed {
+		t.Fatalf("UpdateCookies = (%v, %v), want (true, nil)", changed, err)
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["lidc"] != "b=OGST00" {
+		t.Errorf("lidc = %q, want the rotation applied", got.Cookies["lidc"])
+	}
+}
+
+// TestUpdateCookiesRemovesExpiredCookie covers the reason writeback replaces
+// the cookie set instead of merging into it. The jar's contents are its full
+// state, so a name it omits has expired — the Cloudflare __cf_bm does this on
+// its short TTL. Merging would resurrect the dead value and re-seed it on
+// every later run, which is the opposite of browser-equivalent persistence.
+func TestUpdateCookiesRemovesExpiredCookie(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`, "__cf_bm": "expired-value",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// The jar no longer holds __cf_bm.
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	})
+	if err != nil || !changed {
+		t.Fatalf("UpdateCookies = (%v, %v), want (true, nil)", changed, err)
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := got.Cookies["__cf_bm"]; ok {
+		t.Errorf("__cf_bm = %q, want it gone once the jar dropped it", v)
+	}
+	if got.Cookies["li_at"] != "SESSION-A" {
+		t.Errorf("li_at = %q, want it preserved", got.Cookies["li_at"])
+	}
+}
+
+// TestUpdateCookiesRefusesSetWithoutSession guards the replace path: a jar
+// with no li_at is not a credential worth writing, and persisting one would
+// turn a recoverable "log in again" into a corrupted record.
+func TestUpdateCookiesRefusesSetWithoutSession(t *testing.T) {
+	isolate(t)
+	if err := Save(&Credential{Alias: "default", Cookies: map[string]string{
+		"li_at": "SESSION-A", "JSESSIONID": `"ajax:a"`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := UpdateCookies("default", "SESSION-A", map[string]string{"lidc": "dc-2"})
+	if err != nil {
+		t.Fatalf("UpdateCookies err = %v, want nil", err)
+	}
+	if changed {
+		t.Error("a session-less cookie set was written; want it refused")
+	}
+	got, err := Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "SESSION-A" {
+		t.Errorf("li_at = %q, want the stored credential left intact", got.Cookies["li_at"])
 	}
 }

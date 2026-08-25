@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/jodok/lion/internal/auth"
@@ -293,6 +294,159 @@ func TestIsTerminalRejectsPipe(t *testing.T) {
 	defer w.Close()
 	if isTerminal(r) {
 		t.Error("isTerminal(pipe) = true, want false")
+	}
+}
+
+// rotatingTransport is a fixture voyager.Transport that also implements
+// voyager.CookieSnapshotter, standing in for the real Chrome-TLS transport's
+// live jar (which only rotates cookies via a real network round-trip) so
+// cookie writeback can be tested without hitting the network.
+type rotatingTransport struct {
+	snapshot map[string]string
+}
+
+func (r *rotatingTransport) Do(_ context.Context, _ *voyager.Request) (*voyager.Response, error) {
+	return &voyager.Response{StatusCode: 200, Body: []byte(`{}`)}, nil
+}
+
+func (r *rotatingTransport) Snapshot() map[string]string { return r.snapshot }
+
+// TestPersistRotatedCookiesWritesBackToStore is the cookie-writeback
+// regression test (DESIGN.md §3.3): after a command's client(s) ran,
+// persistRotatedCookies must save whatever the transport's jar rotated in,
+// so the next invocation starts from a fresh session instead of the stale
+// snapshot `auth login` stored — the bug that made a session stop working
+// within minutes of a successful login.
+func TestPersistRotatedCookiesWritesBackToStore(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	// A live jar always carries li_at — it was seeded with it and it hasn't
+	// expired — so the snapshot is the full session, not just the deltas.
+	cl := voyager.New("test-li-at", `"test-jsession"`,
+		voyager.WithTransport(&rotatingTransport{snapshot: map[string]string{
+			"li_at":      "test-li-at",
+			"JSESSIONID": `"rotated:9"`,
+			"lidc":       "dc-3",
+		}}))
+	app := &App{Cfg: &config.Config{}, clients: []*voyager.Client{cl}, clientAlias: "default"}
+	app.persistRotatedCookies()
+
+	got, err := auth.Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["JSESSIONID"] != `"rotated:9"` {
+		t.Errorf("Cookies[JSESSIONID] = %q, want quoted rotated:9", got.Cookies["JSESSIONID"])
+	}
+	if got.Cookies["lidc"] != "dc-3" {
+		t.Errorf("Cookies[lidc] = %q, want dc-3", got.Cookies["lidc"])
+	}
+	if got.Cookies["li_at"] != "test-li-at" {
+		t.Errorf("Cookies[li_at] = %q, want test-li-at", got.Cookies["li_at"])
+	}
+}
+
+// TestPersistRotatedCookiesRefusesSessionlessJar pins the safety guard at the
+// CLI level: if the jar somehow comes back without li_at, nothing is written
+// and the stored credential survives for the user to retry with.
+func TestPersistRotatedCookiesRefusesSessionlessJar(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	cl := voyager.New("test-li-at", `"test-jsession"`,
+		voyager.WithTransport(&rotatingTransport{snapshot: map[string]string{"lidc": "dc-3"}}))
+	app := &App{Cfg: &config.Config{}, clients: []*voyager.Client{cl}, clientAlias: "default"}
+	app.persistRotatedCookies()
+
+	got, err := auth.Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["li_at"] != "test-li-at" {
+		t.Errorf("Cookies[li_at] = %q, want the stored credential untouched", got.Cookies["li_at"])
+	}
+	if _, ok := got.Cookies["lidc"]; ok {
+		t.Error("a session-less jar was written to the store")
+	}
+}
+
+// TestPersistRotatedCookiesNoClientsIsNoop covers the early return: a
+// command that never called App.Client() (e.g. `lion version`) must not
+// touch the credential store at all.
+func TestPersistRotatedCookiesNoClientsIsNoop(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	before, err := auth.Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{Cfg: &config.Config{}}
+	app.persistRotatedCookies() // no clients built; must be a no-op
+	after, err := auth.Get("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.SavedAt.Equal(before.SavedAt) {
+		t.Error("persistRotatedCookies() with no clients modified the stored credential")
+	}
+}
+
+// TestPersistRotatedCookiesWritebackFailureIsNonFatal is the "must never
+// break a command" requirement: a store the writeback can't touch (here, a
+// directory sitting where credentials.json should be, forcing auth.load()
+// to fail) must not surface an error or panic. persistRotatedCookies has no
+// return value specifically so a broken writeback can never fail an
+// otherwise-successful command; the failure is only ever visible on stderr,
+// and only under --verbose.
+func TestPersistRotatedCookiesWritebackFailureIsNonFatal(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t)
+	home := os.Getenv("LION_HOME")
+	// Replace credentials.json with a directory so the next load() errors.
+	if err := os.Remove(filepath.Join(home, "credentials.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(home, "credentials.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cl := voyager.New("test-li-at", `"test-jsession"`,
+		voyager.WithTransport(&rotatingTransport{snapshot: map[string]string{"JSESSIONID": `"rotated:9"`}}))
+	app := &App{Cfg: &config.Config{}, clients: []*voyager.Client{cl}, clientAlias: "default"}
+
+	out := captureStderr(t, func() {
+		app.persistRotatedCookies() // must not panic or otherwise fail
+	})
+	if out != "" {
+		t.Errorf("persistRotatedCookies() without --verbose wrote to stderr: %q", out)
+	}
+
+	app.Cfg.Verbose = true
+	out = captureStderr(t, func() {
+		app.persistRotatedCookies()
+	})
+	if out == "" {
+		t.Error("persistRotatedCookies() with --verbose should report the failure on stderr")
+	}
+}
+
+// TestClientRecordsResolvedAlias pins the resolved-alias requirement: when
+// --account is empty, auth.Get("") resolves to the store's default account,
+// so App.Client() must record that resolved alias (off the returned
+// credential) rather than the empty a.Cfg.Account — otherwise
+// persistRotatedCookies would try to save under alias "" instead of the
+// account that was actually authenticated.
+func TestClientRecordsResolvedAlias(t *testing.T) {
+	isolateHome(t)
+	saveFakeAccount(t) // saved under alias "default", which becomes the store default
+	app := &App{Cfg: &config.Config{}}
+	if _, err := app.Client(); err != nil {
+		t.Fatal(err)
+	}
+	if app.clientAlias != "default" {
+		t.Errorf("clientAlias = %q, want the resolved alias %q", app.clientAlias, "default")
+	}
+	if len(app.clients) != 1 {
+		t.Errorf("len(clients) = %d, want 1", len(app.clients))
 	}
 }
 

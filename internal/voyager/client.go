@@ -125,6 +125,49 @@ func New(liAt, jsessionID string, opts ...Option) *Client {
 // DryRun reports whether mutations are suppressed.
 func (c *Client) DryRun() bool { return c.dryRun }
 
+// Cookies returns the client's current cookie set for persisting back to the
+// credential store (DESIGN.md §3.3). LinkedIn rotates JSESSIONID, li_at, and
+// lidc continuously, so the static set supplied at construction only reflects
+// what was seeded in and goes stale within minutes.
+//
+// When the transport can snapshot its jar, that snapshot is returned as the
+// authoritative set rather than merged over the static one. The jar was seeded
+// with exactly the static cookies, so it is already "everything we started
+// with, plus rotations, minus anything that expired" — and that last part is
+// the reason not to merge. A cookie missing from the jar has been dropped or
+// has expired (the Cloudflare __cf_bm has a short TTL and does exactly this).
+// Overlaying onto the static set would resurrect the dead value and re-seed it
+// on the next run, forever, which is the opposite of the browser-equivalent
+// persistence this exists to provide.
+//
+// Empty values are still skipped: a jar entry with no value carries no
+// information worth persisting.
+//
+// A transport without the capability (a fixture transport in tests) falls back
+// to the static set, since there is no jar to learn anything from.
+//
+// The returned map is always a fresh copy so callers can't mutate the client's
+// internal state through it.
+func (c *Client) Cookies() map[string]string {
+	if snap, ok := c.transport.(CookieSnapshotter); ok {
+		if live := snap.Snapshot(); len(live) > 0 {
+			out := make(map[string]string, len(live))
+			for k, v := range live {
+				if v == "" {
+					continue
+				}
+				out[k] = v
+			}
+			return out
+		}
+	}
+	out := make(map[string]string, len(c.cookies))
+	for k, v := range c.cookies {
+		out[k] = v
+	}
+	return out
+}
+
 // baseHeaders returns the headers common to every Voyager request. Cookies are
 // added by the transport, not here.
 func (c *Client) baseHeaders() map[string]string {

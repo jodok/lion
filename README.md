@@ -33,12 +33,13 @@ Working today:
   to a GraphQL surface whose query id hasn't been captured yet.
 - **`message send` takes a conversation id or a profile URN**, not a bare
   person id — resolving one needs the unsupported profile-by-id lookup above.
-- **Sessions go stale quickly.** LinkedIn rotates `JSESSIONID`/`li_at`/`lidc`
-  and expires the Cloudflare `__cf_bm` cookie, and lion does not yet write
-  rotated cookies back, so a stored session can stop working within minutes of
-  a successful login. Re-run `lion auth login` when that happens. Fixing this
-  is the next change.
 - **Unix only** (macOS, Linux). The action-budget lock uses `flock`.
+
+Sessions do lapse eventually — LinkedIn rotates `JSESSIONID`/`li_at`/`lidc` and
+expires the Cloudflare `__cf_bm` cookie continuously — but lion writes rotated
+cookies back after each successful command, so a stored session stays alive the
+way a browser's does rather than decaying within minutes of login. Re-run
+`lion auth login` if it does lapse.
 
 Later: MCP server, and a Phase-2 CRM + campaign engine (inspired by
 LinkedHelper and Lemlist).
