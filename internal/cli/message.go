@@ -2,10 +2,13 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/jodok/lion/internal/output"
+	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
 )
 
@@ -26,7 +29,7 @@ func newMessageListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List messaging conversations",
-		Args:  cobra.NoArgs,
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()
@@ -37,31 +40,40 @@ func newMessageListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			r := app.Renderer()
-			if app.Cfg.JSON {
-				return r.Emit(convs)
-			}
-			t := &output.Table{Cols: []string{"URN", "PARTICIPANTS", "UNREAD", "LAST_MESSAGE"}}
-			for _, cv := range convs {
-				t.Rows = append(t.Rows, []string{
-					cv.URN,
-					strings.Join(cv.Participants, ", "),
-					strconv.FormatBool(cv.Unread),
-					r.Untrusted(cv.LastMessage),
-				})
-			}
-			return r.Emit(t)
+			return renderConversations(app.Renderer(), app.Cfg.JSON, convs)
 		},
 	}
 	cmd.Flags().BoolVar(&unread, "unread", false, "only show conversations with unread messages")
 	return cmd
 }
 
+// renderConversations wraps free text captured from LinkedIn once and
+// renders it identically for every output format — JSON included — so
+// --wrap-untrusted is honored consistently (F17).
+func renderConversations(r *output.Renderer, jsonOut bool, convs []voyager.Conversation) error {
+	for i := range convs {
+		convs[i].LastMessage = r.Untrusted(convs[i].LastMessage)
+	}
+	if jsonOut {
+		return r.Emit(convs)
+	}
+	t := &output.Table{Cols: []string{"URN", "PARTICIPANTS", "UNREAD", "LAST_MESSAGE"}}
+	for _, cv := range convs {
+		t.Rows = append(t.Rows, []string{
+			cv.URN,
+			strings.Join(cv.Participants, ", "),
+			strconv.FormatBool(cv.Unread),
+			cv.LastMessage,
+		})
+	}
+	return r.Emit(t)
+}
+
 func newMessageReadCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "read <conversation-id>",
 		Short: "Show messages in a conversation",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()
@@ -72,68 +84,85 @@ func newMessageReadCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			r := app.Renderer()
-			if app.Cfg.JSON {
-				return r.Emit(msgs)
-			}
-			t := &output.Table{Cols: []string{"FROM", "SENT_AT", "TEXT"}}
-			for _, m := range msgs {
-				t.Rows = append(t.Rows, []string{
-					m.From,
-					strconv.FormatInt(m.SentAt, 10),
-					r.Untrusted(m.Text),
-				})
-			}
-			return r.Emit(t)
+			return renderMessages(app.Renderer(), app.Cfg.JSON, msgs)
 		},
 	}
 }
 
+// renderMessages wraps free text captured from LinkedIn once and renders it
+// identically for every output format (F17 — see renderConversations).
+func renderMessages(r *output.Renderer, jsonOut bool, msgs []voyager.Message) error {
+	for i := range msgs {
+		msgs[i].Text = r.Untrusted(msgs[i].Text)
+	}
+	if jsonOut {
+		return r.Emit(msgs)
+	}
+	t := &output.Table{Cols: []string{"FROM", "SENT_AT", "TEXT"}}
+	for _, m := range msgs {
+		t.Rows = append(t.Rows, []string{
+			m.From,
+			strconv.FormatInt(m.SentAt, 10),
+			m.Text,
+		})
+	}
+	return r.Emit(t)
+}
+
 func newMessageSendCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "send <id|conversation> <text...>",
-		Short: "Send a message to a person or an existing conversation",
-		Args:  cobra.MinimumNArgs(2),
+		Use:   "send <conversation-id> <text...>",
+		Short: "Send a message to an existing conversation",
+		Long: "Send a message to an existing conversation.\n\nv1 requires a " +
+			"conversation id (copy one from `lion message list`), not a " +
+			"person id: resolving a person id to a profile URN needs " +
+			"profile-by-id, which LinkedIn's modern API doesn't support in " +
+			"this build (the legacy endpoint returns HTTP 410 — see " +
+			"DESIGN.md §3.2). Start the conversation in the LinkedIn app " +
+			"first, then use its conversation id here.",
+		Args: usageArgs(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			if err := app.requireWritable(); err != nil {
 				return err
 			}
+			target := args[0]
+			text := joinArgs(args[1:])
+
+			// F3: person-id targeting depends on Client.Profile, which is
+			// unsupported (LinkedIn 410s the legacy profileView endpoint;
+			// the modern replacement isn't modeled in v1 — see
+			// DESIGN.md §3.2). Rather than attempt it and fail with a
+			// confusing downstream error, reject it here with a clear,
+			// actionable message before even building a client.
+			if !isConversationID(target) {
+				return usageErr("message send requires a conversation id in this build (got %q, which looks like a person id/URN); person-id targeting needs profile-by-id resolution, which LinkedIn's modern API doesn't support (see DESIGN.md §3.2) — copy a conversation id from `lion message list` instead", target)
+			}
+
 			cl, err := app.Client()
 			if err != nil {
 				return err
 			}
-			target := args[0]
-			text := joinArgs(args[1:])
-			ctx := context.Background()
+			r := app.Renderer()
 
-			// A conversation id/URN identifies an existing thread. Anything
-			// else is treated as a recipient and starts (or reuses) a new
-			// thread: a bare public id (e.g. "ada-lovelace") is resolved to
-			// its profile URN first, since SendMessageToProfile needs a URN.
-			if isConversationID(target) {
-				err = cl.SendMessage(ctx, target, text)
-			} else {
-				recipient := target
-				if !strings.HasPrefix(recipient, "urn:") {
-					pr, perr := cl.Profile(ctx, recipient)
-					if perr != nil {
-						return perr
-					}
-					recipient = pr.URN
+			if cl.DryRun() {
+				if app.Cfg.JSON {
+					return r.Emit(map[string]string{"status": "dry-run", "action": "message.send", "target": target, "body": text})
 				}
-				err = cl.SendMessageToProfile(ctx, recipient, text)
+				return r.Emit(&output.Table{Cols: []string{"STATUS", "TARGET", "BODY"}, Rows: [][]string{{"dry-run", target, text}}})
 			}
+
+			ok, err := app.confirm(fmt.Sprintf("About to send a message to conversation %s. Proceed?", target))
 			if err != nil {
 				return err
 			}
+			if !ok {
+				fmt.Fprintln(os.Stderr, "aborted: message not sent")
+				return nil
+			}
 
-			r := app.Renderer()
-			if cl.DryRun() {
-				if app.Cfg.JSON {
-					return r.Emit(map[string]string{"status": "dry-run", "target": target})
-				}
-				return r.Emit(&output.Table{Cols: []string{"STATUS", "TARGET"}, Rows: [][]string{{"dry-run", target}}})
+			if err := cl.SendMessage(context.Background(), target, text); err != nil {
+				return err
 			}
 			if app.Cfg.JSON {
 				return r.Emit(map[string]string{"status": "sent", "target": target})

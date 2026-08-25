@@ -4,6 +4,8 @@
 package output
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,11 +108,39 @@ func (r *Renderer) emitTable(t *Table) error {
 
 // Untrusted wraps free text captured from LinkedIn when --wrap-untrusted is
 // set, marking it as data rather than instructions for any downstream LLM.
+//
+// Format: <untrusted nonce=HEX>\n...\n</untrusted nonce=HEX>, where HEX is a
+// fresh random 16-hex-digit (8-byte) token generated for this call. Consumers
+// that parse the boundary must match the nonce on both the opening and
+// closing tags rather than matching a fixed "</untrusted>" string.
+//
+// A fixed delimiter would let LinkedIn-controlled payload text simply embed
+// a literal "</untrusted>" and forge the end of the wrapper (prompt-injection
+// escape) — a message body containing that string would prematurely close
+// the block and let anything after it be read as trusted output. Tagging the
+// boundary with a per-call random nonce means the payload cannot know it in
+// advance, so it cannot forge a matching terminator: the only way to close
+// the block is to already know the nonce, which is generated fresh and never
+// exposed to the wrapped text itself.
 func (r *Renderer) Untrusted(s string) string {
 	if !r.wrapUntrusted {
 		return s
 	}
-	return "<untrusted>\n" + s + "\n</untrusted>"
+	nonce := randomNonce()
+	return "<untrusted nonce=" + nonce + ">\n" + s + "\n</untrusted nonce=" + nonce + ">"
+}
+
+// randomNonce returns a fresh 16-hex-digit random token for tagging an
+// Untrusted boundary. Falls back to a fixed marker only in the practically
+// unreachable case crypto/rand itself fails (e.g. no entropy source) — that
+// still beats a panic, and a fixed delimiter here is no worse than the bug
+// this function exists to fix.
+func randomNonce() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "fallback0"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // sanitizeTSV neutralizes tabs/newlines that would corrupt TSV rows.

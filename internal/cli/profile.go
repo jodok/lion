@@ -23,7 +23,7 @@ func newProfileViewCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "view [id|me]",
 		Short: "View a profile by public id (default: your own)",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  usageArgs(cobra.MaximumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()
@@ -58,7 +58,7 @@ func newProfileSearchCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "search <query>",
 		Short: "Search people",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  usageArgs(cobra.MinimumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app := appFrom(cmd)
 			cl, err := app.Client()
@@ -77,23 +77,38 @@ func newProfileSearchCmd() *cobra.Command {
 				return err
 			}
 			r := app.Renderer()
+			// Wrap free text captured from LinkedIn once, here, so both the
+			// JSON and table/plain branches below see the same (possibly
+			// wrapped) value — this is what keeps --wrap-untrusted honored
+			// consistently across output formats (F17) instead of only in
+			// the table path.
+			for i := range results {
+				results[i].Headline = r.Untrusted(results[i].Headline)
+			}
 			if app.Cfg.JSON {
 				return r.Emit(results)
 			}
 			t := &output.Table{Cols: []string{"PUBLIC_ID", "NAME", "HEADLINE"}}
 			for _, res := range results {
-				t.Rows = append(t.Rows, []string{res.PublicID, res.Name, r.Untrusted(res.Headline)})
+				t.Rows = append(t.Rows, []string{res.PublicID, res.Name, res.Headline})
 			}
 			return r.Emit(t)
 		},
 	}
-	cmd.Flags().StringVar(&title, "title", "", "filter by title/keyword")
-	cmd.Flags().StringVar(&company, "company", "", "filter by company")
-	cmd.Flags().StringVar(&location, "location", "", "filter by location")
+	cmd.Flags().StringVar(&title, "title", "", "appended to the search keywords as a hint (not a strict filter — LinkedIn's structured search filters aren't modeled in v1)")
+	cmd.Flags().StringVar(&company, "company", "", "appended to the search keywords as a hint (not a strict filter — LinkedIn's structured search filters aren't modeled in v1)")
+	cmd.Flags().StringVar(&location, "location", "", "appended to the search keywords as a hint (not a strict filter — LinkedIn's structured search filters aren't modeled in v1)")
 	return cmd
 }
 
 func renderProfile(r *output.Renderer, app *App, publicID, name, headline, location, industry, summary string) error {
+	// Wrap free text captured from LinkedIn once, here, so it's applied
+	// identically whichever branch below renders it (F17 — --wrap-untrusted
+	// must not be JSON/table-format-specific). hadSummary is captured before
+	// wrapping since Untrusted("") is no longer empty once wrapped.
+	hadSummary := summary != ""
+	headline = r.Untrusted(headline)
+	summary = r.Untrusted(summary)
 	if app.Cfg.JSON {
 		return r.Emit(map[string]string{
 			"public_id": publicID,
@@ -108,12 +123,12 @@ func renderProfile(r *output.Renderer, app *App, publicID, name, headline, locat
 	t.Rows = [][]string{
 		{"public_id", publicID},
 		{"name", name},
-		{"headline", r.Untrusted(headline)},
+		{"headline", headline},
 		{"location", location},
 		{"industry", industry},
 	}
-	if summary != "" {
-		t.Rows = append(t.Rows, []string{"summary", r.Untrusted(summary)})
+	if hadSummary {
+		t.Rows = append(t.Rows, []string{"summary", summary})
 	}
 	return r.Emit(t)
 }

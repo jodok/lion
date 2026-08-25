@@ -115,6 +115,27 @@ fixtures (no live account needed to develop).
   post text) in delimiters so downstream LLMs treat it as data, not
   instructions.
 - Stable exit codes documented in `--help` and `lion schema --json`.
+- `--wrap-untrusted` tags each block with a fresh random nonce
+  (`<untrusted nonce=HEX>...</untrusted nonce=HEX>`) rather than a fixed
+  delimiter, so LinkedIn-controlled text containing a literal
+  `</untrusted>` can't forge the boundary and escape the wrapper. It applies
+  uniformly to `--json`, `--plain`, and table output — free-text fields are
+  wrapped once before rendering, not only in the human-readable table path.
+
+### 2.4 Configuration file & environment (v1, minimal)
+
+Precedence, narrowest to widest: defaults < config file < environment <
+flags (a flag always wins; an explicit flag beats env/file even when its
+value equals the default).
+
+- `--config PATH` (default `$LION_HOME/config.json`) points at an optional
+  JSON file. Recognized keys: `account`, `readonly` (bool), `output`
+  (`"json"`, `"plain"`, or omitted for the default table format). A missing
+  file is not an error; a malformed one is.
+- Environment: `LION_ACCOUNT`, `LION_READONLY` (any value `strconv.ParseBool`
+  accepts), `LION_OUTPUT` (`json`|`plain`).
+- Everything else (rate-limit budgets, dry-run, yes, no-input, wrap-untrusted,
+  max, verbose) is flag-only in v1 — no file/env equivalent yet.
 
 ---
 
