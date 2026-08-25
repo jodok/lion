@@ -528,3 +528,33 @@ func TestOpenRefusesSymlinkedStorePath(t *testing.T) {
 		t.Errorf("victim contents = %q, want them untouched", b)
 	}
 }
+
+// TestOpenRefusesWorldWritableStoreDir covers the swap race that a symlink
+// check alone cannot close: ensureFileMode must release its descriptor before
+// SQLite reopens the path by name, so where another user can create entries
+// they can substitute a symlink in that gap. Refusing such a directory removes
+// the party that would win the race.
+func TestOpenRefusesWorldWritableStoreDir(t *testing.T) {
+	parent := t.TempDir()
+	shared := filepath.Join(parent, "shared")
+	if err := os.Mkdir(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o777); err != nil { // defeat umask
+		t.Fatal(err)
+	}
+	if _, err := Open(filepath.Join(shared, "store.db")); err == nil {
+		t.Fatal("Open in a world-writable directory should be refused")
+	}
+
+	// A private directory must still work, or the check is too broad to ship.
+	private := filepath.Join(parent, "private")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(private, "store.db"))
+	if err != nil {
+		t.Fatalf("Open in a private directory = %v, want success", err)
+	}
+	s.Close()
+}

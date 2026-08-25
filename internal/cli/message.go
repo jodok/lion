@@ -101,13 +101,22 @@ func renderConversations(r *output.Renderer, jsonOut bool, convs []voyager.Conve
 	return r.Emit(t)
 }
 
-// participantNames extracts each participant's display name for the table
-// rendering path above; JSON output serializes the full name+urn pairs
-// unchanged.
+// participantNames extracts the display names for both the table path and
+// conversationOutput's JSON.
+//
+// Participants whose MiniProfile didn't resolve carry an empty Name, and
+// v1.0.0 never emitted those: it only appended a name once it had one, so the
+// published shape is "the names we know", not "one slot per participant, some
+// blank". Passing the blanks through would be a second silent change to the
+// very contract conversationOutput exists to protect, from the same root
+// cause — so they're skipped here, at the one place both paths share.
 func participantNames(participants []voyager.Participant) []string {
-	names := make([]string, len(participants))
-	for i, p := range participants {
-		names[i] = p.Name
+	names := make([]string, 0, len(participants))
+	for _, p := range participants {
+		if p.Name == "" {
+			continue
+		}
+		names = append(names, p.Name)
 	}
 	return names
 }

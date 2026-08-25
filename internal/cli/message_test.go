@@ -267,3 +267,34 @@ func TestMessageSendProfileURNNotRejected(t *testing.T) {
 		t.Errorf("target = %q, want the profile URN passed in", got["target"])
 	}
 }
+
+// TestMessageListJSONOmitsUnresolvedParticipants guards the shipped contract
+// against the second way the participant-pairing change could leak into it.
+// v1.0.0 only ever appended a name it had resolved, so an unresolved
+// participant contributed nothing; carrying the pair internally must not turn
+// that into an empty string in the published array.
+func TestMessageListJSONOmitsUnresolvedParticipants(t *testing.T) {
+	var buf bytes.Buffer
+	r := output.New(&buf, output.FormatJSON, false)
+	convs := []voyager.Conversation{{
+		URN: "urn:li:fs_conversation:2-a",
+		Participants: []voyager.Participant{
+			{URN: "urn:li:fs_miniProfile:A1"}, // unresolved: no name
+			{Name: "Grace Hopper", URN: "urn:li:fs_miniProfile:A2"},
+		},
+		LastMessage: "hi",
+	}}
+	if err := renderConversations(r, true, convs); err != nil {
+		t.Fatal(err)
+	}
+	var got []struct {
+		Participants []string `json:"participants"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("output not valid JSON in v1.0.0's shape: %v\n%s", err, buf.String())
+	}
+	want := []string{"Grace Hopper"}
+	if len(got) != 1 || len(got[0].Participants) != len(want) || got[0].Participants[0] != want[0] {
+		t.Errorf("participants = %#v, want %#v (no empty slot for the unresolved one)", got[0].Participants, want)
+	}
+}
