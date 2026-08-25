@@ -414,3 +414,33 @@ func TestExportRefusesToOverwriteTheStore(t *testing.T) {
 		t.Errorf("store size changed from %d to %d", len(before), len(after))
 	}
 }
+
+// TestExportRefusesStoreByCaseAlias covers the store-overwrite guard against a
+// filesystem alias a string compare misses: on case-insensitive filesystems
+// (default macOS) STORE.DB and store.db are one inode. os.SameFile catches it.
+func TestExportRefusesStoreByCaseAlias(t *testing.T) {
+	seedExportStore(t)
+	path, err := store.DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only meaningful where the filesystem is case-insensitive: probe it.
+	upper := filepath.Join(filepath.Dir(path), "STORE.DB")
+	if _, err := os.Stat(upper); err != nil {
+		t.Skip("filesystem is case-sensitive; case-alias guard not exercised here")
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runRoot(t, "message", "export", "--format", "jsonl", "--output", upper); err == nil {
+		t.Error("export --output STORE.DB should be refused as the store itself")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("store destroyed: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("store changed size %d -> %d", len(before), len(after))
+	}
+}

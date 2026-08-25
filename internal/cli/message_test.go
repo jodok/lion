@@ -298,3 +298,37 @@ func TestMessageListJSONOmitsUnresolvedParticipants(t *testing.T) {
 		t.Errorf("participants = %#v, want %#v (no empty slot for the unresolved one)", got[0].Participants, want)
 	}
 }
+
+// TestMessageListWrapUntrustedOmitsUnresolvedParticipants pins the same
+// v1.0.0 contract as TestMessageListJSONOmitsUnresolvedParticipants but with
+// --wrap-untrusted on. wrapConversation runs before participantNames, and
+// r.Untrusted("") is a non-empty nonce payload, so an unresolved participant
+// would slip past the empty-name filter as a wrapper-only entry unless it is
+// dropped before wrapping.
+func TestMessageListWrapUntrustedOmitsUnresolvedParticipants(t *testing.T) {
+	var buf bytes.Buffer
+	r := output.New(&buf, output.FormatJSON, true) // wrapUntrusted = true
+	convs := []voyager.Conversation{{
+		URN: "urn:li:fs_conversation:2-a",
+		Participants: []voyager.Participant{
+			{URN: "urn:li:fs_miniProfile:A1"}, // unresolved
+			{Name: "Grace Hopper", URN: "urn:li:fs_miniProfile:A2"},
+		},
+		LastMessage: "hi",
+	}}
+	if err := renderConversations(r, true, convs); err != nil {
+		t.Fatal(err)
+	}
+	var got []struct {
+		Participants []string `json:"participants"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+	}
+	if len(got) != 1 || len(got[0].Participants) != 1 {
+		t.Fatalf("participants = %#v, want exactly one (the resolved, wrapped name)", got[0].Participants)
+	}
+	if !strings.Contains(got[0].Participants[0], "Grace Hopper") {
+		t.Errorf("participant = %q, want it to contain the resolved name", got[0].Participants[0])
+	}
+}

@@ -548,11 +548,30 @@ func refuseStoreOverwrite(outputPath, storePath string) error {
 	if resolved, err := filepath.EvalSymlinks(base); err == nil {
 		base = resolved
 	}
+	// os.SameFile catches the aliases a path-string compare misses: a
+	// case-variant on a case-insensitive filesystem (default macOS APFS —
+	// STORE.DB and store.db are one inode), a hard link, or a second symlink
+	// to the same target. It only works on entries that exist, so the string
+	// compare below still backstops the common case where the store's sidecar
+	// isn't present yet.
+	outInfo, outErr := os.Stat(out)
 	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
-		if out == base+suffix {
-			return fmt.Errorf("export: --output %q is the message store itself (or a sidecar of it); "+
-				"exporting onto the store would destroy it — choose a different path", outputPath)
+		candidate := base + suffix
+		if out == candidate {
+			return errStoreOverwrite(outputPath)
+		}
+		if outErr == nil {
+			if candInfo, err := os.Stat(candidate); err == nil && os.SameFile(outInfo, candInfo) {
+				return errStoreOverwrite(outputPath)
+			}
 		}
 	}
 	return nil
+}
+
+// errStoreOverwrite is the shared refusal for an --output that resolves to the
+// live store or one of its sidecars.
+func errStoreOverwrite(outputPath string) error {
+	return fmt.Errorf("export: --output %q is the message store itself (or a sidecar of it); "+
+		"exporting onto the store would destroy it — choose a different path", outputPath)
 }

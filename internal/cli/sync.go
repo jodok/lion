@@ -370,6 +370,13 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) ([]voyager.Conversation, bool, error) {
 	var toProcess []voyager.Conversation
 	var createdBefore int64
+	// seen dedups by conversation id. A page can legitimately re-serve a
+	// conversation: a stalled cursor returns the same page twice before the
+	// stall is detected, and an inclusive createdBefore re-serves the boundary
+	// conversation at the head of the next page. Without this, that
+	// conversation would be walked (a rate-limited MessagesPage) twice and
+	// counted twice toward --max-conversations.
+	seen := map[string]bool{}
 
 	for {
 		if ctx.Err() != nil {
@@ -436,6 +443,10 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 			if opts.afterMs != nil && c.UpdatedAt < *opts.afterMs {
 				continue
 			}
+			if seen[c.ID] {
+				continue
+			}
+			seen[c.ID] = true
 			toProcess = append(toProcess, c)
 			progress.Event("conversation_discovered", map[string]any{"id": c.ID, "urn": c.URN})
 			if opts.maxConversations > 0 && len(toProcess) >= opts.maxConversations {

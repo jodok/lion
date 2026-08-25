@@ -826,3 +826,37 @@ func TestParseTimeFlagAcceptsBothForms(t *testing.T) {
 		t.Error("expected an error for a garbage date")
 	}
 }
+
+// TestSyncDeduplicatesRepeatedConversationPages covers the discovery dedup: an
+// inclusive createdBefore re-serves the boundary conversation at the head of
+// the next page, and a stalled cursor re-serves a whole page. Either way a
+// conversation must be walked (a rate-limited MessagesPage) and counted only
+// once. Here c2 is the boundary and appears on both pages.
+func TestSyncDeduplicatesRepeatedConversationPages(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}}),
+			// Inclusive boundary: c2 (UpdatedAt == the cursor just sent)
+			// re-served at the head, then a genuinely older c3.
+			conversationsPageJSON([][2]any{{"c2", int64(4000)}, {"c3", int64(3000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events", messagesPageJSON([][2]any{{"m1", int64(10)}}), messagesPageJSON(nil)).
+		on("/messaging/conversations/c2/events", messagesPageJSON([][2]any{{"m2", int64(20)}}), messagesPageJSON(nil)).
+		on("/messaging/conversations/c3/events", messagesPageJSON([][2]any{{"m3", int64(30)}}), messagesPageJSON(nil))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.ConversationsSeen != 3 {
+		t.Errorf("ConversationsSeen = %d, want 3 (c2 must not be counted twice)", summary.ConversationsSeen)
+	}
+	// c2 must have been walked exactly once, like c1 and c3: each
+	// conversation fetches one data page plus one terminating empty page.
+	// A duplicate discovery entry would double that to four.
+	if got, want := rt.callCount("/messaging/conversations/c2/events"), rt.callCount("/messaging/conversations/c1/events"); got != want {
+		t.Errorf("c2 events fetched %d times, c1 %d — c2 was re-walked by a duplicate discovery entry", got, want)
+	}
+}
