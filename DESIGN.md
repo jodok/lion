@@ -137,8 +137,11 @@ value equals the default).
   JSON file. Recognized keys: `account`, `readonly` (bool), `output`
   (`"json"`, `"plain"`, or omitted for the default table format). A missing
   file is not an error; a malformed one is.
-- Environment: `LION_ACCOUNT`, `LION_READONLY` (any value `strconv.ParseBool`
-  accepts), `LION_OUTPUT` (`json`|`plain`).
+- Environment: `LION_ACCOUNT`, `LION_READONLY`, `LION_OUTPUT` (`json`|`plain`).
+  `LION_READONLY` accepts `true/false`, `1/0`, `yes/no`, `on/off` (any case);
+  unset or empty falls through to the config file. Anything else is an error
+  rather than a silent `false` — this variable gates every mutation, so a typo
+  like `ture` must not quietly hand back write access.
 - Everything else (rate-limit budgets, dry-run, yes, no-input, wrap-untrusted,
   max, verbose) is flag-only in v1 — no file/env equivalent yet.
 

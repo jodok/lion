@@ -295,3 +295,19 @@ func TestIsTerminalRejectsPipe(t *testing.T) {
 		t.Error("isTerminal(pipe) = true, want false")
 	}
 }
+
+// TestExitCodeBudgetLockAndPersist keeps the limiter's fail-closed refusals on
+// the rate-limit exit code. Both mean "the action was not performed because it
+// could not be accounted for", which a caller should treat like any other
+// budget stop rather than an unrelated generic failure.
+func TestExitCodeBudgetLockAndPersist(t *testing.T) {
+	for _, err := range []error{ratelimit.ErrBudgetLock, ratelimit.ErrBudgetPersist} {
+		if got := exitCode(err); got != ExitRateLimited {
+			t.Errorf("exitCode(%v) = %d, want ExitRateLimited (%d)", err, got, ExitRateLimited)
+		}
+		wrapped := fmt.Errorf("invite: %w", err)
+		if got := exitCode(wrapped); got != ExitRateLimited {
+			t.Errorf("exitCode(wrapped %v) = %d, want ExitRateLimited (%d)", err, got, ExitRateLimited)
+		}
+	}
+}

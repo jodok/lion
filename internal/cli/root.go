@@ -284,7 +284,13 @@ func exitCode(err error) int {
 		return ExitUsage
 	case errors.Is(err, auth.ErrNoAccount), errors.Is(err, voyager.ErrUnauthorized):
 		return ExitAuth
-	case errors.Is(err, voyager.ErrRateLimited), errors.Is(err, ratelimit.ErrDailyBudget):
+	// ErrBudgetLock/ErrBudgetPersist are the limiter refusing to act because it
+	// could not account for the action (lock unavailable, state unwritable).
+	// They belong with the other "the budget stopped you" outcomes: a caller
+	// retrying on exit 4 is doing the right thing, whereas exit 1 would read as
+	// an unrelated failure.
+	case errors.Is(err, voyager.ErrRateLimited), errors.Is(err, ratelimit.ErrDailyBudget),
+		errors.Is(err, ratelimit.ErrBudgetLock), errors.Is(err, ratelimit.ErrBudgetPersist):
 		return ExitRateLimited
 	case errors.Is(err, voyager.ErrNotFound):
 		return ExitNotFound
