@@ -120,3 +120,30 @@ func TestInviteDryRun(t *testing.T) {
 		t.Errorf("Invite under dry-run made an HTTP request: %s", ft.lastReq.URL)
 	}
 }
+
+// TestDecodeConnectionsReportsShapeDrift covers the case where LinkedIn
+// returns profiles but under an envelope this decoder cannot follow. Silently
+// returning an empty list would render as "no connections" with exit 0, which
+// is a wrong answer that looks like a correct one.
+func TestDecodeConnectionsReportsShapeDrift(t *testing.T) {
+	body := []byte(`{"data":{"metadata":{}},"included":[
+		{"$type":"com.linkedin.voyager.identity.shared.MiniProfile",
+		 "entityUrn":"urn:li:fs_miniProfile:ACoAAA1","publicIdentifier":"ada",
+		 "firstName":"Ada","lastName":"L","occupation":"Eng"}]}`)
+	if _, err := decodeConnections(body, 0); err == nil {
+		t.Fatal("want an error when included[] holds profiles no reference resolved to, got nil")
+	}
+}
+
+// TestDecodeConnectionsGenuinelyEmpty ensures the drift guard does not fire on
+// an account that really has no connections.
+func TestDecodeConnectionsGenuinelyEmpty(t *testing.T) {
+	body := []byte(`{"data":{"metadata":{},"elements":[]},"included":[]}`)
+	got, err := decodeConnections(body, 0)
+	if err != nil {
+		t.Fatalf("empty connections should not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want 0 connections, got %d", len(got))
+	}
+}

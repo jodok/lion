@@ -81,3 +81,27 @@ func TestCreatePostRejectsInvalidVisibility(t *testing.T) {
 		t.Errorf("invalid visibility should not make a request: %s", ft.lastReq.URL)
 	}
 }
+
+// TestDecodeFeedReportsShapeDrift mirrors the connections drift guard: an
+// unreadable feed must not be indistinguishable from an empty one.
+func TestDecodeFeedReportsShapeDrift(t *testing.T) {
+	body := []byte(`{"data":{"metadata":{}},"included":[
+		{"$type":"com.linkedin.voyager.feed.render.UpdateV2",
+		 "entityUrn":"urn:li:fs_updateV2:(urn:li:activity:1,FEED_DETAIL,EMPTY,DEFAULT,false)"}]}`)
+	if _, err := decodeFeed(body, 0); err == nil {
+		t.Fatal("want an error when included[] holds updates no reference resolved to, got nil")
+	}
+}
+
+// TestDecodeFeedGenuinelyEmpty ensures the drift guard does not fire on a
+// genuinely empty feed.
+func TestDecodeFeedGenuinelyEmpty(t *testing.T) {
+	body := []byte(`{"data":{"metadata":{},"elements":[]},"included":[]}`)
+	got, err := decodeFeed(body, 0)
+	if err != nil {
+		t.Fatalf("empty feed should not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want 0 items, got %d", len(got))
+	}
+}

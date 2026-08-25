@@ -11,6 +11,14 @@ import (
 // index the included array by URN and by type so the typed decoders in each
 // resource file can resolve references without re-walking the payload.
 
+// Entity "$type" values used by the shape-drift guards in the resource
+// decoders, which distinguish "the server returned nothing" from "the server
+// returned entities this decoder could no longer reach".
+const (
+	typeMiniProfile = "com.linkedin.voyager.identity.shared.MiniProfile"
+	typeUpdateV2    = "com.linkedin.voyager.feed.render.UpdateV2"
+)
+
 // normalized is the envelope shape shared by most Voyager responses.
 type normalized struct {
 	Data     json.RawMessage   `json:"data"`

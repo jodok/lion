@@ -117,6 +117,11 @@ func decodeFeed(body []byte, max int) ([]FeedItem, error) {
 			break
 		}
 	}
+	// Shape-drift guard — see decodeConnections. An empty feed and a feed this
+	// decoder can no longer read look identical to the caller otherwise.
+	if len(out) == 0 && len(idx.ofType(typeUpdateV2)) > 0 {
+		return nil, fmt.Errorf("feed response shape not recognized: %d update(s) returned but none referenced by data.elements; the decoder likely needs updating for a changed Voyager response shape: %w", len(idx.ofType(typeUpdateV2)), ErrNotFound)
+	}
 	return out, nil
 }
 

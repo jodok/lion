@@ -99,6 +99,16 @@ func decodeConnections(body []byte, max int) ([]Connection, error) {
 			break
 		}
 	}
+	// Shape-drift guard. The ordered-reference shape this decoder follows was
+	// reconstructed from DESIGN.md §3.2 rather than re-recorded from a live
+	// response, so if LinkedIn's actual envelope differs, every reference
+	// lookup silently misses and an account with connections renders as "no
+	// connections" with exit 0 — a wrong answer that looks like a valid one.
+	// When included[] clearly holds profiles that no reference resolved to,
+	// report the drift instead.
+	if len(out) == 0 && len(idx.ofType(typeMiniProfile)) > 0 {
+		return nil, fmt.Errorf("connections response shape not recognized: %d profile(s) returned but none referenced by data.elements; the decoder likely needs updating for a changed Voyager response shape: %w", len(idx.ofType(typeMiniProfile)), ErrNotFound)
+	}
 	return out, nil
 }
 
