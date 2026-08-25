@@ -266,6 +266,9 @@ func TestConcurrentLimitersDoNotLoseReservations(t *testing.T) {
 // needed: the kernel releases the flock the moment the holding process dies,
 // so a live holder always blocks a second acquirer and a dead one never does.
 func TestLockFileIsExclusive(t *testing.T) {
+	if !lockSupported {
+		t.Skip("no inter-process lock on this platform; NewDefault uses an in-memory limiter here")
+	}
 	path := filepath.Join(t.TempDir(), "ratelimit.json.lock")
 
 	unlock1, err := lockFile(path)
@@ -308,6 +311,9 @@ func TestLockFileIsExclusive(t *testing.T) {
 // TestConcurrentLimitersDoNotLoseReservations), so an unavailable lock must
 // be a hard stop.
 func TestWaitFailsClosedWhenLockUnavailable(t *testing.T) {
+	if !lockSupported {
+		t.Skip("no inter-process lock on this platform; NewDefault uses an in-memory limiter here")
+	}
 	// statePath sits under a parent directory that doesn't exist, so the
 	// ".lock" sibling file can never be created and lockFile always fails.
 	statePath := filepath.Join(t.TempDir(), "missing-parent", "ratelimit.json")

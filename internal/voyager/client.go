@@ -258,11 +258,13 @@ func classifyRedirect(resp *Response) error {
 		return ErrChallenge
 	case strings.Contains(final, "/uas/login"), strings.Contains(final, "/authwall"):
 		return ErrUnauthorized
-	case final != "" && !strings.Contains(final, "/voyager/api/"):
-		// Redirected clean off the Voyager API surface entirely (e.g. to a
-		// plain www.linkedin.com page) — not a Voyager JSON response.
-		return ErrUnauthorized
 	}
+	// Deliberately no "final URL is not under /voyager/api/" rule. The base URL
+	// is configurable — WithBaseURL points at an httptest server, a proxy, or
+	// an alternate compatible endpoint — so that path is not a property every
+	// legitimate response carries, and treating its absence as a redirect turned
+	// every successful response from a non-default base into ErrUnauthorized.
+	// Only destinations that actually mean "not authenticated" reclassify here.
 	for _, v := range resp.Headers.Values("Set-Cookie") {
 		if strings.Contains(v, "li_at=delete") {
 			return ErrUnauthorized

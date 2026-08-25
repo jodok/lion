@@ -7,6 +7,12 @@ import (
 	"syscall"
 )
 
+// lockSupported reports whether this platform has a real inter-process lock.
+// Used by NewDefault to decide between a persisted limiter and an in-memory
+// one, so an unsupported platform degrades to weaker pacing rather than
+// failing every call closed.
+const lockSupported = true
+
 // lockFile blocks until it holds an exclusive flock on lockPath, creating the
 // file if it doesn't exist. Unlike a PID- or mtime-based lock file, an flock
 // is released by the kernel the instant the holding process exits, crashes,

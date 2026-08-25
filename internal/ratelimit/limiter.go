@@ -185,7 +185,16 @@ func NewPersistent(budgets map[Class]Budget, statePath string) *Limiter {
 // directory can't be resolved or created, it falls back to an in-memory
 // (non-persisted) limiter — a construction-time filesystem hiccup should
 // degrade pacing durability, not stop lion from working at all.
+// On a platform with no inter-process lock it also falls back to in-memory:
+// persisted state that cannot be serialized between processes would make Wait
+// fail closed on every call, leaving the client unable to issue any request at
+// all. Weaker pacing (per-process budgets, as before persistence existed) is
+// the lesser evil versus a CLI that cannot run; lion ships unix binaries, where
+// the persisted path is always the one taken.
 func NewDefault(budgets map[Class]Budget) *Limiter {
+	if !lockSupported {
+		return New(budgets)
+	}
 	path, err := DefaultStatePath()
 	if err != nil {
 		return New(budgets)

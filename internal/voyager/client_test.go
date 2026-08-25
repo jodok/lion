@@ -138,3 +138,46 @@ func TestClassifyNormalResponseUnaffected(t *testing.T) {
 		t.Errorf("body = %q", body)
 	}
 }
+
+// TestClassifyRedirectAllowsCustomBaseURL guards a regression: the redirect
+// classifier once treated any final URL outside /voyager/api/ as an auth
+// redirect, which turned every successful response served through
+// WithBaseURL (httptest server, proxy, alternate endpoint) into
+// ErrUnauthorized.
+func TestClassifyRedirectAllowsCustomBaseURL(t *testing.T) {
+	resp := &Response{
+		StatusCode: 200,
+		FinalURL:   "http://127.0.0.1:52341/me",
+		Headers:    http.Header{},
+	}
+	if err := classifyRedirect(resp); err != nil {
+		t.Fatalf("a success served from a custom base URL must not be reclassified, got %v", err)
+	}
+}
+
+// TestClassifyRedirectStillCatchesAuthDestinations keeps the signals that do
+// mean "not authenticated" working after narrowing the rule above.
+func TestClassifyRedirectStillCatchesAuthDestinations(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want error
+	}{
+		{"checkpoint", "https://www.linkedin.com/checkpoint/challenge/", ErrChallenge},
+		{"login", "https://www.linkedin.com/uas/login?goback=", ErrUnauthorized},
+		{"authwall", "https://www.linkedin.com/authwall?trk=x", ErrUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyRedirect(&Response{StatusCode: 200, FinalURL: tc.url, Headers: http.Header{}})
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("classifyRedirect(%s) = %v, want %v", tc.url, got, tc.want)
+			}
+		})
+	}
+	// Session-wipe cookie must still be caught regardless of URL.
+	h := http.Header{}
+	h.Add("Set-Cookie", `li_at=delete me; Expires=Thu, 01 Jan 1970 00:00:00 GMT`)
+	if err := classifyRedirect(&Response{StatusCode: 200, FinalURL: "https://www.linkedin.com/voyager/api/me", Headers: h}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("li_at deletion should map to ErrUnauthorized, got %v", err)
+	}
+}
