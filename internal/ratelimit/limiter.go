@@ -28,6 +28,12 @@ var ErrDailyBudget = errors.New("daily action budget exhausted for this class")
 // an unavailable lock must abort the reservation, not fall back to it.
 var ErrBudgetLock = errors.New("ratelimit: could not acquire inter-process state lock")
 
+// ErrBudgetPersist is returned when a reservation could not be written to the
+// state file. Like ErrBudgetLock this fails closed: an action that was not
+// recorded is an action the next process cannot count, so proceeding would let
+// an unwritable or full state file silently restore unlimited throughput.
+var ErrBudgetPersist = errors.New("ratelimit: could not persist reservation")
+
 // Class groups actions by how sensitive LinkedIn is to them. Reads are cheap;
 // invites are the most likely to trigger restrictions.
 type Class int
@@ -245,9 +251,26 @@ func (l *Limiter) Wait(ctx context.Context, c Class) error {
 		} else {
 			start = now.Add(gap)
 		}
+		prevNextAt, hadNextAt := l.nextAt[c]
 		l.nextAt[c] = start.Add(gap)
 		l.actions[c] = append(l.actions[c], now)
-		l.saveLocked()
+
+		// A reservation that cannot be written down did not happen. Swallowing
+		// the error would let every fresh limiter reload an empty budget and
+		// succeed forever — if statePath names a directory the rename always
+		// fails, and a full disk behaves the same way — which is precisely the
+		// cross-process bypass this persistence exists to close. Roll the
+		// in-memory reservation back and fail closed so the caller never issues
+		// the action believing it was accounted for.
+		if err := l.saveLocked(); err != nil {
+			l.actions[c] = l.actions[c][:len(l.actions[c])-1]
+			if hadNextAt {
+				l.nextAt[c] = prevNextAt
+			} else {
+				delete(l.nextAt, c)
+			}
+			budgetErr = fmt.Errorf("%w: %v", ErrBudgetPersist, err)
+		}
 	}
 
 	// Reserving is a read-modify-write of state shared across processes: the
@@ -347,9 +370,9 @@ func (l *Limiter) load() {
 // must never block a Voyager call from proceeding. Pruning again here (load
 // already pruned) keeps the file from growing unboundedly for a long-lived
 // process that never restarts and so never re-runs load's prune.
-func (l *Limiter) saveLocked() {
+func (l *Limiter) saveLocked() error {
 	if l.statePath == "" {
-		return
+		return nil
 	}
 	l.pruneLocked(l.now())
 	st := persistedState{
@@ -364,28 +387,29 @@ func (l *Limiter) saveLocked() {
 	}
 	b, err := json.Marshal(st)
 	if err != nil {
-		return
+		return err
 	}
 	dir := filepath.Dir(l.statePath)
 	tmp, err := os.CreateTemp(dir, ".ratelimit-*.tmp")
 	if err != nil {
-		return
+		return err
 	}
 	tmpPath := tmp.Name()
 	_, werr := tmp.Write(b)
 	cerr := tmp.Close()
 	if werr != nil || cerr != nil {
 		os.Remove(tmpPath)
-		return
+		return errors.Join(werr, cerr)
 	}
 	if err := os.Chmod(tmpPath, 0o600); err != nil {
 		os.Remove(tmpPath)
-		return
+		return err
 	}
 	if err := os.Rename(tmpPath, l.statePath); err != nil {
 		os.Remove(tmpPath)
-		return
+		return err
 	}
+	return nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -328,5 +329,38 @@ func TestWaitFailsClosedWhenLockUnavailable(t *testing.T) {
 	}
 	if len(l.actions[Write]) != 0 {
 		t.Fatalf("reservation was made despite failing to acquire the lock: %v", l.actions[Write])
+	}
+}
+
+// TestWaitFailsClosedWhenSaveFails covers the case where the lock can be
+// taken but the reservation cannot be committed — e.g. statePath names a
+// directory, so the atomic rename always fails, or the disk is full.
+// Swallowing that error would let every fresh limiter reload an empty budget
+// and grant actions forever, which is the cross-process bypass persistence
+// exists to close.
+func TestWaitFailsClosedWhenSaveFails(t *testing.T) {
+	if !lockSupported {
+		t.Skip("no inter-process lock on this platform; NewDefault uses an in-memory limiter here")
+	}
+	dir := t.TempDir()
+	// statePath is a directory: the lock sibling can still be created, but the
+	// rename onto statePath can never succeed.
+	statePath := filepath.Join(dir, "ratelimit.json")
+	if err := os.Mkdir(statePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	budgets := map[Class]Budget{Invite: {MinGap: 0, MaxGap: 0, DailyMax: 5}}
+	l := NewPersistent(budgets, statePath)
+	l.sleep = func(context.Context, time.Duration) error { return nil }
+
+	err := l.Wait(context.Background(), Invite)
+	if !errors.Is(err, ErrBudgetPersist) {
+		t.Fatalf("Wait with an unwritable state file = %v, want ErrBudgetPersist", err)
+	}
+	// The failed reservation must not linger in memory either, or a
+	// long-running process would count actions it never committed.
+	if n := len(l.actions[Invite]); n != 0 {
+		t.Errorf("rolled-back reservation left %d action(s) in memory, want 0", n)
 	}
 }
