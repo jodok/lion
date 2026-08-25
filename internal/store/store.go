@@ -10,7 +10,8 @@
 // cli/voyager split DESIGN.md §2 already draws for the network client.
 //
 // The database holds a complete copy of someone's private messages, so the
-// file is created 0600 and its parent directory 0700 (see Open).
+// file is always created (or repaired) 0600, and its parent directory 0700
+// whenever lion is the one creating it (see Open).
 package store
 
 import (
@@ -50,18 +51,19 @@ func DefaultPath() (string, error) {
 
 // Open opens (creating if needed) the SQLite store at path, applying
 // pragmas and running any pending schema migration. The parent directory is
-// created 0700 and repaired to 0700 if it already existed looser (mirroring
-// config.EnsureHome, for the same reason: a 0600 file guarantee is only as
-// good as the directory it lives in). The database file itself is created,
-// or repaired, to 0600 before SQLite ever touches it, so there is no window
-// where a partially-initialized store is world- or group-readable.
+// created 0700 when Open is the one creating it. A directory that already
+// existed is left exactly as found: --store accepts an arbitrary path (a
+// bare "--store /tmp/store.db" or a relative "--store ./store.db" both name
+// a directory lion had no hand in), so re-permissioning it out from under
+// whatever else uses it would be a surprising, unrelated side effect of
+// opening a database. The database file itself is created, or repaired, to
+// 0600 before SQLite ever touches it regardless of the directory's mode, so
+// there is no window where a partially-initialized store is world- or
+// group-readable.
 func Open(path string) (*Store, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("store: create %s: %w", dir, err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("store: chmod %s: %w", dir, err)
+	if err := ensureStoreDir(dir); err != nil {
+		return nil, err
 	}
 	if err := ensureFileMode(path, 0o600); err != nil {
 		return nil, fmt.Errorf("store: prepare %s: %w", path, err)
@@ -99,6 +101,31 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
 	return s, nil
+}
+
+// ensureStoreDir makes sure dir exists, creating it 0700 only when this call
+// is the one that creates it — never chmodding a directory that was already
+// there (see Open's doc comment for why: --store names an arbitrary path,
+// not something lion is guaranteed to own).
+func ensureStoreDir(dir string) error {
+	if fi, err := os.Stat(dir); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("store: %s exists and is not a directory", dir)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("store: stat %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("store: create %s: %w", dir, err)
+	}
+	// os.MkdirAll's mode is subject to umask, so an explicit Chmod is what
+	// actually guarantees 0700 — safe here because we just created dir
+	// ourselves in the branch above.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("store: chmod %s: %w", dir, err)
+	}
+	return nil
 }
 
 // ensureFileMode creates path (empty) with mode if it doesn't exist, or

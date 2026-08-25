@@ -239,7 +239,7 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 	start := time.Now()
 	summary := syncSummary{Complete: true}
 
-	toProcess, err := discoverConversations(ctx, cl, st, opts, progress)
+	toProcess, discComplete, err := discoverConversations(ctx, cl, st, opts, progress)
 	if err != nil {
 		summary.Complete = false
 		summary.ConversationsSeen = len(toProcess)
@@ -247,6 +247,13 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 		return summary, err
 	}
 	summary.ConversationsSeen = len(toProcess)
+	if !discComplete {
+		// --max-conversations cut discovery short, or the conversations
+		// cursor stalled (ErrPaginationStalled) — either way there may be
+		// older conversations this pass never saw, so the summary must say
+		// so even though nothing here actually failed.
+		summary.Complete = false
+	}
 
 	var budget *int
 	if opts.maxMessages > 0 {
@@ -269,8 +276,17 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 		progress.Status("syncing %s (%s)", conv.ID, firstNonEmpty(conv.Participants...))
 		progress.Event("conversation_start", map[string]any{"id": conv.ID, "urn": conv.URN})
 
-		added, err := catchUpMessages(ctx, cl, st, conv, opts, budget, progress)
+		added, caughtUp, err := catchUpMessages(ctx, cl, st, conv, opts, budget, progress)
 		summary.MessagesAdded += added
+		if !caughtUp {
+			// catchUpMessages stopped without reaching a known message, an
+			// empty page, or --after — i.e. --max-messages ran out mid-walk,
+			// or the messages cursor stalled (ErrPaginationStalled). Either
+			// way this conversation may have older messages left unfetched,
+			// which the outer loop's own budget check (above) won't
+			// necessarily catch if this was the last conversation.
+			summary.Complete = false
+		}
 		if err != nil {
 			if errors.Is(err, errMaxDBSizeReached) {
 				progress.Warn("%s", err)
@@ -286,10 +302,13 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 		}
 
 		if opts.backfill {
-			bAdded, err := backfillMessages(ctx, cl, st, conv.ID, opts, budget, progress)
+			bAdded, backfillComplete, err := backfillMessages(ctx, cl, st, conv.ID, opts, budget, progress)
 			summary.MessagesAdded += bAdded
 			if bAdded > 0 && added == 0 {
 				summary.ConversationsUpdated++
+			}
+			if !backfillComplete {
+				summary.Complete = false
 			}
 			if err != nil {
 				if errors.Is(err, errMaxDBSizeReached) {
@@ -320,24 +339,33 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 // --max-conversations is reached, when a page's oldest conversation is
 // already older than --after (pages are newest-first, so nothing further
 // back can pass the filter either), or when there are no more pages.
-func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) ([]voyager.Conversation, error) {
+//
+// The returned bool is true only when discovery ran to genuine exhaustion
+// (an empty page, or the --after cutoff) — it is false when
+// --max-conversations cut the walk short or when ConversationsPage reported
+// ErrPaginationStalled, since in both cases older conversations may exist
+// that this pass never saw. That's a truncation, not a failure: the error
+// return stays nil so a caller doesn't turn it into a non-zero exit, but the
+// caller must fold the bool into the pass's complete:false summary field.
+func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) ([]voyager.Conversation, bool, error) {
 	var toProcess []voyager.Conversation
 	var createdBefore int64
 
 	for {
 		if ctx.Err() != nil {
-			return toProcess, ctx.Err()
+			return toProcess, false, ctx.Err()
 		}
 		convs, next, err := cl.ConversationsPage(ctx, createdBefore, defaultConversationPageSize)
-		if err != nil {
-			return toProcess, err
+		stalled := errors.Is(err, voyager.ErrPaginationStalled)
+		if err != nil && !stalled {
+			return toProcess, false, err
 		}
 		if len(convs) == 0 {
-			return toProcess, nil
+			return toProcess, true, nil
 		}
 
 		now := time.Now().UnixMilli()
-		err = st.WithTx(ctx, func(tx *store.Tx) error {
+		txErr := st.WithTx(ctx, func(tx *store.Tx) error {
 			for _, c := range convs {
 				if c.ID == "" {
 					// conversationIDFromURN couldn't parse this one (an
@@ -352,8 +380,8 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 			}
 			return nil
 		})
-		if err != nil {
-			return toProcess, err
+		if txErr != nil {
+			return toProcess, false, txErr
 		}
 
 		oldestInPage := convs[0].UpdatedAt
@@ -370,15 +398,20 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 			toProcess = append(toProcess, c)
 			progress.Event("conversation_discovered", map[string]any{"id": c.ID, "urn": c.URN})
 			if opts.maxConversations > 0 && len(toProcess) >= opts.maxConversations {
-				return toProcess, nil
+				progress.Warn("--max-conversations reached; older conversations were not discovered")
+				return toProcess, false, nil
 			}
 		}
 
+		if stalled {
+			progress.Warn("conversations pagination cursor did not advance; older conversations may not have been discovered")
+			return toProcess, false, nil
+		}
 		if next == 0 {
-			return toProcess, nil
+			return toProcess, true, nil
 		}
 		if opts.afterMs != nil && oldestInPage < *opts.afterMs {
-			return toProcess, nil
+			return toProcess, true, nil
 		}
 		createdBefore = next
 	}
@@ -390,14 +423,23 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 // short of the page size) — that's the "already caught up" signal, per
 // sync's catch-up contract. It also stops at --after, at a --max-messages
 // budget, or at --max-db-size.
-func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, err error) {
+//
+// The returned bool is true only when the walk reached a genuine stopping
+// point (a known message, an empty page, or --after) — it is false when a
+// --max-messages budget ran out before that, or when MessagesPage reported
+// ErrPaginationStalled, since in both cases this conversation may still have
+// older messages sync never fetched. A caller must fold that into the pass's
+// complete:false summary field; it is not itself a returned error, matching
+// --max-db-size's existing "truncated, not failed" treatment via
+// errMaxDBSizeReached below.
+func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
 	var createdBefore int64
 	for {
 		if ctx.Err() != nil {
-			return added, ctx.Err()
+			return added, false, ctx.Err()
 		}
 		if budget != nil && *budget <= 0 {
-			return added, nil
+			return added, false, nil
 		}
 		pageSize := defaultMessagePageSize
 		if budget != nil && *budget < pageSize {
@@ -405,16 +447,17 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 		}
 
 		msgs, next, err := cl.MessagesPage(ctx, conv.ID, createdBefore, pageSize)
-		if err != nil {
-			return added, err
+		stalled := errors.Is(err, voyager.ErrPaginationStalled)
+		if err != nil && !stalled {
+			return added, false, err
 		}
 		if len(msgs) == 0 {
-			return added, nil
+			return added, true, nil
 		}
 
-		pageAdded, err := applyMessagePage(ctx, st, conv.ID, msgs)
-		if err != nil {
-			return added, err
+		pageAdded, aErr := applyMessagePage(ctx, st, conv.ID, msgs)
+		if aErr != nil {
+			return added, false, aErr
 		}
 		added += pageAdded
 		if budget != nil {
@@ -425,20 +468,24 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 
 		if opts.maxDBSizeBytes > 0 {
 			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
-				return added, err
+				return added, false, err
 			} else if reached {
-				return added, errMaxDBSizeReached
+				return added, false, errMaxDBSizeReached
 			}
 		}
 
 		if pageAdded < len(msgs) {
-			return added, nil // hit a message we already had: caught up
+			return added, true, nil // hit a message we already had: caught up
+		}
+		if stalled {
+			progress.Warn("messages pagination cursor did not advance for conversation %s; older messages may not have been fetched", conv.ID)
+			return added, false, nil
 		}
 		if next == 0 {
-			return added, nil
+			return added, true, nil
 		}
 		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
-			return added, nil
+			return added, true, nil
 		}
 		createdBefore = next
 	}
@@ -449,16 +496,22 @@ func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, c
 // empty — the signal that paging reached the true start of the
 // conversation — at which point it marks BackfillDone so a later plain sync
 // knows there's nothing older to fetch. Stopping early (--after, a budget,
-// --max-db-size, or the ConversationsPage/MessagesPage non-decreasing-cursor
-// guard tripping) does NOT set BackfillDone: only actually reaching the
-// start does.
-func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conversationID string, opts syncOptions, budget *int, progress *progressReporter) (added int, err error) {
+// --max-db-size, or MessagesPage reporting ErrPaginationStalled) does NOT
+// set BackfillDone: only actually reaching the start does.
+//
+// The returned bool mirrors catchUpMessages': true only when this walk
+// reached a genuine stopping point (the true start), false when a
+// --max-messages budget or a stalled cursor cut it short and older messages
+// may remain. A caller must fold that into the pass's complete:false
+// summary field rather than only checking the error, which stays nil for
+// this kind of truncation (see catchUpMessages' doc comment for why).
+func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conversationID string, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
 	current, ok, err := st.Conversation(ctx, conversationID)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if !ok || current.BackfillDone {
-		return 0, nil
+		return 0, true, nil
 	}
 	var createdBefore int64
 	if current.OldestSynced != nil {
@@ -467,10 +520,10 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 
 	for {
 		if ctx.Err() != nil {
-			return added, ctx.Err()
+			return added, false, ctx.Err()
 		}
 		if budget != nil && *budget <= 0 {
-			return added, nil
+			return added, false, nil
 		}
 		pageSize := defaultMessagePageSize
 		if budget != nil && *budget < pageSize {
@@ -478,8 +531,9 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 		}
 
 		msgs, next, err := cl.MessagesPage(ctx, conversationID, createdBefore, pageSize)
-		if err != nil {
-			return added, err
+		stalled := errors.Is(err, voyager.ErrPaginationStalled)
+		if err != nil && !stalled {
+			return added, false, err
 		}
 		if len(msgs) == 0 {
 			now := time.Now().UnixMilli()
@@ -487,15 +541,15 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 				return tx.MarkBackfillDone(ctx, conversationID, now)
 			})
 			if err != nil {
-				return added, err
+				return added, false, err
 			}
 			progress.Event("backfill_done", map[string]any{"conversation_id": conversationID})
-			return added, nil
+			return added, true, nil
 		}
 
-		pageAdded, err := applyMessagePage(ctx, st, conversationID, msgs)
-		if err != nil {
-			return added, err
+		pageAdded, aErr := applyMessagePage(ctx, st, conversationID, msgs)
+		if aErr != nil {
+			return added, false, aErr
 		}
 		added += pageAdded
 		if budget != nil {
@@ -506,17 +560,21 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 
 		if opts.maxDBSizeBytes > 0 {
 			if reached, err := storeSizeReached(st, opts.maxDBSizeBytes); err != nil {
-				return added, err
+				return added, false, err
 			} else if reached {
-				return added, errMaxDBSizeReached
+				return added, false, errMaxDBSizeReached
 			}
 		}
 
 		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
-			return added, nil // hit the user's --after bound, not the true start
+			return added, false, nil // hit the user's --after bound, not the true start
+		}
+		if stalled {
+			progress.Warn("messages pagination cursor did not advance while backfilling conversation %s; older messages may not have been fetched", conversationID)
+			return added, false, nil
 		}
 		if next == 0 {
-			return added, nil // cursor stopped decreasing; see doc comment above
+			return added, false, nil // shouldn't happen without stalled being set; treated conservatively as incomplete
 		}
 		createdBefore = next
 	}

@@ -359,6 +359,92 @@ func TestSyncMidRunErrorLeavesConsistentStoreAndReportsIncomplete(t *testing.T) 
 	}
 }
 
+// TestSyncMaxConversationsTruncatesAndReportsIncomplete is the required
+// --max-conversations completeness test: capping discovery below the number
+// of conversations actually available must leave older ones undiscovered,
+// so the pass must report complete:false even though nothing errored.
+func TestSyncMaxConversationsTruncatesAndReportsIncomplete(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}})).
+		on("/messaging/conversations/c1/events", messagesPageJSON(nil))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{maxConversations: 1}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: --max-conversations left c2 undiscovered")
+	}
+	if summary.ConversationsSeen != 1 {
+		t.Errorf("ConversationsSeen = %d, want 1", summary.ConversationsSeen)
+	}
+}
+
+// TestSyncMaxMessagesTruncatesAndReportsIncomplete is the required
+// --max-messages completeness test, specifically the case where the budget
+// is exhausted by the last (here, only) conversation's page: the outer
+// per-conversation budget check never gets a "next" conversation to run
+// against, so catchUpMessages itself must report the truncation.
+func TestSyncMaxMessagesTruncatesAndReportsIncomplete(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		// The page exactly consumes the --max-messages=2 budget, and (unlike
+		// a genuine "caught up" page) both messages are new, so nothing
+		// signals a stopping point other than the budget itself.
+		on("/messaging/conversations/c1/events",
+			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{maxMessages: 2}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: --max-messages was exhausted mid-conversation with no further conversation to trip the outer budget check")
+	}
+	if summary.MessagesAdded != 2 {
+		t.Errorf("MessagesAdded = %d, want 2", summary.MessagesAdded)
+	}
+}
+
+// TestSyncStalledMessagesCursorReportsIncomplete is the required
+// stalled-cursor completeness test: a conversation whose events endpoint
+// stops honoring createdBefore partway through paging must not be reported
+// as a complete pass, even though nothing returned an error.
+func TestSyncStalledMessagesCursorReportsIncomplete(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/messaging/conversations",
+			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsPageJSON(nil)).
+		on("/messaging/conversations/c1/events",
+			// First page: genuinely new, decreasing cursor (oldest=200).
+			messagesPageJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
+			// Second page: also new messages, but its oldest (220) does not
+			// decrease below the createdBefore (200) just sent — the server
+			// ignored the cursor, which is exactly the condition
+			// MessagesPage's ErrPaginationStalled guard exists to catch.
+			messagesPageJSON([][2]any{{"m3", int64(250)}, {"m4", int64(220)}}))
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	if summary.Complete {
+		t.Error("Complete = true, want false: the messages cursor stalled before the conversation's true start was reached")
+	}
+	if summary.MessagesAdded != 4 {
+		t.Errorf("MessagesAdded = %d, want 4 (both pages' messages are genuinely new)", summary.MessagesAdded)
+	}
+}
+
 // TestSyncOnceAndFollowAreMutuallyExclusive covers the flag-validation half
 // of the --once/--follow wacli-compat flags, at the full command-dispatch
 // level (no network needed since this fails before building a client).

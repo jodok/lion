@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -346,17 +347,7 @@ func writeExportFile(path, format string, groups []*exportGroup) error {
 // directory of files doesn't have a "json envelope" equivalent worth
 // building.
 func writeExportDirectory(dir string, groups []*exportGroup) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("export: create %s: %w", dir, err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-	messagesDir := filepath.Join(dir, "messages")
-	if err := os.MkdirAll(messagesDir, 0o700); err != nil {
-		return fmt.Errorf("export: create %s: %w", messagesDir, err)
-	}
-	if err := os.Chmod(messagesDir, 0o700); err != nil {
+	if err := ensureOutputDir(dir); err != nil {
 		return err
 	}
 
@@ -369,38 +360,118 @@ func writeExportDirectory(dir string, groups []*exportGroup) error {
 		return err
 	}
 	convEnc := json.NewEncoder(cf)
-
 	for _, g := range groups {
 		if err := convEnc.Encode(toExportedConversationMeta(g)); err != nil {
 			cf.Close()
 			return err
 		}
+	}
+	if err := cf.Close(); err != nil {
+		return err
+	}
 
-		msgPath := filepath.Join(messagesDir, sanitizeConversationFilename(g.id)+".jsonl")
+	return writeMessagesDir(dir, groups)
+}
+
+// ensureOutputDir makes sure dir exists, creating it 0700 only when this
+// call is the one that creates it. --output can point at a directory a user
+// already has for other purposes, so an existing directory's permissions
+// are left alone — chmodding it out from under whatever else uses it would
+// be a surprising side effect of running an export. A pre-existing
+// directory that's group/world-accessible is still flagged on stderr, so
+// leaving it unrepaired is a visible choice rather than a silent one: it's
+// about to gain a full copy of someone's private messages.
+func ensureOutputDir(dir string) error {
+	if fi, err := os.Stat(dir); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("export: %s exists and is not a directory", dir)
+		}
+		if runtime.GOOS != "windows" && fi.Mode().Perm()&0o077 != 0 {
+			fmt.Fprintf(os.Stderr, "warning: %s already exists and is group/world-accessible (mode %o); lion will not change an existing directory's permissions, but it is about to hold exported private messages\n", dir, fi.Mode().Perm())
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("export: stat %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("export: create %s: %w", dir, err)
+	}
+	// os.MkdirAll's mode is subject to umask, so an explicit Chmod is what
+	// actually guarantees 0700 — safe here because we just created dir
+	// ourselves in the branch above.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("export: chmod %s: %w", dir, err)
+	}
+	return nil
+}
+
+// writeMessagesDir stages every conversation's messages/<id>.jsonl file into
+// a fresh temporary directory inside dir, then swaps it into place as
+// dir/messages with a pair of renames, rather than reusing whatever was
+// already at dir/messages and only writing this run's files into it. A
+// second export into the same --output directory with a narrower filter
+// (e.g. --after, or --conversation) legitimately writes fewer files than a
+// prior, broader export did — reusing the directory in place would leave
+// the excluded conversations' files sitting there, and an archive that
+// silently retains messages the caller just asked to exclude is a privacy
+// bug, not untidiness. Swapping the whole directory in guarantees the
+// archive's contents match exactly this export, every time.
+func writeMessagesDir(dir string, groups []*exportGroup) error {
+	staging, err := os.MkdirTemp(dir, ".messages-")
+	if err != nil {
+		return fmt.Errorf("export: stage messages dir: %w", err)
+	}
+	// os.MkdirTemp's mode is subject to umask like any other create; we made
+	// this directory ourselves, so an explicit Chmod to guarantee 0700 is
+	// always safe (contrast ensureOutputDir, which never chmods a
+	// pre-existing --output directory).
+	if err := os.Chmod(staging, 0o700); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+
+	for _, g := range groups {
+		msgPath := filepath.Join(staging, sanitizeConversationFilename(g.id)+".jsonl")
 		mf, err := os.OpenFile(msgPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
-			cf.Close()
+			os.RemoveAll(staging)
 			return err
 		}
 		if err := mf.Chmod(0o600); err != nil {
 			mf.Close()
-			cf.Close()
+			os.RemoveAll(staging)
 			return err
 		}
 		menc := json.NewEncoder(mf)
 		for _, m := range g.messages {
 			if err := menc.Encode(toExportedMessage(m)); err != nil {
 				mf.Close()
-				cf.Close()
+				os.RemoveAll(staging)
 				return err
 			}
 		}
 		if err := mf.Close(); err != nil {
-			cf.Close()
+			os.RemoveAll(staging)
 			return err
 		}
 	}
-	return cf.Close()
+
+	messagesDir := filepath.Join(dir, "messages")
+	// A directory rename can't replace a non-empty existing directory, so
+	// the swap is two renames rather than one atomic syscall. The window
+	// between them is process-local — export is a single-shot CLI command,
+	// not a long-lived service with concurrent readers of a half-swapped
+	// archive — so this is safe in practice even though it isn't a single
+	// atomic operation.
+	if err := os.RemoveAll(messagesDir); err != nil {
+		os.RemoveAll(staging)
+		return fmt.Errorf("export: remove stale %s: %w", messagesDir, err)
+	}
+	if err := os.Rename(staging, messagesDir); err != nil {
+		os.RemoveAll(staging)
+		return fmt.Errorf("export: swap in %s: %w", messagesDir, err)
+	}
+	return nil
 }
 
 // isDirTarget reports whether path should be treated as a directory

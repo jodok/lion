@@ -158,6 +158,66 @@ func TestExportOutputDirectoryLayoutAndModes(t *testing.T) {
 	}
 }
 
+// TestExportOutputDirectoryPreservesPreexistingMode is the Theme A
+// regression test: an --output directory that already existed (e.g. a
+// shared directory the caller reused) must keep its own mode — export must
+// only chmod a directory it actually created.
+func TestExportOutputDirectoryPreservesPreexistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits don't apply on windows")
+	}
+	seedExportStore(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o755 {
+		t.Errorf("pre-existing --output dir mode = %o, want unchanged 0755", perm)
+	}
+}
+
+// TestExportOutputDirectoryDropsStaleFiles is the required Theme B test: a
+// full export followed by a filtered export into the same --output
+// directory must not leave the excluded conversation's file behind —
+// copying or sharing the archive afterward would otherwise leak exactly the
+// messages the second export's filter was meant to exclude.
+func TestExportOutputDirectoryDropsStaleFiles(t *testing.T) {
+	seedExportStore(t)
+	dir := filepath.Join(t.TempDir(), "archive") + string(filepath.Separator)
+
+	if err := runRoot(t, "message", "export", "--output", dir); err != nil {
+		t.Fatalf("full export: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); err != nil {
+		t.Fatalf("messages/c2.jsonl missing after the full export: %v", err)
+	}
+
+	if err := runRoot(t, "message", "export", "--conversation", "c1", "--output", dir); err != nil {
+		t.Fatalf("filtered export: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c2.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("messages/c2.jsonl still present after a filtered re-export excluded c2 (err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "messages", "c1.jsonl")); err != nil {
+		t.Errorf("messages/c1.jsonl missing after the filtered export: %v", err)
+	}
+
+	lines := readJSONLines(t, filepath.Join(dir, "conversations.jsonl"))
+	if len(lines) != 1 {
+		t.Errorf("conversations.jsonl lines = %d, want 1 (only c1 survives the filter)", len(lines))
+	}
+}
+
 // TestExportStreamsJSONLToStdout is the required stdout-streaming test.
 func TestExportStreamsJSONLToStdout(t *testing.T) {
 	seedExportStore(t)

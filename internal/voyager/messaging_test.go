@@ -238,7 +238,8 @@ func TestConversationsPagePaginatesAcrossPages(t *testing.T) {
 // TestConversationsPageLoopGuardTerminates is the required loop-guard test: a
 // transport that ignores createdBefore and keeps returning the same page
 // must not spin forever — the cursor stops strictly decreasing on the
-// second call, which must force next to 0.
+// second call, which must surface ErrPaginationStalled (carrying that same
+// page, not an empty one) rather than the old, indistinguishable next=0.
 func TestConversationsPageLoopGuardTerminates(t *testing.T) {
 	page := conversationsPageJSON([]convEntry{{"2-aaa", 5000}, {"2-bbb", 4000}})
 	st := &sequenceTransport{responses: jsonResponses(page)} // same body every call
@@ -248,10 +249,16 @@ func TestConversationsPageLoopGuardTerminates(t *testing.T) {
 	pages := 0
 	for {
 		convs, next, err := c.ConversationsPage(context.Background(), cursor, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
 		pages++
+		if err != nil {
+			if !errors.Is(err, ErrPaginationStalled) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(convs) == 0 {
+				t.Error("ErrPaginationStalled must still carry the page it fetched, got none")
+			}
+			break
+		}
 		if len(convs) == 0 {
 			t.Fatal("the ignored-cursor page unexpectedly came back empty")
 		}
@@ -368,10 +375,16 @@ func TestMessagesPageLoopGuardTerminates(t *testing.T) {
 	pages := 0
 	for {
 		msgs, next, err := c.MessagesPage(context.Background(), "2-abc", cursor, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
 		pages++
+		if err != nil {
+			if !errors.Is(err, ErrPaginationStalled) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(msgs) == 0 {
+				t.Error("ErrPaginationStalled must still carry the page it fetched, got none")
+			}
+			break
+		}
 		if len(msgs) == 0 {
 			t.Fatal("the ignored-cursor page unexpectedly came back empty")
 		}
@@ -385,6 +398,86 @@ func TestMessagesPageLoopGuardTerminates(t *testing.T) {
 	}
 	if pages != 2 {
 		t.Errorf("pages fetched = %d, want 2", pages)
+	}
+}
+
+// TestConversationsPageStalledCursorReturnsPageAndError is the required
+// stalled-cursor test: a transport that ignores createdBefore must yield
+// ErrPaginationStalled alongside the (non-empty) page it fetched, on the
+// second call once the cursor stops decreasing.
+func TestConversationsPageStalledCursorReturnsPageAndError(t *testing.T) {
+	page := conversationsPageJSON([]convEntry{{"2-aaa", 5000}, {"2-bbb", 4000}})
+	st := &sequenceTransport{responses: jsonResponses(page, page)}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+
+	// The page's oldest item (4000) does not decrease below the createdBefore
+	// bound just sent (4000, i.e. the server ignored it), which is exactly
+	// the non-decreasing-cursor condition the guard exists to catch.
+	convs, next, err := c.ConversationsPage(context.Background(), 4000, 2)
+	if !errors.Is(err, ErrPaginationStalled) {
+		t.Fatalf("err = %v, want ErrPaginationStalled", err)
+	}
+	if next != 0 {
+		t.Errorf("next = %d, want 0", next)
+	}
+	if len(convs) != 2 {
+		t.Fatalf("convs = %d, want the 2-item page ErrPaginationStalled must still carry", len(convs))
+	}
+}
+
+// TestConversationsUnaffectedByStalledPagination is the required
+// non-paged-wrapper test: Conversations never calls ConversationsPage and
+// makes only a single request, so a server that ignores createdBefore (the
+// condition that trips ErrPaginationStalled in the *Page variant) must not
+// make the plain, one-shot Conversations call fail.
+func TestConversationsUnaffectedByStalledPagination(t *testing.T) {
+	page := conversationsPageJSON([]convEntry{{"2-aaa", 5000}, {"2-bbb", 4000}})
+	st := &sequenceTransport{responses: jsonResponses(page)}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+
+	convs, err := c.Conversations(context.Background(), false, 0)
+	if err != nil {
+		t.Fatalf("Conversations: %v", err)
+	}
+	if len(convs) != 2 {
+		t.Errorf("convs = %d, want 2", len(convs))
+	}
+}
+
+// TestMessagesPageStalledCursorReturnsPageAndError is the Message-side
+// counterpart of TestConversationsPageStalledCursorReturnsPageAndError.
+func TestMessagesPageStalledCursorReturnsPageAndError(t *testing.T) {
+	page := messagesPageJSON([]msgEntry{{"urn:li:fs_event:(2-abc,1)", 5000}, {"urn:li:fs_event:(2-abc,2)", 4000}})
+	st := &sequenceTransport{responses: jsonResponses(page, page)}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+
+	// Same non-decreasing-cursor condition as
+	// TestConversationsPageStalledCursorReturnsPageAndError, above.
+	msgs, next, err := c.MessagesPage(context.Background(), "2-abc", 4000, 2)
+	if !errors.Is(err, ErrPaginationStalled) {
+		t.Fatalf("err = %v, want ErrPaginationStalled", err)
+	}
+	if next != 0 {
+		t.Errorf("next = %d, want 0", next)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("msgs = %d, want the 2-item page ErrPaginationStalled must still carry", len(msgs))
+	}
+}
+
+// TestMessagesUnaffectedByStalledPagination is the Message-side counterpart
+// of TestConversationsUnaffectedByStalledPagination.
+func TestMessagesUnaffectedByStalledPagination(t *testing.T) {
+	page := messagesPageJSON([]msgEntry{{"urn:li:fs_event:(2-abc,1)", 5000}, {"urn:li:fs_event:(2-abc,2)", 4000}})
+	st := &sequenceTransport{responses: jsonResponses(page)}
+	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+
+	msgs, err := c.Messages(context.Background(), "2-abc", 0)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("msgs = %d, want 2", len(msgs))
 	}
 }
 

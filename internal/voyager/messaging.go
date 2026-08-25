@@ -4,12 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/jodok/lion/internal/ratelimit"
 )
+
+// ErrPaginationStalled is returned by ConversationsPage and MessagesPage,
+// alongside the page they just fetched, when the server's cursor failed to
+// strictly decrease — the loop guard described on each function's doc
+// comment. The page is real and safe to keep: it's whatever the server
+// actually sent back. What the error means is narrower than "this call
+// failed" — it's "there may be more data, but this endpoint isn't giving
+// pagination a cursor that can reach it," so a caller can't tell the
+// difference between "ignored createdBefore" and "genuinely exhausted" any
+// other way. A caller that only wants a single page (see Conversations and
+// Messages below, which never call these Page variants at all) is
+// unaffected by this error by construction.
+var ErrPaginationStalled = errors.New("voyager: pagination cursor did not decrease; more data may exist but is not reachable through this endpoint")
 
 // NOTE: the messaging paths below (/messaging/conversations,
 // /messaging/conversations/{id}/events) and body shapes are best-known from
@@ -78,16 +92,17 @@ func (c *Client) Conversations(ctx context.Context, unreadOnly bool, max int) ([
 // "most recent" (no bound). count caps the page size (0 = server default).
 //
 // next is the oldest item's UpdatedAt in this page, i.e. what a caller loops
-// with to walk further back. It is 0 when there is nothing more to fetch: the
-// page came back empty, or the computed cursor did not strictly decrease
-// versus createdBefore. That second case is the loop guard — if
-// /messaging/conversations ever ignores createdBefore (a real risk per the
-// reverse-engineered-shapes NOTE above) and keeps returning the same page,
-// the cursor stops shrinking and a caller looping on "next != 0" would spin
-// forever without it. The guard only applies once createdBefore is actually
-// bounding the request (> 0): the very first call passes createdBefore=0,
-// and "no bound" always counts as bigger than any real timestamp the server
-// returns, so that call must not itself be flagged as non-decreasing.
+// with to walk further back. It is 0, with a nil error, when there is
+// nothing more to fetch because the page came back empty — that's genuine
+// exhaustion. If instead the computed cursor fails to strictly decrease
+// versus createdBefore, this returns the page it fetched (non-nil) alongside
+// ErrPaginationStalled instead of silently reporting next as 0: those two
+// situations used to be indistinguishable, which meant a caller looping on
+// "next != 0" kept only the first page and reported success. The guard only
+// applies once createdBefore is actually bounding the request (> 0): the
+// very first call passes createdBefore=0, and "no bound" always counts as
+// bigger than any real timestamp the server returns, so that call must not
+// itself be flagged as non-decreasing.
 func (c *Client) ConversationsPage(ctx context.Context, createdBefore int64, count int) ([]Conversation, int64, error) {
 	q := url.Values{}
 	if createdBefore > 0 {
@@ -109,7 +124,7 @@ func (c *Client) ConversationsPage(ctx context.Context, createdBefore int64, cou
 	}
 	next := oldestConversationTime(convs)
 	if createdBefore > 0 && next >= createdBefore {
-		next = 0
+		return convs, 0, ErrPaginationStalled
 	}
 	return convs, next, nil
 }
@@ -242,8 +257,9 @@ func (c *Client) Messages(ctx context.Context, conversationID string, max int) (
 // MessagesPage returns one page of a conversation's events, plus the cursor
 // to pass as createdBefore for the next, older page. It follows the same
 // contract as ConversationsPage — see that doc comment for createdBefore/next
-// semantics and the loop-guard rationale — using each message's SentAt as
-// the cursor instead of a conversation's UpdatedAt.
+// semantics, the ErrPaginationStalled case, and the loop-guard rationale —
+// using each message's SentAt as the cursor instead of a conversation's
+// UpdatedAt.
 func (c *Client) MessagesPage(ctx context.Context, conversationID string, createdBefore int64, count int) ([]Message, int64, error) {
 	if conversationID == "" {
 		return nil, 0, fmt.Errorf("empty conversation id")
@@ -272,7 +288,7 @@ func (c *Client) MessagesPage(ctx context.Context, conversationID string, create
 	}
 	next := oldestMessageTime(msgs)
 	if createdBefore > 0 && next >= createdBefore {
-		next = 0
+		return msgs, 0, ErrPaginationStalled
 	}
 	return msgs, next, nil
 }

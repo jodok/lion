@@ -80,6 +80,44 @@ func TestOpenModes(t *testing.T) {
 	}
 }
 
+// TestOpenPreservesPreexistingDirMode is the Theme A regression test: a
+// --store path inside a directory that already existed (the way "--store
+// /tmp/store.db" or "--store ./store.db" name a directory lion had no hand
+// in) must not have its mode touched, even though the db file inside it
+// still gets the usual 0600 treatment.
+func TestOpenPreservesPreexistingDirMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits don't apply on windows")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "store.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o755 {
+		t.Errorf("pre-existing dir mode = %o, want unchanged 0755", perm)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("store.db mode = %o, want 0600 regardless of the directory's mode", perm)
+	}
+}
+
 // TestUpsertMessageIsIdempotent pins the load-bearing property: applying
 // the same message page twice must never duplicate a row, which is what
 // makes resumption and --follow safe.
