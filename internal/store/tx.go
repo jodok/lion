@@ -55,7 +55,15 @@ func (t *Tx) UpsertConversation(ctx context.Context, c Conversation, firstSeenAt
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			urn          = excluded.urn,
-			participants = excluded.participants,
+			-- Same reasoning as the message upsert: participants are resolved
+			-- from the page's included[], so a later page can return this
+			-- conversation with nobody resolved. Keeping the empty list would
+			-- turn a named thread into an anonymous one on re-sync, so an empty
+			-- incoming list leaves the stored one alone.
+			participants = CASE
+				WHEN excluded.participants IN ('[]', 'null', '') THEN conversations.participants
+				ELSE excluded.participants
+			END,
 			updated_at   = excluded.updated_at,
 			unread       = excluded.unread
 	`, c.ID, c.URN, string(participantsJSON), c.UpdatedAt, boolToInt(c.Unread), firstSeenAt, firstSeenAt)
@@ -110,10 +118,17 @@ func (t *Tx) RecordMessagePage(ctx context.Context, conversationID string, msgs 
 			VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT(urn) DO UPDATE SET
 				conversation_id = excluded.conversation_id,
-				sender_name     = excluded.sender_name,
-				sender_urn      = excluded.sender_urn,
+				-- Never let a blank re-fetch erase detail already held.
+				-- LinkedIn's normalized responses carry included[] per page, so
+				-- the same message seen again from a different page can fail to
+				-- resolve its sender's MiniProfile and come back with an empty
+				-- name/URN. A plain overwrite would quietly downgrade a complete
+				-- archive on every re-sync, and the loss is permanent once the
+				-- page that had the detail is out of reach.
+				sender_name     = COALESCE(NULLIF(excluded.sender_name, ''), messages.sender_name),
+				sender_urn      = COALESCE(NULLIF(excluded.sender_urn, ''),  messages.sender_urn),
 				sent_at         = excluded.sent_at,
-				body            = excluded.body
+				body            = COALESCE(NULLIF(excluded.body, ''),        messages.body)
 		`, m.URN, m.ConversationID, m.SenderName, m.SenderURN, m.SentAt, m.Body); err != nil {
 			return 0, fmt.Errorf("store: upsert message %s: %w", m.URN, err)
 		}
