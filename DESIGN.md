@@ -295,11 +295,29 @@ in-browser, and a wrong csrf yields `403 "CSRF check failed"` — a different er
 — so csrf and the query are correct. The binary's imported snapshot simply
 decayed: `/me` worked at login and then `401`'d ~15 min later. LinkedIn rotates
 `JSESSIONID`/`li_at`/`lidc` and expires the Cloudflare `__cf_bm`, so a one-shot
-cookie snapshot is short-lived. **Fix (task #19): persist rotated cookies from
-each response's `Set-Cookie` back into the credential store** (the transport jar
-already captures them within a process; lion must write them back so the next
-invocation starts fresh, like a browser). Snapshot import stays the entry point;
-writeback keeps it alive.
+cookie snapshot is short-lived. **Fixed (task #19, cookie writeback):** rotated
+cookies are persisted back into the credential store, so the next invocation
+starts from a fresh jar the way a browser would. Snapshot import stays the
+entry point; writeback keeps it alive.
+
+The seam: a `Transport` may implement the optional `CookieSnapshotter`
+capability (`Snapshot() map[string]string`), which both the Chrome and stdlib
+transports do by reading their jar. `Client.Cookies()` overlays that live
+snapshot onto the static cookie set, and the CLI merges the result into the
+stored credential via `auth.UpdateCookies` after a successful command — wired
+in `cli.Execute` rather than a `PersistentPostRun`, because cobra runs only the
+*nearest* such hook in the tree, so a future vertical adding its own would
+silently disable writeback for its whole subtree. `auth login` stores the
+*post*-validation jar, since the `/me` check can itself rotate a cookie.
+
+Three details worth keeping: writeback is skipped when the command failed (a
+session-wipe response puts `li_at=delete me` in the jar, and persisting that
+would overwrite a good credential with garbage); an empty snapshot value never
+overwrites a stored cookie; and the snapshot reconstructs each cookie's wire
+form, because both cookie parsers move a quoted value's quotes into
+`Cookie.Quoted` instead of leaving them in `Value` — without that, JSESSIONID
+would shed its quotes a little more on every command until the derived
+csrf-token silently stopped matching.
 
 Historical note — earlier open `401`: `profile search` (GraphQL) returns
 `{"data":{"status":401}}` with a *valid* session (not a bot-block, no wipe).
