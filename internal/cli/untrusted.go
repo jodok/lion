@@ -2,6 +2,7 @@ package cli
 
 import (
 	"github.com/jodok/lion/internal/output"
+	"github.com/jodok/lion/internal/store"
 	"github.com/jodok/lion/internal/voyager"
 )
 
@@ -94,4 +95,29 @@ func wrapSearchResult(r *output.Renderer, sr voyager.SearchResult) voyager.Searc
 	sr.Headline = r.Untrusted(sr.Headline)
 	sr.Location = r.Untrusted(sr.Location)
 	return sr
+}
+
+// wrapStoreMessage returns m with its free-text display fields (SenderName,
+// Body) wrapped. Used by `lion message search`, which — unlike `message
+// export` — is display output that may be piped into an LLM, so
+// --wrap-untrusted applies here the same as it does to the live API's
+// message read/list (see wrapMessage above and export.go's exportedMessage
+// doc comment for why export is the one exception).
+func wrapStoreMessage(r *output.Renderer, m store.Message) store.Message {
+	m.SenderName = r.Untrusted(m.SenderName)
+	m.Body = r.Untrusted(m.Body)
+	return m
+}
+
+// wrapStoreParticipants returns participant display names wrapped, for
+// rendering a local-store conversation's participant list (`lion history
+// coverage`, `lion store cleanup`) the same way wrapConversation wraps the
+// live API's participant list — these are the same LinkedIn-controlled
+// display names, just read from the store instead of a live response.
+func wrapStoreParticipants(r *output.Renderer, participants []store.Participant) []string {
+	names := make([]string, len(participants))
+	for i, p := range participants {
+		names[i] = r.Untrusted(p.Name)
+	}
+	return names
 }

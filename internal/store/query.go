@@ -233,20 +233,71 @@ func (s *Store) ForEachMessage(ctx context.Context, f MessageFilter, fn func(Mes
 	return rows.Err()
 }
 
-// Search returns messages whose body or sender name matches an FTS5 query,
-// most relevant first, capped at limit (0 = FTS5's default, effectively
-// unbounded for this store's size).
-func (s *Store) Search(ctx context.Context, query string, limit int) ([]Message, error) {
-	sqlQuery := `
+// SearchFilter narrows Search. Query is the only required field; the rest
+// mirror MessageFilter so `lion message search` can layer the same
+// --conversation/--after/--before narrowing on top of the FTS match, plus
+// --from (matched against sender name, substring, and sender URN, exact).
+type SearchFilter struct {
+	// Query is the FTS5 match expression, checked against message bodies
+	// and sender names (see schemaV1's messages_fts columns).
+	Query string
+	// ConversationID restricts to one conversation; "" matches all.
+	ConversationID string
+	// From narrows by sender: a case-insensitive substring match against
+	// the stored sender name, OR an exact match against the sender URN —
+	// accepting either is what lets a caller pass either half of `--from
+	// NAME-or-URN` without first resolving one to the other.
+	From string
+	// After/Before bound SentAt (epoch ms), inclusive; nil is unbounded on
+	// that side. Same semantics as MessageFilter.After/Before.
+	After, Before *int64
+	// Limit, when > 0, caps the number of results returned.
+	Limit int
+	// Asc returns oldest-first instead of the default newest-first — the
+	// ordering search results actually get sorted by (see below), not
+	// FTS5's relevance rank: a message search is a way to jump into
+	// conversation history at a point in time, so "most recent match
+	// first" is the useful default, matching wacli's own `messages search`.
+	Asc bool
+}
+
+// Search returns messages matching an FTS5 query and f's other filters,
+// newest-first by default (Asc for oldest-first), capped at f.Limit (0 = no
+// cap).
+func (s *Store) Search(ctx context.Context, f SearchFilter) ([]Message, error) {
+	where := []string{"messages_fts MATCH ?"}
+	args := []any{f.Query}
+	if f.ConversationID != "" {
+		where = append(where, "m.conversation_id = ?")
+		args = append(args, f.ConversationID)
+	}
+	if f.From != "" {
+		where = append(where, "(m.sender_name LIKE ? OR m.sender_urn = ?)")
+		args = append(args, "%"+f.From+"%", f.From)
+	}
+	if f.After != nil {
+		where = append(where, "m.sent_at >= ?")
+		args = append(args, *f.After)
+	}
+	if f.Before != nil {
+		where = append(where, "m.sent_at <= ?")
+		args = append(args, *f.Before)
+	}
+
+	order := "DESC"
+	if f.Asc {
+		order = "ASC"
+	}
+
+	sqlQuery := fmt.Sprintf(`
 		SELECT m.urn, m.conversation_id, m.sender_name, m.sender_urn, m.sent_at, m.body
 		FROM messages_fts
 		JOIN messages m ON m.rowid = messages_fts.rowid
-		WHERE messages_fts MATCH ?
-		ORDER BY rank`
-	args := []any{query}
-	if limit > 0 {
+		WHERE %s
+		ORDER BY m.sent_at %s`, strings.Join(where, " AND "), order)
+	if f.Limit > 0 {
 		sqlQuery += " LIMIT ?"
-		args = append(args, limit)
+		args = append(args, f.Limit)
 	}
 
 	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
@@ -286,10 +337,162 @@ func (s *Store) Empty(ctx context.Context) (bool, error) {
 }
 
 // DeleteConversation removes a conversation and, via ON DELETE CASCADE, all
-// of its messages. Not currently wired to any CLI command — it exists so
-// the cascade behavior itself is directly testable — but is a reasonable
-// building block for a future `lion sync --forget` or similar.
+// of its messages. Used by `lion store cleanup`; also exists independently
+// of that command so the cascade behavior itself is directly testable.
 func (s *Store) DeleteConversation(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM conversations WHERE id = ?`, id)
 	return err
+}
+
+// ConversationCoverage answers "how much of this conversation's history does
+// the store actually hold?" — the question `lion history coverage` exists
+// to answer, since for a backup tool that's the whole point.
+type ConversationCoverage struct {
+	Conversation
+	// MessageCount is how many messages this store holds for the
+	// conversation — distinct from "how many exist on LinkedIn", which
+	// lion has no way to ask for directly; BackfillDone is the closer proxy
+	// for completeness.
+	MessageCount int
+}
+
+// Coverage returns per-conversation coverage, newest-activity first
+// (matching Conversations' ordering). id, when non-empty, restricts the
+// result to one conversation; an unknown id returns an empty slice rather
+// than an error, mirroring Conversation's not-found-is-a-bool convention —
+// callers that need to distinguish "unknown id" from "no messages yet" use
+// Conversation's ok return for that check first.
+func (s *Store) Coverage(ctx context.Context, id string) ([]ConversationCoverage, error) {
+	// conversationColumns is unqualified (fine for Conversation/Conversations,
+	// which never join); joined against messages here — which has its own
+	// urn column — "urn" alone would be an ambiguous-column error, so every
+	// column is qualified to the conversations side explicitly.
+	query := `
+		SELECT c.` + strings.ReplaceAll(conversationColumns, ", ", ", c.") + `, count(m.urn)
+		FROM conversations c
+		LEFT JOIN messages m ON m.conversation_id = c.id`
+	var args []any
+	if id != "" {
+		query += " WHERE c.id = ?"
+		args = append(args, id)
+	}
+	query += " GROUP BY c.id ORDER BY c.updated_at DESC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: coverage: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ConversationCoverage
+	for rows.Next() {
+		// scanConversation reads exactly conversationColumns' worth of
+		// dest, so the trailing count needs its own Scan target chained
+		// onto the same *sql.Rows — coverageRowScanner below bridges that.
+		var count int
+		c, err := scanConversation(&coverageRowScanner{rows: rows, count: &count})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ConversationCoverage{Conversation: c, MessageCount: count})
+	}
+	return out, rows.Err()
+}
+
+// coverageRowScanner adapts one *sql.Rows call to scanConversation's
+// rowScanner interface when the query has one extra trailing column
+// (count(m.urn)) beyond conversationColumns — it appends its own dest to
+// whatever scanConversation passes in, rather than duplicating
+// scanConversation's field-by-field decode logic for a query that differs
+// from it by exactly one column.
+type coverageRowScanner struct {
+	rows  *sql.Rows
+	count *int
+}
+
+func (c *coverageRowScanner) Scan(dest ...any) error {
+	return c.rows.Scan(append(dest, c.count)...)
+}
+
+// ConversationsOlderThan returns conversations whose UpdatedAt (LinkedIn's
+// own last-activity timestamp) is strictly before cutoffMs, oldest-activity
+// first — the candidate set `lion store cleanup --days N` considers for
+// removal, listed oldest-first so a --dry-run reads as "these have been
+// stale longest" rather than an arbitrary order.
+func (s *Store) ConversationsOlderThan(ctx context.Context, cutoffMs int64) ([]Conversation, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+conversationColumns+` FROM conversations WHERE updated_at < ? ORDER BY updated_at ASC`, cutoffMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Conversation
+	for rows.Next() {
+		c, err := scanConversation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Stats is the store-wide summary `lion store stats` reports.
+type Stats struct {
+	Conversations int
+	Messages      int
+	// OldestMessage/NewestMessage are nil when the store holds no messages.
+	OldestMessage, NewestMessage *int64
+	SchemaVersion                int
+	// LastSyncedAt is the most recent LastSyncedAt across every
+	// conversation (i.e. the last time any `lion sync` actually wrote
+	// something), nil when the store holds no conversations yet.
+	LastSyncedAt *int64
+}
+
+// Stats computes store-wide counts and bounds. Unlike SizeBytes (a plain
+// stat call, not a query), this belongs in query.go since it reads table
+// contents.
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var st Stats
+
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM conversations`).Scan(&st.Conversations); err != nil {
+		return Stats{}, err
+	}
+
+	var msgCount sql.NullInt64
+	var oldest, newest, lastSynced sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*), min(sent_at), max(sent_at) FROM messages`,
+	).Scan(&msgCount, &oldest, &newest); err != nil {
+		return Stats{}, err
+	}
+	st.Messages = int(msgCount.Int64)
+	if oldest.Valid {
+		v := oldest.Int64
+		st.OldestMessage = &v
+	}
+	if newest.Valid {
+		v := newest.Int64
+		st.NewestMessage = &v
+	}
+
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT max(last_synced_at) FROM conversations`,
+	).Scan(&lastSynced); err != nil {
+		return Stats{}, err
+	}
+	if lastSynced.Valid {
+		v := lastSynced.Int64
+		st.LastSyncedAt = &v
+	}
+
+	version, err := s.schemaVersion(ctx)
+	if err != nil {
+		return Stats{}, err
+	}
+	st.SchemaVersion = version
+
+	return st, nil
 }

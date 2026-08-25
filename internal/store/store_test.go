@@ -316,7 +316,7 @@ func TestSearchReturnsMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := s.Search(ctx, "coffee", 0)
+	hits, err := s.Search(ctx, SearchFilter{Query: "coffee"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestCascadeDeleteRemovesMessages(t *testing.T) {
 	if len(msgs) != 0 {
 		t.Errorf("Messages after DeleteConversation = %v, want none (cascade)", msgs)
 	}
-	hits, err := s.Search(ctx, "hi", 0)
+	hits, err := s.Search(ctx, SearchFilter{Query: "hi"})
 	if err != nil {
 		t.Fatal(err)
 	}
