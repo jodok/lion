@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/pflag"
 )
@@ -147,8 +148,17 @@ func Apply(cfg *Config, flags *pflag.FlagSet) error {
 	}
 
 	if !flags.Changed("readonly") {
-		if v, ok := os.LookupEnv("LION_READONLY"); ok {
-			cfg.ReadOnly = parseBoolLoose(v)
+		// LION_READONLY gates every mutation, so it must never fail open. An
+		// unset or empty value falls through to the config file; a value we
+		// cannot understand is an error rather than a silent false, because
+		// silently ignoring `LION_READONLY=yes` would enable writes for
+		// someone who believes they are protected.
+		if v, ok := os.LookupEnv("LION_READONLY"); ok && v != "" {
+			b, err := parseBoolStrict(v)
+			if err != nil {
+				return fmt.Errorf("LION_READONLY=%q: %w", v, err)
+			}
+			cfg.ReadOnly = b
 		} else if fc.ReadOnly != nil {
 			cfg.ReadOnly = *fc.ReadOnly
 		}
@@ -170,13 +180,20 @@ func Apply(cfg *Config, flags *pflag.FlagSet) error {
 	return nil
 }
 
-// parseBoolLoose parses an environment variable's boolean value, treating an
-// unparseable value as false rather than erroring — an env var is easy to
-// typo and shouldn't hard-fail every command.
-func parseBoolLoose(s string) bool {
+// parseBoolStrict parses a boolean environment value, accepting the spellings
+// people actually type (strconv's 1/t/true/0/f/false, plus yes/no/on/off, any
+// case) and rejecting everything else. Used for safety-gating variables where
+// an unrecognized value must be reported rather than quietly treated as off.
+func parseBoolStrict(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "yes", "y", "on":
+		return true, nil
+	case "no", "n", "off":
+		return false, nil
+	}
 	b, err := strconv.ParseBool(s)
 	if err != nil {
-		return false
+		return false, errors.New("want a boolean (true/false, 1/0, yes/no, on/off)")
 	}
-	return b
+	return b, nil
 }

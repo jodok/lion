@@ -159,3 +159,23 @@ func TestEnsureHomeRepairsLoosePermissions(t *testing.T) {
 		t.Errorf("home dir perm = %o, want 0700 (should have been repaired)", perm)
 	}
 }
+
+// TestReadOnlyEnvNeverFailsOpen covers the safety gate: an unrecognized
+// LION_READONLY must be reported, never silently treated as "writes allowed".
+func TestReadOnlyEnvNeverFailsOpen(t *testing.T) {
+	for _, v := range []string{"yes", "on", "1", "true", "Y"} {
+		if b, err := parseBoolStrict(v); err != nil || !b {
+			t.Fatalf("parseBoolStrict(%q) = (%v,%v), want (true,nil)", v, b, err)
+		}
+	}
+	for _, v := range []string{"no", "off", "0", "false"} {
+		if b, err := parseBoolStrict(v); err != nil || b {
+			t.Fatalf("parseBoolStrict(%q) = (%v,%v), want (false,nil)", v, b, err)
+		}
+	}
+	for _, v := range []string{"garbage", "tru", "2", "maybe"} {
+		if _, err := parseBoolStrict(v); err == nil {
+			t.Fatalf("parseBoolStrict(%q) should error rather than fail open", v)
+		}
+	}
+}

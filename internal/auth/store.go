@@ -204,10 +204,12 @@ func withLock(fn func() error) error {
 		staleLockAge = 30 * time.Second
 	)
 	deadline := time.Now().Add(maxWait)
+	acquired := false
 	for {
 		f, err := os.OpenFile(lp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			f.Close()
+			acquired = true
 			break
 		}
 		if !errors.Is(err, os.ErrExist) {
@@ -215,14 +217,20 @@ func withLock(fn func() error) error {
 		}
 		if fi, statErr := os.Stat(lp); statErr == nil && time.Since(fi.ModTime()) > staleLockAge {
 			os.Remove(lp) // steal a stale lock left by a crashed process
-			continue
 		}
+		// Fall through to the deadline check even after stealing, so a lock
+		// that keeps being recreated cannot spin here past maxWait.
 		if time.Now().After(deadline) {
 			break // proceed unlocked rather than hang or fail outright
 		}
 		time.Sleep(retryDelay)
 	}
-	defer os.Remove(lp)
+	// Only clean up a lock this call actually created. Removing it after
+	// giving up would delete a lock another process still holds, turning a
+	// missed wait into a broken mutex for everyone else.
+	if acquired {
+		defer os.Remove(lp)
+	}
 	return fn()
 }
 
