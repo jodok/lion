@@ -47,9 +47,23 @@ func wrapInvitation(r *output.Renderer, inv voyager.Invitation) voyager.Invitati
 // element-by-element rather than as a whole joined string.
 func wrapConversation(r *output.Renderer, c voyager.Conversation) voyager.Conversation {
 	if len(c.Participants) > 0 {
-		wrapped := make([]string, len(c.Participants))
-		for i, p := range c.Participants {
-			wrapped[i] = r.Untrusted(p)
+		wrapped := make([]voyager.Participant, 0, len(c.Participants))
+		for _, p := range c.Participants {
+			// An unresolved participant carries an empty Name (see
+			// decodeConversations). v1.0.0 never emitted those, so they are
+			// dropped here rather than wrapped: r.Untrusted("") produces a
+			// non-empty nonce-delimited payload, which would sail past
+			// participantNames' Name=="" filter and put a wrapper-only entry
+			// in the published participants[] — reintroducing the exact
+			// contract break conversationOutput exists to prevent, but only
+			// under --wrap-untrusted. Filtering before wrapping keeps the two
+			// output modes identical in shape.
+			if p.Name == "" {
+				continue
+			}
+			// URN is lion's own structured identifier, not free text — only
+			// Name (the display name someone else set) gets wrapped.
+			wrapped = append(wrapped, voyager.Participant{Name: r.Untrusted(p.Name), URN: p.URN})
 		}
 		c.Participants = wrapped
 	}

@@ -166,6 +166,31 @@ lion connection requests [--incoming|--outgoing]
 lion message list [--unread] [--max N]
 lion message read <conversation-id>
 lion message send <id|conversation> TEXT   # id = person -> new/existing thread
+lion message export [--conversation ID] [--after DATE] [--before DATE]
+                     [--limit N] [--format json|jsonl] [--output FILE]
+                     # reads the local store only — never touches LinkedIn.
+                     # --output writes one file, created fresh and renamed
+                     # into place; omit it to stream to stdout.
+                     #
+                     # A multi-file directory layout was cut before v1.1
+                     # shipped. It was the only surface that wrote many
+                     # files into, and deleted files from, a user-chosen
+                     # directory, and essentially every review finding on
+                     # the store/sync/export work landed there: filename
+                     # collisions silently dropping a conversation,
+                     # deleting the previous archive before the new one was
+                     # durable, and a self-asserted marker authorizing
+                     # recursive deletion. Streaming and single-file export
+                     # carry none of that, so the layout can come back on
+                     # its own merits instead of gating everything else.
+
+lion sync [--backfill] [--after DATE] [--max-conversations N]
+          [--max-messages N] [--max-db-size SIZE] [--once|--follow]
+          [--interval DUR] [--events] [--lock-wait DUR]
+          # populates $LION_HOME/store.db (SQLite+FTS5) from LinkedIn, so
+          # `message export` (and later, search) can read it offline —
+          # see internal/store's package doc for the wacli-modeled
+          # sync-then-read-locally architecture this follows
 
 lion feed read [--max N]
 lion feed post TEXT [--visibility connections|public] [--media FILE]
