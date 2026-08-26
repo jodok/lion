@@ -330,3 +330,48 @@ func TestStatsOnEmptyStore(t *testing.T) {
 		t.Errorf("Stats on a fresh store = %+v, want nil bounds", st)
 	}
 }
+
+// TestDeleteConversationIfOlderThanRespectsCutoff is the store cleanup race
+// guard: a conversation a concurrent sync refreshed (updated_at bumped past
+// the cutoff) between cleanup's target selection and the delete must survive,
+// while a still-stale one is removed. Folding the cutoff into the DELETE's own
+// WHERE is what closes that window.
+func TestDeleteConversationIfOlderThanRespectsCutoff(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const cutoff = int64(1000)
+
+	mk := func(id string, updated int64) {
+		if err := s.WithTx(ctx, func(tx *Tx) error {
+			return tx.UpsertConversation(ctx, Conversation{
+				ID: id, URN: "urn:li:fs_conversation:" + id, UpdatedAt: updated,
+			}, updated)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("stale", 500)  // below cutoff → deletable
+	mk("fresh", 5000) // a sync bumped it above cutoff → must be spared
+
+	gone, err := s.DeleteConversationIfOlderThan(ctx, "fresh", cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gone {
+		t.Error("a conversation newer than the cutoff was deleted; the race guard failed")
+	}
+	if _, ok, _ := s.Conversation(ctx, "fresh"); !ok {
+		t.Error("fresh conversation is gone from the store")
+	}
+
+	gone, err = s.DeleteConversationIfOlderThan(ctx, "stale", cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gone {
+		t.Error("a still-stale conversation was not deleted")
+	}
+	if _, ok, _ := s.Conversation(ctx, "stale"); ok {
+		t.Error("stale conversation should have been removed")
+	}
+}

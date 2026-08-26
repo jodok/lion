@@ -344,6 +344,30 @@ func (s *Store) DeleteConversation(ctx context.Context, id string) error {
 	return err
 }
 
+// DeleteConversationIfOlderThan deletes a conversation (and, by cascade, its
+// messages) only if its stored updated_at is still below cutoffMs, reporting
+// whether a row was actually removed.
+//
+// The cutoff re-check is what makes `store cleanup` safe against a concurrent
+// sync. Cleanup picks its stale targets, then a sync can refresh one of them —
+// bumping updated_at to now — before the delete runs; an unconditional delete
+// by id would then destroy freshly-synced history. Folding the cutoff into the
+// DELETE's own WHERE means a conversation a sync revived in that window simply
+// isn't matched: the decision to delete and the delete are one statement, with
+// no gap for the row to change underneath.
+func (s *Store) DeleteConversationIfOlderThan(ctx context.Context, id string, cutoffMs int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM conversations WHERE id = ? AND updated_at < ?`, id, cutoffMs)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ConversationCoverage answers "how much of this conversation's history does
 // the store actually hold?" — the question `lion history coverage` exists
 // to answer, since for a backup tool that's the whole point.

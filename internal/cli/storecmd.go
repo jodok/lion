@@ -138,6 +138,7 @@ func newStoreCleanupCmd() *cobra.Command {
 	var (
 		days      int
 		storePath string
+		lockWait  time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "cleanup",
@@ -211,11 +212,39 @@ func newStoreCleanupCmd() *cobra.Command {
 			}
 
 			if !dryRun {
-				for _, c := range targets {
-					if err := st.DeleteConversation(ctx, c.ID); err != nil {
+				// Take the store lock for the delete pass, the same lock
+				// `lion sync` holds — cleanup is a store writer too, and a
+				// concurrent sync must not interleave. The lock is acquired
+				// here, after the confirmation prompt, rather than around the
+				// whole command, so a human deliberating at the prompt never
+				// blocks a scheduled sync.
+				if st.LockSupported() {
+					release, err := st.Lock(ctx, lockWait)
+					if err != nil {
 						return err
 					}
+					defer release()
 				}
+				// Each delete re-checks the cutoff inside its own statement,
+				// so a conversation a sync refreshed between the select above
+				// and here (updated_at bumped to now) is spared rather than
+				// destroyed. deleted tracks what was actually removed, which
+				// can be fewer than targets for exactly that reason.
+				deleted := targets[:0:0]
+				for _, c := range targets {
+					gone, err := st.DeleteConversationIfOlderThan(ctx, c.ID, cutoffMs)
+					if err != nil {
+						return err
+					}
+					if gone {
+						deleted = append(deleted, c)
+					}
+				}
+				if len(deleted) < len(targets) {
+					fmt.Fprintf(os.Stderr, "note: %d of %d target(s) were refreshed by a concurrent sync and left in place\n",
+						len(targets)-len(deleted), len(targets))
+				}
+				targets = deleted
 			}
 
 			status := "deleted"
@@ -242,6 +271,7 @@ func newStoreCleanupCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&days, "days", 0, "delete conversations whose last activity is older than this many days (required)")
+	cmd.Flags().DurationVar(&lockWait, "lock-wait", 0, "wait up to this long for a running lion sync to release the store lock instead of failing immediately")
 	cmd.Flags().StringVar(&storePath, "store", "", "path to the store database (default $LION_HOME/store.db)")
 	return cmd
 }
