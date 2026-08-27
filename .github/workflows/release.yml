@@ -78,3 +78,91 @@ jobs:
             dist/*.tar.gz
             dist/checksums.txt
           generate_release_notes: true
+
+  # Whether the tap-bump job below can run: it pushes to a *different* repo
+  # (jodok/homebrew-tap), which the default GITHUB_TOKEN cannot do, so it needs
+  # a user-supplied PAT in the HOMEBREW_TAP_TOKEN secret. Secrets can't be read
+  # in a job-level `if:`, so this job turns "is the secret set?" into an output
+  # the tap job can gate on — and the whole homebrew step simply no-ops (rather
+  # than failing the release) until the secret is added.
+  tap-token-check:
+    needs: release
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set — skipping the Homebrew tap update. Add a fine-grained PAT with contents:write on jodok/homebrew-tap to enable it."
+          fi
+
+  # Regenerate jodok/homebrew-tap's Formula/lion.rb for this release and push
+  # it, so `brew install jodok/tap/lion` tracks the latest version. The formula
+  # is a prebuilt-binary formula: one url+sha256 per platform, and a plain
+  # `bin.install "lion"` because Homebrew changes into the tarball's single
+  # top-level directory (lion_<version>_<os>_<arch>/) before running install.
+  homebrew:
+    needs: [release, tap-token-check]
+    if: needs.tap-token-check.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: jodok/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Fetch this release's checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" -p checksums.txt -D .
+      - name: Check out lion (for the formula template)
+        uses: actions/checkout@v4
+        with:
+          path: lion
+      - name: Render Formula/lion.rb from the template
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"        # e.g. v1.1.0
+          version="${tag#v}"              # e.g. 1.1.0
+          # sha of a given release asset, read from the checksums file.
+          sha() { awk -v f="$1" '$2 == f { print $1 }' checksums.txt; }
+          da="$(sha "lion_${tag}_darwin_arm64.tar.gz")"
+          di="$(sha "lion_${tag}_darwin_amd64.tar.gz")"
+          la="$(sha "lion_${tag}_linux_arm64.tar.gz")"
+          li="$(sha "lion_${tag}_linux_amd64.tar.gz")"
+          for v in "$da" "$di" "$la" "$li"; do
+            if [ -z "$v" ]; then echo "missing a checksum for $tag" >&2; exit 1; fi
+          done
+          # Substitute placeholders in the committed template. Only @@…@@
+          # tokens are replaced, so the Ruby #{…} interpolations in the
+          # template survive verbatim into the formula.
+          sed \
+            -e "s|@@TAG@@|${tag}|g" \
+            -e "s|@@VERSION@@|${version}|g" \
+            -e "s|@@SHA_DARWIN_ARM64@@|${da}|g" \
+            -e "s|@@SHA_DARWIN_AMD64@@|${di}|g" \
+            -e "s|@@SHA_LINUX_ARM64@@|${la}|g" \
+            -e "s|@@SHA_LINUX_AMD64@@|${li}|g" \
+            lion/.github/lion.rb.tmpl > tap/Formula/lion.rb
+          echo "--- generated formula ---"
+          cat tap/Formula/lion.rb
+      - name: Commit and push the formula
+        run: |
+          set -euo pipefail
+          cd tap
+          if git diff --quiet -- Formula/lion.rb; then
+            echo "Formula already up to date for ${GITHUB_REF_NAME}; nothing to push."
+            exit 0
+          fi
+          git config user.name "lion-release"
+          git config user.email "noreply@github.com"
+          git add Formula/lion.rb
+          git commit -m "lion ${GITHUB_REF_NAME#v}"
+          git push
