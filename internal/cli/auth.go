@@ -193,10 +193,22 @@ const cookieHeaderPrompt = "Paste the full Cookie: header for linkedin.com.\n" +
 // one that dies minutes later.
 var identityCookies = []string{"bcookie", "bscookie"}
 
-// warnThinCookieJar warns on stderr when the jar being saved is missing the
-// browser-identity cookies. It runs after the li_at/JSESSIONID check, so by
-// here the session itself is well-formed and the only thing worth saying is
-// that this jar is thinner than a browser's.
+// warnThinCookieJar warns on stderr when the cookies supplied to `auth
+// login` omit the browser-identity ones. It runs after the li_at/JSESSIONID
+// check, so by here the session itself is well-formed and the only thing
+// worth saying is that this input is thinner than a browser's jar.
+//
+// The message deliberately talks about what was *supplied*, not about the
+// credential that gets saved. Those are different jars: the credential
+// stores the post-validation snapshot (see the Cookies field in login's
+// RunE), and LinkedIn issues bcookie/bscookie during the very /me request
+// that validates the session — so a warned-about login still lands on disk
+// with both cookies present. Wording this as "the saved jar is missing
+// them" would be provably false the moment anyone looked at the store, and
+// the warning would read as a bug rather than as the one notice explaining
+// why the session is about to stop working. Server-minted identity cookies
+// are exactly the problem being described: they identify a jar that is not
+// the browser the session was issued to.
 func warnThinCookieJar(cookies map[string]string) {
 	var missing []string
 	for _, name := range identityCookies {
@@ -208,9 +220,11 @@ func warnThinCookieJar(cookies map[string]string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr,
-		"warning: cookie jar is missing %s — LinkedIn may drop this session shortly "+
-			"after it starts working, and GraphQL endpoints (message list, profile "+
-			"search) can reject it outright. Paste the whole Cookie: header instead: "+
+		"warning: the cookies you supplied omit %s, so this session is not being "+
+			"presented as the browser it was issued to. LinkedIn hands out its own "+
+			"and then typically drops the session within minutes, and GraphQL "+
+			"endpoints (message list, profile search) can reject it outright. Paste "+
+			"the whole Cookie: header instead: "+
 			"`pbpaste | lion auth login --cookies-stdin`\n",
 		strings.Join(missing, " and "))
 }

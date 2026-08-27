@@ -462,9 +462,12 @@ func TestWarnThinCookieJar(t *testing.T) {
 		t.Errorf("warnThinCookieJar(full jar) warned: %q", out)
 	}
 
+	// Assertions match the full rendered clause rather than a bare cookie
+	// name: "bscookie" contains "bcookie", so a substring check on either
+	// name alone passes for a message naming only the other one.
 	thin := map[string]string{"li_at": "x", "JSESSIONID": `"ajax:2"`}
 	out := captureStderr(t, func() { warnThinCookieJar(thin) })
-	for _, want := range []string{"bcookie", "bscookie", "--cookies-stdin"} {
+	for _, want := range []string{"omit bcookie and bscookie,", "--cookies-stdin"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("warnThinCookieJar(thin jar) = %q, want it to mention %q", out, want)
 		}
@@ -472,8 +475,16 @@ func TestWarnThinCookieJar(t *testing.T) {
 
 	partial := map[string]string{"li_at": "x", "JSESSIONID": `"ajax:2"`, "bcookie": "b"}
 	out = captureStderr(t, func() { warnThinCookieJar(partial) })
-	if !strings.Contains(out, "bscookie") || strings.Contains(out, "bcookie and") {
+	if !strings.Contains(out, "omit bscookie,") {
 		t.Errorf("warnThinCookieJar(partial jar) = %q, want only bscookie named", out)
+	}
+
+	// The message describes the supplied cookies, not the credential that
+	// gets saved: login persists the post-validation jar, into which
+	// LinkedIn has by then injected its own bcookie/bscookie, so a claim
+	// about what is "missing" from the stored jar would be false.
+	if strings.Contains(out, "jar is missing") {
+		t.Errorf("warnThinCookieJar described the saved jar rather than the input: %q", out)
 	}
 }
 
