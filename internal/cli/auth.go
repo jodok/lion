@@ -40,11 +40,12 @@ func newAuthLoginCmd() *cobra.Command {
 			"shell history or a process listing, e.g. " +
 			"`pbpaste | lion auth login --cookies-stdin`, or use --cookies-file " +
 			"PATH (a saved Cookie header line, or a Netscape cookies.txt " +
-			"export). --cookies '<value>', --li-at, and --jsessionid (or the " +
-			"interactive prompt) still work for compatibility, but any " +
-			"credential passed directly as a command-line flag is visible in " +
-			"shell history and in the process listing of any other user on the " +
-			"same machine — lion prints a warning when you do this.",
+			"export). With no flags at all, lion prompts for that same Cookie " +
+			"header. --cookies '<value>', --li-at, and --jsessionid still work " +
+			"for compatibility, but any credential passed directly as a " +
+			"command-line flag is visible in shell history and in the process " +
+			"listing of any other user on the same machine — lion prints a " +
+			"warning when you do this.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
 			warnArgvCredentials(liAt, jsession, cookiesFlag)
@@ -53,8 +54,9 @@ func newAuthLoginCmd() *cobra.Command {
 				return err
 			}
 			if cookies["li_at"] == "" || cookies["JSESSIONID"] == "" {
-				return usageErr("both li_at and JSESSIONID cookies are required")
+				return usageErr("%s", missingCookiesMsg(cookies))
 			}
+			warnThinCookieJar(cookies)
 
 			// Validate the session before saving so we never store dead
 			// cookies, going through the same Chrome-impersonating transport
@@ -114,12 +116,15 @@ func warnArgvCredentials(liAt, jsession, cookiesFlag string) {
 
 // resolveLoginCookies builds the cookie map for `auth login` from whichever
 // input source was given, in priority order: --cookies-stdin (or `--cookies
-// -`), --cookies-file, --cookies, then --li-at/--jsessionid (prompting for
-// any still missing unless --no-input is set). Every path funnels through
-// auth.NormalizeCookies so cookie values (notably JSESSIONID's wire
-// quoting) are corrected in one place, matching what auth.Save persists.
+// -`), --cookies-file, --cookies, then --li-at/--jsessionid. With none of
+// those, it prompts for the full Cookie header (unless --no-input is set).
+// Every path funnels through auth.NormalizeCookies so cookie values (notably
+// JSESSIONID's wire quoting) are corrected in one place, matching what
+// auth.Save persists.
 func resolveLoginCookies(cookiesFlag, cookiesFile string, cookiesStdin bool, liAt, jsession string, noInput bool, stdin io.Reader) (map[string]string, error) {
 	var cookies map[string]string
+	// One buffered reader shared by every prompt below; see promptSecret.
+	prompts := bufio.NewReader(stdin)
 	switch {
 	case cookiesStdin, cookiesFlag == "-":
 		b, err := io.ReadAll(stdin)
@@ -136,11 +141,24 @@ func resolveLoginCookies(cookiesFlag, cookiesFile string, cookiesStdin bool, liA
 	case cookiesFlag != "":
 		cookies = parseCookieHeader(cookiesFlag)
 	default:
+		// Nothing on the command line: ask for the whole Cookie header, the
+		// same input --cookies-stdin takes. This prompt used to ask for li_at
+		// and JSESSIONID separately, which quietly steered every interactive
+		// login into the two-cookie compatibility path — a jar that
+		// authenticates /me (so `auth login` reports success) but is rejected
+		// by the GraphQL surface `message list` and `profile search` use, and
+		// that is missing the browser-identity cookies LinkedIn expects to
+		// see alongside a session (DESIGN.md §3.3). --li-at/--jsessionid
+		// still select the old path, prompting for whichever one they omit.
+		if liAt == "" && jsession == "" {
+			cookies = parseCookieHeader(promptSecret(cookieHeaderPrompt, noInput, prompts))
+			break
+		}
 		if liAt == "" {
-			liAt = promptSecret("li_at cookie: ", noInput)
+			liAt = promptSecret("li_at cookie: ", noInput, prompts)
 		}
 		if jsession == "" {
-			jsession = promptSecret("JSESSIONID cookie: ", noInput)
+			jsession = promptSecret("JSESSIONID cookie: ", noInput, prompts)
 		}
 		cookies = map[string]string{}
 		if liAt = strings.TrimSpace(liAt); liAt != "" {
@@ -154,6 +172,69 @@ func resolveLoginCookies(cookiesFlag, cookiesFile string, cookiesStdin bool, liA
 	}
 	auth.NormalizeCookies(cookies)
 	return cookies, nil
+}
+
+// cookieHeaderPrompt is the interactive login prompt. It spells out where
+// the value comes from because "paste your cookies" is the step people get
+// wrong — the header lives in the Network tab's request headers, not in the
+// Application tab's cookie table (whose tab-separated copy output is not the
+// Netscape format --cookies-file reads).
+const cookieHeaderPrompt = "Paste the full Cookie: header for linkedin.com.\n" +
+	"DevTools -> Network -> any linkedin.com request -> Request Headers -> Cookie\n" +
+	"(li_at and JSESSIONID alone are not enough — see `lion auth login --help`)\n\n" +
+	"Cookie: "
+
+// identityCookies are the cookies that identify the browser instance a
+// session belongs to. LinkedIn issues them alongside li_at and expects to
+// keep seeing them: a session presented without them looks like it moved to
+// a different device, which is the shape of a stolen cookie. Requests can
+// still succeed for a while, so their absence is a warning rather than an
+// error — but it is the difference between a login that keeps working and
+// one that dies minutes later.
+var identityCookies = []string{"bcookie", "bscookie"}
+
+// warnThinCookieJar warns on stderr when the jar being saved is missing the
+// browser-identity cookies. It runs after the li_at/JSESSIONID check, so by
+// here the session itself is well-formed and the only thing worth saying is
+// that this jar is thinner than a browser's.
+func warnThinCookieJar(cookies map[string]string) {
+	var missing []string
+	for _, name := range identityCookies {
+		if cookies[name] == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: cookie jar is missing %s — LinkedIn may drop this session shortly "+
+			"after it starts working, and GraphQL endpoints (message list, profile "+
+			"search) can reject it outright. Paste the whole Cookie: header instead: "+
+			"`pbpaste | lion auth login --cookies-stdin`\n",
+		strings.Join(missing, " and "))
+}
+
+// missingCookiesMsg builds the error for login input that didn't yield both
+// required cookies. It reports how many cookies were parsed, because the
+// usual cause is input that is not a Cookie header at all — an empty or
+// overwritten clipboard, a copied terminal line, or DevTools' cookie table
+// rather than the request header. A bare "both are required" leaves the user
+// re-pasting the same wrong thing; a count of 0 says lion never saw a cookie.
+// Only the count is reported, never parsed names or values, so a mistaken
+// paste of unrelated content can't be echoed back to the terminal.
+func missingCookiesMsg(cookies map[string]string) string {
+	var missing []string
+	for _, name := range []string{"li_at", "JSESSIONID"} {
+		if cookies[name] == "" {
+			missing = append(missing, name)
+		}
+	}
+	return fmt.Sprintf("missing required cookie %s (parsed %d cookie(s) from the input). "+
+		"Copy the whole Cookie: header for linkedin.com — DevTools -> Network -> any "+
+		"linkedin.com request -> Request Headers -> Cookie — and pipe it in with "+
+		"`pbpaste | lion auth login --cookies-stdin`",
+		strings.Join(missing, " and "), len(cookies))
 }
 
 // parseCookieHeader parses a `Cookie:` header value (e.g. `li_at=..; ` +
@@ -398,18 +479,29 @@ func newAuthLogoutCmd() *cobra.Command {
 	}
 }
 
-// promptSecret reads a line from stdin. It is intentionally simple (no echo
-// suppression) since cookies are pasted, not typed; NoInput short-circuits.
-func promptSecret(label string, noInput bool) string {
+// promptSecret prints label to stderr and reads one line from r. It is
+// intentionally simple (no echo suppression) since cookies are pasted, not
+// typed; NoInput short-circuits before anything is printed or read.
+//
+// The reader is passed in (rather than read from os.Stdin here) so the
+// caller can share one buffered reader across consecutive prompts. A fresh
+// bufio.Reader per prompt would read ahead past its own line and discard
+// what it buffered, so a second prompt could miss input the user had already
+// typed. It also lets tests drive the prompt.
+//
+// bufio.Reader.ReadString rather than bufio.Scanner: a full Cookie header is
+// a few KB today and Scanner's 64KB line cap would silently truncate rather
+// than error if one ever grew past it.
+func promptSecret(label string, noInput bool, r *bufio.Reader) string {
 	if noInput {
 		return ""
 	}
 	fmt.Fprint(os.Stderr, label)
-	s := bufio.NewScanner(os.Stdin)
-	if s.Scan() {
-		return s.Text()
+	line, err := r.ReadString('\n')
+	if line == "" && err != nil {
+		return ""
 	}
-	return ""
+	return strings.TrimRight(line, "\r\n")
 }
 
 func firstNonEmpty(vals ...string) string {
