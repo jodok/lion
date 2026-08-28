@@ -48,12 +48,37 @@ LinkedHelper and Lemlist).
 
 ```sh
 make build
-# Copy the whole Cookie: header for linkedin.com from a logged-in browser —
-# li_at + JSESSIONID alone are not enough for the GraphQL endpoints.
-./bin/lion auth login --cookies-stdin
-./bin/lion profile view me --json
-./bin/lion profile search "compiler engineer" --max 10 --plain
+# Sign in once, in a real browser window. lion keeps the session in a
+# Chromium profile it owns, so later runs need nothing pasted.
+./bin/lion --browser auth login
+./bin/lion --browser profile view me --json
+./bin/lion --browser profile search "compiler engineer" --max 10 --plain
 ```
+
+### Two transports
+
+`--browser` (recommended) drives a real Chromium that lion owns and issues
+Voyager calls as same-origin `fetch()` from inside a loaded linkedin.com
+page. The TLS handshake, headers, client hints, and origin are Chrome's own,
+because they are Chrome's. Sign-in happens in a visible window — lion never
+types a password or answers a challenge — and every later command runs
+headless, so a periodic `lion --browser sync` works from a timer. Put
+`{"browser": true}` in `$LION_HOME/config.json` (or set `LION_BROWSER=1`) to
+avoid passing the flag each time.
+
+The older cookie transport is still the default: paste the whole `Cookie:`
+header for linkedin.com and lion replays it over a TLS fingerprint borrowed
+from uTLS.
+
+```sh
+./bin/lion auth login --cookies-stdin
+```
+
+Be aware of what it costs. That transport sends a synthesized User-Agent over
+a handshake it does not match, without the header set Chrome actually emits.
+LinkedIn's bot management cross-checks those signals, and a session used this
+way can be **revoked account-wide within minutes** — signing you out of your
+own browser, not merely failing the command. Prefer `--browser`.
 
 Every mutation is previewed with `--dry-run` and requires `--yes` to actually
 send. `--no-input` suppresses prompts but does **not** authorize a write.

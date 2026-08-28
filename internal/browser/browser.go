@@ -1,0 +1,364 @@
+// Package browser runs LinkedIn inside a real Chromium instance that lion
+// owns, and exposes it as a voyager.Transport.
+//
+// Why this exists: lion's other transports synthesize a browser. They send a
+// hand-built User-Agent over a TLS handshake borrowed from uTLS, with none of
+// the client-hint or fetch-metadata headers Chrome actually emits and no
+// header ordering. LinkedIn's bot management cross-checks those signals
+// against each other, and a session used that way is not merely rejected —
+// it is revoked account-wide, logging the person out of their own browser
+// (DESIGN.md §3.3).
+//
+// Driving a real browser removes the mismatch rather than narrowing it: the
+// handshake, the header set, their order, and the origin are Chrome's own,
+// because they are Chrome's. Requests go out as same-origin fetch() calls
+// from inside a loaded linkedin.com page — the same thing the web app does
+// when you click something.
+//
+// The session lives in a persistent Chromium profile per account alias, not
+// in lion's credential store, so an unattended `lion sync` on a timer picks
+// up where the last run left off exactly as a browser would. Nothing is
+// pasted, and there is no cookie snapshot to go stale.
+package browser
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/jodok/lion/internal/config"
+)
+
+// ErrLoggedOut reports that the profile has no usable LinkedIn session: the
+// browser landed on the login wall or a checkpoint instead of the feed. It
+// is distinct from a transport failure because the remedy is different and
+// specific — the person has to sign in themselves, in a window, once.
+var ErrLoggedOut = errors.New("browser profile is not signed in to LinkedIn; run `lion auth login`")
+
+// homeURL is the page every session loads before issuing any API call.
+//
+// Requests are same-origin fetch() calls, so they need a document on
+// linkedin.com to run in — but the choice of document is not merely
+// mechanical. The feed is what a browser loads when a person opens LinkedIn,
+// and its request pattern is the one LinkedIn expects to precede API
+// traffic. Firing API calls from a bare or unrelated document would be a
+// behavioral tell of exactly the kind this package exists to avoid.
+// It is a var rather than a const only so tests can point a session at a
+// local server; nothing outside this package can reach it.
+var homeURL = "https://www.linkedin.com/feed/"
+
+// loginURL is where `auth login` sends the person to sign in themselves.
+const loginURL = "https://www.linkedin.com/login"
+
+// Options configures a browser session.
+type Options struct {
+	// Alias selects the profile directory. Empty means "default".
+	Alias string
+	// Headed shows the browser window. Login always forces this on (a person
+	// cannot sign in to a window they cannot see); ordinary commands default
+	// to headless so they can run from a timer.
+	Headed bool
+	// ChromePath overrides the Chromium binary. Empty means: use the
+	// system's Chrome if one is installed, otherwise fetch a pinned build.
+	ChromePath string
+	// Timeout bounds browser startup and page load.
+	Timeout time.Duration
+}
+
+// defaultTimeout bounds launch plus the initial page load. Generous compared
+// with an HTTP request's budget because it covers process startup and a full
+// page render, both of which are slow on a cold profile.
+const defaultTimeout = 90 * time.Second
+
+// Browser is a running Chromium bound to one profile, with a loaded
+// linkedin.com page to issue requests from. Close it when done.
+type Browser struct {
+	browser *rod.Browser
+	page    *rod.Page
+	cleanup func()
+}
+
+// ProfileDir returns the Chromium user-data directory backing alias.
+//
+// One directory per alias keeps lion's existing multi-account model intact
+// while moving the actual session state into the browser: switching accounts
+// is switching profiles, and `auth logout` is deleting one, which revokes
+// exactly as much as it should and nothing more.
+func ProfileDir(alias string) (string, error) {
+	if alias == "" {
+		alias = "default"
+	}
+	// Aliases reach this from --account and from the credential store, so a
+	// value containing a path separator or traversal would otherwise place a
+	// browser profile — and later delete it — anywhere on disk.
+	if alias != filepath.Base(alias) || alias == "." || alias == ".." {
+		return "", fmt.Errorf("invalid account alias %q", alias)
+	}
+	home, err := config.EnsureHome()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, "profiles", alias)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// Launch starts Chromium against alias's profile and loads LinkedIn.
+//
+// It returns ErrLoggedOut when the profile has no live session, so callers
+// can tell "you need to sign in" apart from "the browser would not start" —
+// the first is routine and actionable, the second is not.
+func Launch(ctx context.Context, opts Options) (*Browser, error) {
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	// The browser outlives this call, so its context must be cancelable but
+	// not deadlined: a timeout here would bound the whole session and kill
+	// Chromium mid-command on any run longer than the startup budget (a
+	// paged sync, a long export). Startup gets the deadline instead, via
+	// startCtx below, and each request carries its own from the caller.
+	ctx, cancel := context.WithCancel(ctx)
+	startCtx, cancelStart := context.WithTimeout(ctx, timeout)
+	defer cancelStart()
+
+	dir, err := ProfileDir(opts.Alias)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	bin, err := resolveChrome(opts.ChromePath)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	l := launcher.New().
+		Bin(bin).
+		UserDataDir(dir).
+		// Chromium refuses to reuse a profile another process holds, which
+		// is what a second concurrent lion command would be. Leakless off
+		// keeps the child from outliving a killed parent on macOS.
+		Leakless(true).
+		Headless(!opts.Headed)
+	if !opts.Headed {
+		// navigator.webdriver and the AutomationControlled blink feature are
+		// the two signals that separate a CDP-driven Chrome from a hand-driven
+		// one in ordinary page script. Neither touches the TLS handshake or
+		// the header set, which is where the previous transport actually gave
+		// itself away, but both are cheap to remove and there is no reason to
+		// leave a tell in place.
+		l = l.Set("disable-blink-features", "AutomationControlled")
+	}
+
+	wsURL, err := l.Context(startCtx).Launch()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("launch chromium: %w", err)
+	}
+
+	br := rod.New().ControlURL(wsURL).Context(ctx)
+	if err := br.Connect(); err != nil {
+		cancel()
+		l.Kill()
+		return nil, fmt.Errorf("connect to chromium: %w", err)
+	}
+
+	b := &Browser{
+		browser: br,
+		cleanup: func() {
+			_ = br.Close()
+			l.Kill()
+			cancel()
+		},
+	}
+
+	page, err := br.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	if err != nil {
+		b.Close()
+		return nil, fmt.Errorf("open page: %w", err)
+	}
+	if !opts.Headed {
+		// Headless Chrome advertises "HeadlessChrome/<version>" in its UA
+		// while presenting headed Chrome's TLS fingerprint — the same
+		// self-contradiction that got the previous transport revoked, just
+		// one layer up. Strip the marker so the two agree.
+		ua, err := page.Eval(`() => navigator.userAgent`)
+		if err == nil {
+			fixed := strings.Replace(ua.Value.Str(), "HeadlessChrome/", "Chrome/", 1)
+			_ = proto.NetworkSetUserAgentOverride{UserAgent: fixed}.Call(page)
+		}
+	}
+	b.page = page
+	return b, nil
+}
+
+// Open loads LinkedIn and reports whether the profile is signed in.
+//
+// Separate from Launch so `auth login` can start a browser that is expected
+// to be logged out and drive the sign-in itself, rather than having Launch
+// fail on the very condition login exists to fix.
+func (b *Browser) Open(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	defer cancel()
+	if err := b.page.Context(ctx).Navigate(homeURL); err != nil {
+		return fmt.Errorf("load linkedin: %w", err)
+	}
+	if err := b.page.Context(ctx).WaitLoad(); err != nil {
+		return fmt.Errorf("load linkedin: %w", err)
+	}
+	if !b.signedIn() {
+		return ErrLoggedOut
+	}
+	return nil
+}
+
+// signedIn reports whether the loaded page is an authenticated one. It reads
+// the URL rather than probing for page elements: LinkedIn redirects an
+// unauthenticated request for the feed to the login wall or a checkpoint,
+// and those destinations are stable in a way that DOM structure is not.
+func (b *Browser) signedIn() bool {
+	u := strings.ToLower(b.page.MustInfo().URL)
+	switch {
+	case strings.Contains(u, "/uas/login"), strings.Contains(u, "/login"):
+		return false
+	case strings.Contains(u, "/authwall"):
+		return false
+	case strings.Contains(u, "/checkpoint/"):
+		return false
+	}
+	return true
+}
+
+// Login drives an interactive sign-in: it opens the login page and waits
+// until LinkedIn lands the person on an authenticated URL.
+//
+// lion deliberately does not type credentials, answer two-factor prompts, or
+// touch a challenge. Those are the person's to complete in the window, which
+// is both the only honest way to handle someone's password and the only way
+// a checkpoint is meant to be satisfied. All this does is hold the browser
+// open until the session exists, then let the profile persist it.
+func (b *Browser) Login(ctx context.Context, poll time.Duration) error {
+	if poll <= 0 {
+		poll = time.Second
+	}
+	if err := b.page.Context(ctx).Navigate(loginURL); err != nil {
+		return fmt.Errorf("open login page: %w", err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(poll):
+		}
+		if b.signedIn() {
+			return nil
+		}
+	}
+}
+
+// Close shuts the browser down and releases the profile lock. Safe to call
+// more than once.
+func (b *Browser) Close() {
+	if b.cleanup != nil {
+		b.cleanup()
+		b.cleanup = nil
+	}
+}
+
+// resolveChrome picks the Chromium binary: an explicit override, then a
+// system Chrome, then a pinned build fetched into rod's cache.
+//
+// Preferring an installed Chrome is not just about saving a download. A
+// stock Chrome is the exact binary whose fingerprint LinkedIn sees from
+// millions of ordinary users, and it stays current on its own; a pinned
+// download drifts out of date the moment Chrome ships a release, which is
+// the failure mode this whole package is replacing. The download is the
+// fallback so that an unattended host with no browser still works.
+func resolveChrome(override string) (string, error) {
+	if override != "" {
+		if _, err := os.Stat(override); err != nil {
+			return "", fmt.Errorf("chrome path %q: %w", override, err)
+		}
+		return override, nil
+	}
+	if path, ok := launcher.LookPath(); ok {
+		return path, nil
+	}
+	path, err := launcher.NewBrowser().Get()
+	if err != nil {
+		return "", fmt.Errorf("no chrome found and download failed: %w", err)
+	}
+	return path, nil
+}
+
+// CSRFToken returns the value Voyager expects in the csrf-token header.
+//
+// LinkedIn derives it from the JSESSIONID cookie with the surrounding quotes
+// stripped, and its own web app reads that cookie from document.cookie to
+// build the header — JSESSIONID is deliberately not httpOnly for exactly
+// this reason. Reading it the same way keeps lion from needing a copy of the
+// session outside the browser profile.
+func (b *Browser) CSRFToken(ctx context.Context) (string, error) {
+	obj, err := b.page.Context(ctx).Eval(`() => {
+		const m = document.cookie.match(/(?:^|;\s*)JSESSIONID=([^;]*)/);
+		return m ? m[1] : '';
+	}`)
+	if err != nil {
+		return "", fmt.Errorf("read csrf token: %w", err)
+	}
+	tok := strings.Trim(obj.Value.Str(), `"`)
+	if tok == "" {
+		return "", ErrLoggedOut
+	}
+	return tok, nil
+}
+
+// DeleteProfile removes alias's browser profile, ending that session.
+//
+// This is what `auth logout` means once the session lives in the browser:
+// the cookies are in the profile, so deleting the directory is what actually
+// revokes local access. Leaving it behind would keep a working, signed-in
+// LinkedIn session on disk after the person asked lion to forget it.
+func DeleteProfile(alias string) error {
+	dir, err := ProfileDir(alias)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
+// ListProfiles returns the aliases that have a browser profile on disk,
+// sorted so `auth status` output is stable rather than filesystem-ordered.
+func ListProfiles() ([]string, error) {
+	home, err := config.EnsureHome()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "profiles"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}

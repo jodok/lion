@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jodok/lion/internal/auth"
+	"github.com/jodok/lion/internal/browser"
 	"github.com/jodok/lion/internal/output"
 	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
@@ -48,6 +49,9 @@ func newAuthLoginCmd() *cobra.Command {
 			"warning when you do this.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
+			if app.Cfg.Browser {
+				return browserLogin(cmd.Context(), app, firstNonEmpty(alias, app.Cfg.Account, "default"))
+			}
 			warnArgvCredentials(liAt, jsession, cookiesFlag)
 			cookies, err := resolveLoginCookies(cookiesFlag, cookiesFile, cookiesStdin, liAt, jsession, app.Cfg.NoInput, cmd.InOrStdin())
 			if err != nil {
@@ -100,6 +104,127 @@ func newAuthLoginCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cookiesFile, "cookies-file", "", "path to a file with a Cookie header line or a Netscape cookies.txt export")
 	cmd.Flags().StringVar(&alias, "alias", "default", "account alias")
 	return cmd
+}
+
+// browserLoginTimeout bounds how long lion holds the sign-in window open.
+// Generous because the person on the other side may have to fetch a phone
+// for a two-factor code or work through a checkpoint.
+const browserLoginTimeout = 10 * time.Minute
+
+// browserLogin signs an account in by opening a real browser window and
+// waiting for the person to authenticate themselves.
+//
+// lion never types the password, answers the two-factor prompt, or touches a
+// challenge. That is the person's to do, in the window — the only honest way
+// to handle someone's credentials, and the only way a checkpoint is meant to
+// be satisfied. lion's part is to own the profile the resulting session lands
+// in, so every later command can use it without anything being pasted.
+//
+// The window is forced visible regardless of --headed: a headless sign-in
+// would hang forever on a form nobody can see.
+func browserLogin(ctx context.Context, app *App, alias string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, browserLoginTimeout)
+	defer cancel()
+
+	b, err := browser.Launch(ctx, browser.Options{
+		Alias:      alias,
+		Headed:     true,
+		ChromePath: app.Cfg.ChromePath,
+	})
+	if err != nil {
+		return err
+	}
+	defer b.Close()
+
+	fmt.Fprintf(os.Stderr, "opening a browser window — sign in to LinkedIn there, including any "+
+		"two-factor or checkpoint step.\nlion is waiting, and will store the session in profile %q.\n", alias)
+
+	if err := b.Login(ctx, time.Second); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("timed out waiting for sign-in after %s", browserLoginTimeout)
+		}
+		return err
+	}
+	dir, err := browser.ProfileDir(alias)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "signed in; session stored in %s\n", dir)
+	return nil
+}
+
+// browserProfileStatus reports whether alias's browser profile still holds a
+// live session, in the vocabulary auth status already uses.
+func browserProfileStatus(ctx context.Context, app *App, alias string) string {
+	b, err := browser.Launch(ctx, browser.Options{
+		Alias:      alias,
+		Headed:     app.Cfg.Headed,
+		ChromePath: app.Cfg.ChromePath,
+	})
+	if err != nil {
+		return "unknown"
+	}
+	defer b.Close()
+	switch err := b.Open(ctx); {
+	case err == nil:
+		return "valid"
+	case errors.Is(err, browser.ErrLoggedOut):
+		return "expired"
+	default:
+		// Reachability problems are not the same as a dead session, and
+		// reporting them as "expired" would send someone to re-authenticate
+		// a session that is fine.
+		return "unknown"
+	}
+}
+
+// browserStatus renders `auth status` for browser profiles: every profile on
+// disk, each probed for a live session, in the same table the cookie path
+// emits so downstream --json consumers see one shape regardless of transport.
+//
+// Probing is serial by necessity rather than choice — each check launches a
+// Chromium against that profile, and Chromium will not open a profile another
+// process already holds.
+func browserStatus(ctx context.Context, app *App) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	aliases, err := browser.ListProfiles()
+	if err != nil {
+		return err
+	}
+	if len(aliases) == 0 {
+		return browser.ErrLoggedOut
+	}
+	fmt.Fprintf(os.Stderr, "validating %d browser profile(s)...\n", len(aliases))
+
+	type row struct {
+		Alias   string `json:"alias"`
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Default bool   `json:"default"`
+	}
+	rows := make([]row, 0, len(aliases))
+	for _, a := range aliases {
+		rows = append(rows, row{Alias: a, Status: browserProfileStatus(ctx, app, a), Default: a == "default"})
+	}
+
+	r := app.Renderer()
+	if app.Cfg.JSON {
+		return r.Emit(rows)
+	}
+	t := &output.Table{Cols: []string{"ALIAS", "NAME", "STATUS", "DEFAULT"}}
+	for _, x := range rows {
+		d := ""
+		if x.Default {
+			d = "*"
+		}
+		t.Rows = append(t.Rows, []string{x.Alias, x.Name, x.Status, d})
+	}
+	return r.Emit(t)
 }
 
 // warnArgvCredentials prints a one-line stderr warning when session
@@ -431,6 +556,9 @@ func newAuthStatusCmd() *cobra.Command {
 		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
+			if app.Cfg.Browser {
+				return browserStatus(cmd.Context(), app)
+			}
 			creds, def, err := auth.List()
 			if err != nil {
 				return err
@@ -479,6 +607,22 @@ func newAuthLogoutCmd() *cobra.Command {
 			alias := app.Cfg.Account
 			if len(args) == 1 {
 				alias = args[0]
+			}
+			// Under --browser the session is the profile directory, so
+			// that is what has to go: leaving it behind would keep a
+			// signed-in LinkedIn session on disk after the person asked
+			// lion to forget the account. Resolved before the credential
+			// store below, which holds nothing for a browser account and
+			// would fail the command with "no such account".
+			if app.Cfg.Browser {
+				if alias == "" {
+					alias = "default"
+				}
+				if err := browser.DeleteProfile(alias); err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "removed browser profile for %q\n", alias)
+				return nil
 			}
 			if alias == "" {
 				// F2: resolve the store's actual recorded default rather
