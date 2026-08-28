@@ -230,11 +230,23 @@ func (c *Client) AllMessages(ctx context.Context, conversationID string, max int
 			added++
 		}
 		if added == 0 || page.NextToken == "" || page.NextToken == token {
-			sortMessagesOldestFirst(msgs)
-			return capNewest(msgs, max), true, nil
+			return finishMessages(msgs, max, true)
 		}
 		token = page.NextToken
 	}
+	return finishMessages(msgs, max, false)
+}
+
+// finishMessages orders a drained conversation and applies the cap.
+//
+// Capping is itself a truncation, so it clears complete: AllConversations
+// already reported false when its cap bit, and messages must match. Without
+// this a --max-messages run that stopped mid-conversation would be recorded
+// as a full sync, stranding everything past the cap as permanently unseen —
+// which is exactly what a caller folds into its complete:false summary to
+// avoid.
+func finishMessages(msgs []Message, max int, drained bool) ([]Message, bool, error) {
 	sortMessagesOldestFirst(msgs)
-	return capNewest(msgs, max), false, nil
+	capped := max > 0 && len(msgs) > max
+	return capNewest(msgs, max), drained && !capped, nil
 }

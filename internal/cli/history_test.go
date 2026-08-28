@@ -251,7 +251,7 @@ func TestHistoryBackfillPartialRunIsHonest(t *testing.T) {
 		on("/me", meJSON).
 		on(routeMessages("c1"), messagesSyncJSON(nil)). // c1 reaches an empty page: backfill_done
 		on(routeMessages("c2"), messagesSyncJSON([][2]any{{"m2", int64(50)}}))
-	rt.failOnCall("/messaging/conversations/c2/events", 0, boom)
+	rt.failOnCall(routeMessages("c2"), 0, boom)
 	cl := newFixtureClient(rt)
 
 	targets, err := resolveBackfillTargets(ctx, st, "")

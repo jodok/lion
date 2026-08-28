@@ -232,3 +232,43 @@ func TestConversationsSyncSendsTokenOnlyWhenSet(t *testing.T) {
 		t.Errorf("second request did not carry the token: %s", st.lastURL)
 	}
 }
+
+// TestAllMessagesCapReportsIncomplete: capping is a truncation, and a
+// --max-messages run recorded as a full sync would strand everything past the
+// cap as permanently unseen. AllConversations already reported false here;
+// messages must match.
+func TestAllMessagesCapReportsIncomplete(t *testing.T) {
+	body := func(token string, ids ...string) string {
+		var els, inc []string
+		for i, id := range ids {
+			urn := "urn:li:msg_message:" + id
+			els = append(els, fmt.Sprintf("%q", urn))
+			inc = append(inc, fmt.Sprintf(`{"$type":"com.linkedin.messenger.Message",
+				"entityUrn":%q,"deliveredAt":%d,"body":{"text":"hi"}}`, urn, 100+i))
+		}
+		return fmt.Sprintf(`{"data":{"data":{"messengerMessagesBySyncToken":{
+			"*elements":[%s],"metadata":{"newSyncToken":%q}}}},"included":[%s]}`,
+			strings.Join(els, ","), token, strings.Join(inc, ","))
+	}
+	c, _ := syncClient(t, body("t1", "m1", "m2", "m3"), body("t2"))
+	msgs, complete, err := c.AllMessages(context.Background(), "2-abc", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want the cap of 2", len(msgs))
+	}
+	if complete {
+		t.Error("complete = true after the cap truncated the walk, want false")
+	}
+
+	// Uncapped, the same stream is complete.
+	c2, _ := syncClient(t, body("t1", "m1", "m2", "m3"), body("t2"))
+	msgs, complete, err = c2.AllMessages(context.Background(), "2-abc", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 || !complete {
+		t.Errorf("uncapped drain = %d messages complete=%v, want 3 and true", len(msgs), complete)
+	}
+}
