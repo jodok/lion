@@ -33,20 +33,28 @@ func newAuthLoginCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Store a LinkedIn session (full browser cookie jar)",
-		Long: "Store the browser session cookies lion uses to call LinkedIn's " +
-			"Voyager API.\n\nGraphQL endpoints (search, modern profile) reject a " +
-			"bare li_at+JSESSIONID pair and want the full linkedin.com cookie " +
-			"jar (bcookie, bscookie, lidc, li_gc, ...) — see DESIGN.md §3.3. " +
-			"Recommended: pipe the Cookie header in on stdin so it never touches " +
-			"shell history or a process listing, e.g. " +
-			"`pbpaste | lion auth login --cookies-stdin`, or use --cookies-file " +
-			"PATH (a saved Cookie header line, or a Netscape cookies.txt " +
-			"export). With no flags at all, lion prompts for that same Cookie " +
-			"header. --cookies '<value>', --li-at, and --jsessionid still work " +
-			"for compatibility, but any credential passed directly as a " +
+		Long: "Store a LinkedIn session.\n\n" +
+			"With --browser (recommended), lion opens a real browser window; you " +
+			"sign in there yourself, including any two-factor or checkpoint step, " +
+			"and lion keeps the session in a Chromium profile it owns. Nothing is " +
+			"pasted, and later commands run headless, so a periodic run works from " +
+			"a timer.\n\n" +
+			"Without --browser, lion stores browser session cookies you supply and " +
+			"replays them over a synthesized TLS fingerprint. LinkedIn cross-checks " +
+			"those signals and can revoke the session account-wide within minutes, " +
+			"signing you out of your own browser — prefer --browser.\n\n" +
+			"Cookie transport: GraphQL endpoints (search, modern profile) reject a " +
+			"bare li_at+JSESSIONID pair and want the full linkedin.com cookie jar " +
+			"(bcookie, bscookie, lidc, li_gc, ...) — see DESIGN.md §3.3. Pipe the " +
+			"Cookie header in on stdin so it never touches shell history or a " +
+			"process listing, e.g. `pbpaste | lion auth login --cookies-stdin`, or " +
+			"use --cookies-file PATH (a saved Cookie header line, or a Netscape " +
+			"cookies.txt export). With no flags at all, lion prompts for that same " +
+			"Cookie header. --cookies '<value>', --li-at, and --jsessionid still " +
+			"work for compatibility, but any credential passed directly as a " +
 			"command-line flag is visible in shell history and in the process " +
-			"listing of any other user on the same machine — lion prints a " +
-			"warning when you do this.",
+			"listing of any other user on the same machine — lion prints a warning " +
+			"when you do this.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
 			if app.Cfg.Browser {
