@@ -56,14 +56,14 @@ func conversationIDFromURN(urn string) string {
 // reliably). max caps the number of returned conversations (0 = server
 // default / no client-side cap).
 func (c *Client) Conversations(ctx context.Context, unreadOnly bool, max int) ([]Conversation, error) {
-	me, err := c.Me(ctx)
+	mailbox, err := c.mailbox(ctx)
 	if err != nil {
 		return nil, err
 	}
 	// The messaging GraphQL query takes no count: it returns the mailbox and
 	// the cap is applied below, as it already was for unreadOnly.
 	body, err := c.getMessagingGraphQL(ctx, queryIDMessengerConversations,
-		"(mailboxUrn:"+mailboxURN(me.URN)+")")
+		"(mailboxUrn:"+mailbox+")")
 	if err != nil {
 		return nil, err
 	}

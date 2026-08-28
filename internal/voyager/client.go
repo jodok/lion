@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/jodok/lion/internal/ratelimit"
 )
@@ -63,6 +64,16 @@ type Client struct {
 	dryRun    bool
 	baseURL   string
 	userAgent string
+
+	// mailboxOnce/mailboxURN memoize the messaging mailbox URN, which is
+	// derived from the member's own id and so cannot change while a Client
+	// lives. Without this every `message list` and `message read` spends a
+	// second Voyager request re-fetching a constant — and the rate limiter
+	// meters reads precisely so a real account does not look automated, so
+	// the extra call costs budget as well as a round trip.
+	mailboxOnce sync.Once
+	mailboxURN  string
+	mailboxErr  error
 }
 
 // Option configures a Client.

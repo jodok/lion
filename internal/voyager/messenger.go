@@ -44,17 +44,37 @@ func (c *Client) getMessagingGraphQL(ctx context.Context, queryID, variables str
 		"queryId="+queryID+"&variables="+variables)
 }
 
-// mailboxURN builds the mailboxUrn variable from the member URN Me returns.
+// mailboxURNFor builds the mailboxUrn variable from the member URN Me
+// returns.
 //
 // Me reports a urn:li:fs_miniProfile:<id> (or bare id) while messaging wants
 // urn:li:fsd_profile:<id>, so this takes the trailing id segment and rebuilds
 // it rather than assuming either spelling.
-func mailboxURN(memberURN string) string {
-	id := memberURN
-	if i := strings.LastIndex(id, ":"); i >= 0 {
-		id = id[i+1:]
+func mailboxURNFor(memberURN string) string {
+	return url.QueryEscape("urn:li:fsd_profile:" + memberID(memberURN))
+}
+
+// memberID takes the trailing id segment off whichever URN spelling Me
+// returned.
+func memberID(memberURN string) string {
+	if i := strings.LastIndex(memberURN, ":"); i >= 0 {
+		return memberURN[i+1:]
 	}
-	return url.QueryEscape("urn:li:fsd_profile:" + id)
+	return memberURN
+}
+
+// mailbox returns the escaped mailboxUrn for this client's account, resolving
+// it through /me at most once per Client (see the memo fields on Client).
+func (c *Client) mailbox(ctx context.Context) (string, error) {
+	c.mailboxOnce.Do(func() {
+		me, err := c.Me(ctx)
+		if err != nil {
+			c.mailboxErr = err
+			return
+		}
+		c.mailboxURN = mailboxURNFor(me.URN)
+	})
+	return c.mailboxURN, c.mailboxErr
 }
 
 // messengerEntity is one entry of the response's included[] index. The
@@ -113,6 +133,9 @@ const (
 // the one `message list` promises.
 func decodeMessengerConversations(body []byte) ([]Conversation, error) {
 	var root struct {
+		Data struct {
+			Data map[string]json.RawMessage `json:"data"`
+		} `json:"data"`
 		Included []messengerEntity `json:"included"`
 	}
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -120,14 +143,32 @@ func decodeMessengerConversations(body []byte) ([]Conversation, error) {
 	}
 
 	byURN := make(map[string]*messengerEntity, len(root.Included))
-	var convs []*messengerEntity
 	for i := range root.Included {
 		e := &root.Included[i]
 		if e.EntityURN != "" {
 			byURN[e.EntityURN] = e
 		}
-		if e.Type == typeConversation {
+	}
+
+	// Membership comes from the collection's *elements, not from sweeping
+	// included[] for anything shaped like a conversation. included[] is the
+	// flat index of every object the response touches — a thread referenced
+	// for context but not part of this result would be indistinguishable from
+	// a real hit, and would show up in `message list` with no way to tell.
+	convs := make([]*messengerEntity, 0, len(root.Included))
+	for _, ref := range collectionElements(root.Data.Data) {
+		if e := byURN[ref]; e != nil && e.Type == typeConversation {
 			convs = append(convs, e)
+		}
+	}
+	if len(convs) == 0 {
+		// Defensive fallback: the collection key is LinkedIn's to rename, and
+		// returning an empty mailbox because the wrapper moved would look
+		// exactly like "you have no conversations".
+		for i := range root.Included {
+			if root.Included[i].Type == typeConversation {
+				convs = append(convs, &root.Included[i])
+			}
 		}
 	}
 
@@ -140,8 +181,11 @@ func decodeMessengerConversations(body []byte) ([]Conversation, error) {
 			// read is a pointer so an absent field is not silently "unread":
 			// LinkedIn omits it on some conversations, and defaulting a
 			// missing flag to unread would light up `message list --unread`
-			// with threads nobody has touched.
-			Unread: e.Read != nil && !*e.Read,
+			// with threads nobody has touched. When it is absent, unreadCount
+			// is the unambiguous signal LinkedIn does still provide — without
+			// this, a thread reporting three unread messages and no read flag
+			// is filtered out of --unread entirely.
+			Unread: unreadFlag(e),
 		}
 		if c.UpdatedAt == 0 {
 			c.UpdatedAt = e.CreatedAt
@@ -217,15 +261,26 @@ func (c *Client) conversationURN(ctx context.Context, conversationID string) (st
 	if strings.HasPrefix(conversationID, "urn:li:msg_conversation:") {
 		return conversationID, nil
 	}
-	me, err := c.Me(ctx)
+	// Anything else that looks like a URN is not a thread segment, and
+	// splicing it in whole would build a nested, malformed conversation URN
+	// that LinkedIn rejects with an opaque error. Pre-migration stores hold
+	// urn:li:fs_conversation:… values (see README), so this is a path people
+	// actually take.
+	if strings.HasPrefix(conversationID, "urn:") {
+		return "", fmt.Errorf("not a conversation URN: %q; pass the thread id "+
+			"(the 2-… segment) or a urn:li:msg_conversation:(…) URN", conversationID)
+	}
+	mailbox, err := c.mailbox(ctx)
 	if err != nil {
 		return "", err
 	}
-	id := me.URN
-	if i := strings.LastIndex(id, ":"); i >= 0 {
-		id = id[i+1:]
+	// mailbox is percent-encoded for use as a query value; the URN is
+	// assembled from the decoded form and escaped once by the caller.
+	decoded, err := url.QueryUnescape(mailbox)
+	if err != nil {
+		return "", err
 	}
-	return "urn:li:msg_conversation:(urn:li:fsd_profile:" + id + "," + conversationID + ")", nil
+	return "urn:li:msg_conversation:(" + decoded + "," + conversationID + ")", nil
 }
 
 // decodeMessengerMessages turns a messengerMessages response into lion's
@@ -280,4 +335,36 @@ func decodeMessengerMessages(body []byte, max int) ([]Message, error) {
 		out = out[len(out)-max:]
 	}
 	return out, nil
+}
+
+// collectionElements finds the *elements reference list in a GraphQL
+// response's data payload.
+//
+// The wrapper key is query-specific (messengerConversationsBySyncToken here),
+// so this looks for whichever member actually carries the list rather than
+// hardcoding a name LinkedIn is free to change with the next queryId.
+func collectionElements(data map[string]json.RawMessage) []string {
+	for _, raw := range data {
+		var probe struct {
+			Elements []string `json:"*elements"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			continue // not an object, e.g. the $type string
+		}
+		if len(probe.Elements) > 0 {
+			return probe.Elements
+		}
+	}
+	return nil
+}
+
+// unreadFlag reports whether a conversation has unread messages, preferring
+// LinkedIn's explicit read flag and falling back to unreadCount when it is
+// absent. Both missing means "read" — the conservative default, since
+// inventing unread threads is the more annoying failure.
+func unreadFlag(e *messengerEntity) bool {
+	if e.Read != nil {
+		return !*e.Read
+	}
+	return e.UnreadCount > 0
 }

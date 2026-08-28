@@ -574,31 +574,3 @@ func ListProfiles() ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
-
-// Navigate points the session's page at a URL and waits for it to load.
-// Used by callers that need a specific LinkedIn page rather than the feed.
-func (b *Browser) Navigate(ctx context.Context, url string) error {
-	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
-	defer cancel()
-	if err := b.page.Context(ctx).Navigate(url); err != nil {
-		return err
-	}
-	return b.page.Context(ctx).WaitLoad()
-}
-
-// ResourceURLs returns every URL the loaded page has fetched, read from the
-// browser's own performance timeline. It is how lion learns what LinkedIn's
-// web app actually calls — queryId hashes rotate with each web-app build, so
-// observing them beats pinning them.
-func (b *Browser) ResourceURLs(ctx context.Context) ([]string, error) {
-	obj, err := b.page.Context(ctx).Eval(
-		`() => performance.getEntriesByType('resource').map(e => e.name)`)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	for _, v := range obj.Value.Arr() {
-		out = append(out, v.Str())
-	}
-	return out, nil
-}
