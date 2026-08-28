@@ -1,0 +1,66 @@
+{
+  "data": {
+    "data": {
+      "searchDashClustersByAll": {
+        "elements": [
+          {
+            "clusterRenderType": "LIST",
+            "results": [],
+            "items": [
+              { "item": { "*entityResult": "urn:li:fsd_entityResultViewModel:(urn:li:activity:111,SEARCH,DEFAULT)" } },
+              { "item": { "*entityResult": "urn:li:fsd_entityResultViewModel:(urn:li:activity:222,SEARCH,DEFAULT)" } }
+            ]
+          }
+        ],
+        "metadata": { "totalResultCount": 2 },
+        "paging": { "start": 0, "count": 10, "total": 2 }
+      }
+    },
+    "errors": [
+      {
+        "message": "The field at path '/searchDashClustersByAll/metadata/entityResultAttributes/templateType' was null",
+        "extensions": { "classification": "NullValueInNonNullableField" }
+      }
+    ]
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.voyager.dash.search.EntityResultViewModel",
+      "entityUrn": "urn:li:fsd_entityResultViewModel:(urn:li:activity:111,SEARCH,DEFAULT)",
+      "trackingUrn": "urn:li:activity:111",
+      "navigationUrl": "https://www.linkedin.com/feed/update/urn:li:activity:111",
+      "actorNavigationUrl": "https://www.linkedin.com/company/acme/",
+      "title": { "text": "Acme Corp" },
+      "primarySubtitle": { "text": "1M followers" },
+      "summary": { "text": "A plain text post with no embedded link." },
+      "entityEmbeddedObject": null
+    },
+    {
+      "$type": "com.linkedin.voyager.dash.search.EntityResultViewModel",
+      "entityUrn": "urn:li:fsd_entityResultViewModel:(urn:li:activity:222,SEARCH,DEFAULT)",
+      "trackingUrn": "urn:li:activity:222",
+      "navigationUrl": "https://www.linkedin.com/feed/update/urn:li:activity:222",
+      "actorNavigationUrl": "https://www.linkedin.com/in/ada-lovelace/",
+      "title": { "text": "Ada Lovelace" },
+      "primarySubtitle": { "text": "Mathematician" },
+      "summary": { "text": "Worth reading." },
+      "entityEmbeddedObject": {
+        "title": { "text": "On the Analytical Engine" },
+        "primarySubtitle": { "text": "example.com • 8 min read" }
+      }
+    },
+    {
+      "$type": "com.linkedin.voyager.dash.search.EntityResultViewModel",
+      "entityUrn": "urn:li:fsd_entityResultViewModel:(urn:li:activity:999,SEARCH,DEFAULT)",
+      "trackingUrn": "urn:li:activity:999",
+      "navigationUrl": "https://www.linkedin.com/feed/update/urn:li:activity:999",
+      "title": { "text": "Referenced But Not Saved" },
+      "summary": { "text": "Present in included[] but absent from items[]." }
+    },
+    {
+      "$type": "com.linkedin.voyager.dash.feed.SaveState",
+      "entityUrn": "urn:li:fsd_saveState:urn:li:activity:111",
+      "saved": true
+    }
+  ]
+}

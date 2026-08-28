@@ -21,6 +21,7 @@ Working today:
 - `lion connection list|invite|remove`
 - `lion message list|read|send`
 - `lion feed read|post|comment|react|engagement`
+- `lion bookmark list` — posts you've saved on LinkedIn
 - `lion doctor` — self-checks: home, transport, browser, store, session
 - `lion schema --json` · `lion version`
 
