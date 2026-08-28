@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"time"
 
 	"github.com/jodok/lion/internal/output"
@@ -358,7 +357,10 @@ const conversationsSyncTokenKey = "sync_token:conversations"
 // it in the store forever.
 func applyDeletedConversations(ctx context.Context, st *store.Store, urns []string, progress *progressReporter) error {
 	for _, urn := range urns {
-		id := conversationIDFromSyncURN(urn)
+		// voyager owns this parse, because it is the same one that derives
+		// Conversation.ID. A second copy here would have to be kept in step
+		// by hand, and a drift would make deletions silently match nothing.
+		id := voyager.ConversationIDFromURN(urn)
 		if id == "" {
 			continue
 		}
@@ -368,20 +370,6 @@ func applyDeletedConversations(ctx context.Context, st *store.Store, urns []stri
 		progress.Event("conversation_deleted", map[string]any{"id": id, "urn": urn})
 	}
 	return nil
-}
-
-// conversationIDFromSyncURN extracts the thread segment from a deleted
-// conversation's URN, matching how Conversation.ID is derived.
-func conversationIDFromSyncURN(urn string) string {
-	open := strings.Index(urn, "(")
-	if open < 0 || !strings.HasSuffix(urn, ")") {
-		return ""
-	}
-	inner := urn[open+1 : len(urn)-1]
-	if i := strings.LastIndex(inner, ","); i >= 0 {
-		return inner[i+1:]
-	}
-	return ""
 }
 
 // discoverConversations drains the mailbox sync stream, upserts every
@@ -456,6 +444,18 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 		}
 	}
 	if len(convs) == 0 {
+		// Still record the resume point. A delta reporting no changes is the
+		// steady state for a periodic sync, and returning here without
+		// advancing would leave the stored token ageing forever until
+		// LinkedIn stops accepting it and the recovery path pays for a full
+		// snapshot of the whole mailbox.
+		if next != "" {
+			if tErr := st.WithTx(ctx, func(tx *store.Tx) error {
+				return tx.SetMeta(ctx, conversationsSyncTokenKey, next)
+			}); tErr != nil {
+				return nil, false, tErr
+			}
+		}
 		return nil, drained, nil
 	}
 	if !drained {
@@ -600,7 +600,19 @@ func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *stor
 	progress.Status("syncing %s: +%d messages", conversationID, added)
 	progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": added, "phase": phase})
 
-	if next != "" {
+	// Advance the resume point only past messages this run actually stored.
+	//
+	// Two ways a run fetches more than it keeps: --max-messages caps via
+	// capNewest, which keeps the newest N of a response and discards the
+	// older ones from that same response, and --after trims below the
+	// cutoff. Moving the token past either means no later run — not even
+	// `history backfill`, which resumes from the same token — ever asks for
+	// them again, and they are gone from the archive for good. Leaving the
+	// old token costs a refetch, which is the right side to err on: an
+	// incremental sync that silently misses messages is worse than a slow
+	// full one.
+	storedEverythingFetched := len(toStore) == len(msgs)
+	if next != "" && drained && storedEverythingFetched {
 		if tErr := st.WithTx(ctx, func(tx *store.Tx) error {
 			return tx.SetMessagesSyncToken(ctx, conversationID, next)
 		}); tErr != nil {

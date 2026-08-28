@@ -959,67 +959,155 @@ func TestSyncFullIgnoresStoredToken(t *testing.T) {
 	}
 }
 
-// TestIncrementalRunDoesNotClaimFullBackfill is the trap worth guarding: a
-// delta drain running out means "nothing changed", not "the whole history is
-// held". Marking BackfillDone on it would tell `history coverage` a
-// conversation was fully archived on the strength of a stream that never
-// replays what came before.
+// TestIncrementalRunDoesNotClaimFullBackfill pins the guard that a
+// resumed-from-token drain running dry means "nothing changed since last
+// time", not "the whole history is held" — a delta never replays what came
+// before, so marking BackfillDone on it would tell `history coverage` a
+// conversation was fully archived on evidence that says no such thing.
 //
-// The fixture has to keep returning c1 on the second pass, or discovery finds
-// nothing, the message drain is never reached, and the test passes without
-// exercising the guard at all — which is exactly how the first version of it
-// failed to catch anything.
+// The state is seeded directly rather than produced by a capped run. Since
+// the token now only advances when a drain both completed and stored
+// everything it fetched, a normal pass can no longer leave a token behind
+// with the history still partial — but a store written by an earlier build,
+// or one whose backfill flag was cleared, still can, and the guard is what
+// protects those.
 func TestIncrementalRunDoesNotClaimFullBackfill(t *testing.T) {
+	ctx := context.Background()
 	st := openSyncTestStore(t)
+	if err := st.WithTx(ctx, func(tx *store.Tx) error {
+		if err := tx.UpsertConversation(ctx, store.Conversation{
+			ID: "c1", URN: "urn:li:msg_conversation:(urn:li:fsd_profile:me,c1)", UpdatedAt: 5000,
+		}, 1); err != nil {
+			return err
+		}
+		// A resume point with the history still incomplete: BackfillDone is
+		// deliberately left false.
+		return tx.SetMessagesSyncToken(ctx, "c1", "stored-token")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	rt := newRouteFixtureTransport().
 		on("/me", meJSON).
 		on(routeConversations,
-			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}), // pass 1 fetch
-			conversationsSyncJSON(nil),                           // pass 1 drain ends
-			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}), // pass 2 fetch
-			conversationsSyncJSON(nil)).                          // pass 2 drain ends
-		on(routeMessages("c1"),
-			// Pass 1 is capped at one message, so it never proves it holds
-			// the whole thread and must not set BackfillDone.
-			messagesSyncJSON([][2]any{{"m3", int64(300)}, {"m2", int64(200)}, {"m1", int64(100)}}),
-			// Pass 2 resumes from the stored token and its delta runs dry.
-			messagesSyncJSON(nil))
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		// The delta runs dry immediately: nothing changed.
+		on(routeMessages("c1"), messagesSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
-	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{maxMessages: 1}, discardProgress(t)); err != nil {
+	if _, err := runSyncPass(ctx, cl, st, syncOptions{}, discardProgress(t)); err != nil {
 		t.Fatal(err)
 	}
-	conv, ok, err := st.Conversation(context.Background(), "c1")
+	// The pass must actually have resumed, or the guard is never reached.
+	if !strings.Contains(rt.lastURLFor(routeMessages("c1")), "syncToken") {
+		t.Fatalf("pass did not resume the message stream: %s", rt.lastURLFor(routeMessages("c1")))
+	}
+	conv, ok, err := st.Conversation(ctx, "c1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
-		t.Fatal("c1 not stored by the first pass")
-	}
-	if conv.BackfillDone {
-		t.Fatal("BackfillDone = true after a capped first pass, want false")
-	}
-	if conv.MessagesSyncToken == "" {
-		t.Fatal("no resume point stored, so the next run cannot be incremental")
-	}
-
-	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
-		t.Fatal(err)
-	}
-	// The second pass must actually have reached the message stream —
-	// otherwise the guard below is never exercised.
-	if got := rt.callCount(routeMessages("c1")); got < 2 {
-		t.Fatalf("messages fetched %d times across two passes, want the second pass to reach the drain", got)
-	}
-	if !strings.Contains(rt.lastURLFor(routeMessages("c1")), "syncToken") {
-		t.Fatalf("second pass did not resume the message stream: %s", rt.lastURLFor(routeMessages("c1")))
-	}
-	conv, _, err = st.Conversation(context.Background(), "c1")
-	if err != nil {
-		t.Fatal(err)
+		t.Fatal("c1 missing from the store")
 	}
 	if conv.BackfillDone {
 		t.Error("BackfillDone = true after an incremental drain ran dry; a delta never replays older history")
+	}
+}
+
+// TestCappedRunDoesNotAdvanceTheResumePoint: a run that fetches more than it
+// keeps must not move the token past what it discarded.
+//
+// --max-messages caps through capNewest, which keeps the newest N of a
+// response and throws away the older ones from that same response. Advancing
+// the token past them would mean no later run — not even `history backfill`,
+// which resumes from the same token — ever asks for them again.
+func TestCappedRunDoesNotAdvanceTheResumePoint(t *testing.T) {
+	ctx := context.Background()
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m3", int64(300)}, {"m2", int64(200)}, {"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(ctx, cl, st, syncOptions{maxMessages: 1}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	conv, _, err := st.Conversation(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conv.MessagesSyncToken != "" {
+		t.Errorf("MessagesSyncToken = %q after a capped run; resuming from it would skip the messages "+
+			"the cap discarded", conv.MessagesSyncToken)
+	}
+}
+
+// TestAfterFilteredRunDoesNotAdvanceTheResumePoint is the same guarantee for
+// --after: messages below the cutoff are fetched and dropped, and a later run
+// without --after must still be able to reach them.
+func TestAfterFilteredRunDoesNotAdvanceTheResumePoint(t *testing.T) {
+	ctx := context.Background()
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(300)}, {"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	after := int64(250)
+	if _, err := runSyncPass(ctx, cl, st, syncOptions{afterMs: &after}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	conv, _, err := st.Conversation(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conv.MessagesSyncToken != "" {
+		t.Errorf("MessagesSyncToken = %q after --after trimmed older messages; resuming from it would "+
+			"skip them permanently", conv.MessagesSyncToken)
+	}
+}
+
+// TestSteadyStateAdvancesTheMailboxToken: once caught up, a delta run
+// legitimately returns no conversations. That is the common case for a
+// periodic sync, and the resume point still has to move — otherwise the
+// stored token ages until LinkedIn rejects it and the recovery path pays for
+// a full snapshot of the whole mailbox.
+func TestSteadyStateAdvancesTheMailboxToken(t *testing.T) {
+	ctx := context.Background()
+	st := openSyncTestStore(t)
+	if err := st.WithTx(ctx, func(tx *store.Tx) error {
+		return tx.SetMeta(ctx, conversationsSyncTokenKey, "old-token")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing changed: no conversations, but the server still offers a token.
+	body := `{"data":{"data":{"messengerConversationsBySyncToken":{"*elements":[],
+		"metadata":{"newSyncToken":"fresh-token","deletedUrns":[],"shouldClearCache":false}}}},
+		"included":[]}`
+	rt := newRouteFixtureTransport().on("/me", meJSON).on(routeConversations, body)
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(ctx, cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	tok, ok, err := st.Meta(ctx, conversationsSyncTokenKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || tok != "fresh-token" {
+		t.Errorf("mailbox token = %q, want it advanced to fresh-token even though nothing changed", tok)
 	}
 }
 

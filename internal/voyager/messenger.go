@@ -225,6 +225,11 @@ func decodeMessengerConversations(body []byte) ([]Conversation, error) {
 	return out, nil
 }
 
+// ConversationIDFromURN is conversationID, exported so callers outside this
+// package match Conversation.ID the same way rather than reimplementing the
+// parse and drifting from it.
+func ConversationIDFromURN(urn string) string { return conversationID(urn) }
+
 // conversationID extracts the thread segment from a messaging URN.
 //
 // The new URNs look like
