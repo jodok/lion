@@ -56,7 +56,8 @@ var ErrLoggedOut = errors.New("browser profile is not signed in to LinkedIn; run
 var homeURL = "https://www.linkedin.com/feed/"
 
 // loginURL is where `auth login` sends the person to sign in themselves.
-const loginURL = "https://www.linkedin.com/login"
+// A var, like homeURL, so tests can point sign-in at a local server.
+var loginURL = "https://www.linkedin.com/login"
 
 // Options configures a browser session.
 type Options struct {
@@ -224,11 +225,48 @@ func (b *Browser) Open(ctx context.Context) error {
 	return nil
 }
 
-// signedIn reports whether the loaded page is an authenticated one. It reads
-// the URL rather than probing for page elements: LinkedIn redirects an
-// unauthenticated request for the feed to the login wall or a checkpoint,
-// and those destinations are stable in a way that DOM structure is not.
+// sessionCookieName is the cookie that *is* a LinkedIn session. Its presence
+// is the only positive, unambiguous evidence that authentication completed.
+const sessionCookieName = "li_at"
+
+// hasSession reports whether the profile holds a LinkedIn session cookie.
+//
+// li_at is httpOnly, so this goes through CDP rather than document.cookie.
+func (b *Browser) hasSession() bool {
+	// Empty list means "cookies for the page we are actually on", which
+	// keeps this correct without hardcoding an origin the tests override.
+	cookies, err := b.page.Cookies(nil)
+	if err != nil {
+		return false
+	}
+	for _, c := range cookies {
+		if c.Name == sessionCookieName && c.Value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// signedIn reports whether this profile has an authenticated LinkedIn
+// session.
+//
+// The load-bearing half is hasSession: a session is the li_at cookie, so
+// asking whether it exists is a positive test that cannot be satisfied by
+// accident. An earlier version asked only whether the current URL looked
+// logged *out* — no /login, /authwall, or /checkpoint/ — which inverted the
+// burden of proof and failed open on everything it had not enumerated.
+// about:blank during an in-flight navigation and LinkedIn's logged-out
+// marketing homepage both passed, so `auth login` reported success the
+// instant the window opened and stored a profile holding nothing but
+// anonymous cookies.
+//
+// The URL check is kept as a second condition rather than replaced, because
+// the two catch different things: a checkpoint is reachable while li_at
+// still exists, and that is a session lion cannot use yet.
 func (b *Browser) signedIn() bool {
+	if !b.hasSession() {
+		return false
+	}
 	u := strings.ToLower(b.page.MustInfo().URL)
 	switch {
 	case strings.Contains(u, "/uas/login"), strings.Contains(u, "/login"):

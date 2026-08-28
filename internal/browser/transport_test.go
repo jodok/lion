@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,9 +17,17 @@ import (
 )
 
 // newTestBrowser launches a real headless Chromium against a throwaway
-// profile, pointed at srv instead of LinkedIn. It skips rather than fails
-// when no Chrome is installed: the transport cannot be exercised without a
-// browser, and a machine without one should not turn a green suite red.
+// profile, pointed at srv instead of LinkedIn, and loads the home page.
+//
+// It deliberately does not call Open: Open also asserts that the profile is
+// signed in, and most of what needs testing here — issuing a request from
+// the page, reading the csrf cookie, recognising a session-less profile —
+// either does not need a session or is specifically about its absence.
+// Tests that want Open's check call it themselves.
+//
+// It skips rather than fails when no Chrome is installed: the transport
+// cannot be exercised without a browser, and a machine without one should
+// not turn a green suite red.
 func newTestBrowser(t *testing.T, srvURL string) *Browser {
 	t.Helper()
 	if _, ok := launcher.LookPath(); !ok {
@@ -38,8 +47,11 @@ func newTestBrowser(t *testing.T, srvURL string) *Browser {
 		t.Fatalf("Launch: %v", err)
 	}
 	t.Cleanup(b.Close)
-	if err := b.Open(ctx); err != nil {
-		t.Fatalf("Open: %v", err)
+	if err := b.page.Context(ctx).Navigate(homeURL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	if err := b.page.Context(ctx).WaitLoad(); err != nil {
+		t.Fatalf("wait load: %v", err)
 	}
 	return b
 }
@@ -239,5 +251,93 @@ func TestListProfilesSortedAndEmpty(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("ListProfiles = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestSignedInRequiresSessionCookie is the regression test for a login that
+// reported success while storing nothing.
+//
+// The original check asked only whether the URL looked logged *out* — not
+// /login, /authwall, or /checkpoint/ — which passes for about:blank during
+// an in-flight navigation and for LinkedIn's logged-out homepage. `auth
+// login` therefore announced "signed in" the moment the window opened, and
+// the profile it saved held only anonymous cookies. A session is the li_at
+// cookie, so that is what gets asserted.
+func TestSignedInRequiresSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	// A perfectly ordinary URL that names none of the logged-out paths, and
+	// sets no session cookie — exactly the shape that used to pass.
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>marketing homepage</body></html>")
+	})
+	mux.HandleFunc("/authed", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if b.signedIn() {
+		t.Error("signedIn() = true on a page with no li_at cookie")
+	}
+
+	if err := b.page.Navigate(srv.URL + "/authed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.page.WaitLoad(); err != nil {
+		t.Fatal(err)
+	}
+	if !b.signedIn() {
+		t.Error("signedIn() = false after li_at was set")
+	}
+}
+
+// TestOpenReportsLoggedOutWithoutSessionCookie covers the same failure from
+// the caller's side: every command routes through Open, and a profile with
+// no session must be reported as logged out rather than used.
+func TestOpenReportsLoggedOutWithoutSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>marketing homepage</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.Open(context.Background()); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("Open() on a session-less profile = %v, want ErrLoggedOut", err)
+	}
+}
+
+// TestLoginWaitsRatherThanFalselySucceeding pins the behaviour that broke:
+// with no sign-in ever completing, Login must keep waiting until its context
+// expires, not return nil.
+func TestLoginWaitsRatherThanFalselySucceeding(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	// Served at a path naming none of the logged-out markers, which is what
+	// made this fail in the wild: LinkedIn moved the window to a URL the old
+	// check had not enumerated, so "not obviously logged out" was read as
+	// "signed in" and login returned success within a second.
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>sign in</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+
+	origLogin := loginURL
+	loginURL = srv.URL + "/signin"
+	defer func() { loginURL = origLogin }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := b.Login(ctx, 200*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Login() with no sign-in = %v, want it to keep waiting until the deadline", err)
 	}
 }
