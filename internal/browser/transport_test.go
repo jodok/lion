@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -531,5 +532,254 @@ func TestSessionSurvivesBrowserRestart(t *testing.T) {
 	}
 	if got := cookieValue(cookies, "li_at"); got != "session-token" {
 		t.Errorf("li_at after restart = %q, want the value from the first run", got)
+	}
+}
+
+// TestPersistentSessionSurvivesRestart covers the path a real sign-in
+// actually takes: LinkedIn issues li_at with an expiry already set, so
+// PersistSession leaves it alone and everything depends on Chromium writing
+// it out. Distinct from TestSessionSurvivesBrowserRestart, which promotes a
+// session-scoped cookie and therefore rewrites it on the way past — a rewrite
+// that could be doing the persisting all by itself and masking this case.
+func TestPersistentSessionSurvivesRestart(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping browser restart test")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		if issue {
+			http.SetCookie(w, &http.Cookie{
+				Name: "li_at", Value: "persistent-token", Path: "/",
+				Expires: time.Now().Add(365 * 24 * time.Hour),
+			})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "persistent"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	promoted, err := first.PersistSession(ctx)
+	if err != nil {
+		first.Close()
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if promoted {
+		first.Close()
+		t.Fatal("PersistSession rewrote an already-persistent cookie; this test must exercise the untouched path")
+	}
+	first.Close()
+
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "persistent"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — an already-persistent li_at did not survive the restart", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "persistent-token" {
+		t.Errorf("li_at after restart = %q, want it carried over", got)
+	}
+}
+
+// TestSessionSurvivesProfileLoss is the guarantee that replaced trusting
+// Chromium to commit its cookie store.
+//
+// A real sign-in showed all twelve cookies live in the browser at close and
+// none of them on disk afterwards, while every local reproduction persisted
+// correctly. Rather than keep chasing Chromium's commit timing, lion exports
+// the jar itself and injects it on the next run — so this deletes the
+// Chromium profile outright between the two browsers. If the session still
+// comes back, nothing about Chromium's flushing behaviour can break it.
+func TestSessionSurvivesProfileLoss(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping session persistence test")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		if issue {
+			http.SetCookie(w, &http.Cookie{
+				Name: "li_at", Value: "the-session", Path: "/", HttpOnly: true,
+				Expires: time.Now().Add(365 * 24 * time.Hour),
+			})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "lost"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	if err := first.SaveSession(ctx, "lost"); err != nil {
+		first.Close()
+		t.Fatalf("SaveSession: %v", err)
+	}
+	first.Close()
+
+	// The exported jar is the session; the file holding it must not be
+	// world- or group-readable.
+	path, err := sessionPath("lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("saved session: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("saved session mode = %04o, want 0600", perm)
+	}
+
+	// Destroy everything Chromium owns. Only lion's export remains.
+	profile, err := ProfileDir("lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "lost"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — the session did not survive losing the profile", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "the-session" {
+		t.Errorf("li_at after profile loss = %q, want it restored from lion's export", got)
+	}
+}
+
+// TestSaveSessionRefusesAnonymousJar keeps a signed-out browser from
+// overwriting a good stored session, which would turn "sign in again" into a
+// session that looks present and never works.
+func TestSaveSessionRefusesAnonymousJar(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "bcookie", Value: "anon", Path: "/"})
+		io.WriteString(w, "<html><body>logged out</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.SaveSession(context.Background(), "anon"); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("SaveSession with no li_at = %v, want ErrLoggedOut", err)
+	}
+	if path, err := sessionPath("anon"); err == nil {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Error("SaveSession wrote a file for a jar with no session in it")
+		}
+	}
+}
+
+// TestRestoreSessionPreservesAttributes checks the cookie comes back the way
+// LinkedIn issued it. Storing only name and value would drop HttpOnly and
+// SameSite, which decide whether the browser sends the cookie at all.
+func TestRestoreSessionPreservesAttributes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name: "li_at", Value: "tok", Path: "/", HttpOnly: true,
+			Expires: time.Now().Add(365 * 24 * time.Hour),
+		})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.SaveSession(context.Background(), "attrs"); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	path, err := sessionPath("attrs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored []storedCookie
+	if err := json.Unmarshal(blob, &stored); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range stored {
+		if c.Name != "li_at" {
+			continue
+		}
+		found = true
+		if !c.HTTPOnly {
+			t.Error("stored li_at lost its HttpOnly flag")
+		}
+		if c.Expires <= 0 {
+			t.Error("stored li_at lost its expiry")
+		}
+		if c.Value != "tok" {
+			t.Errorf("stored li_at value = %q", c.Value)
+		}
+	}
+	if !found {
+		t.Fatal("li_at missing from the exported jar")
+	}
+
+	// DeleteSession is what logout relies on to actually revoke access.
+	if err := DeleteSession("attrs"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Error("DeleteSession left the session file behind")
+	}
+	if err := DeleteSession("attrs"); err != nil {
+		t.Errorf("DeleteSession on an already-deleted session = %v, want nil", err)
 	}
 }

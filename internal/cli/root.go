@@ -145,6 +145,7 @@ func (a *App) browserClient(opts ...voyager.Option) (*voyager.Client, error) {
 			Alias:      a.Cfg.Account,
 			Headed:     a.Cfg.Headed,
 			ChromePath: a.Cfg.ChromePath,
+			Verbose:    a.Cfg.Verbose,
 		})
 		if err != nil {
 			return nil, err

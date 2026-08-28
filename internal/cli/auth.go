@@ -141,6 +141,7 @@ func browserLogin(ctx context.Context, app *App, alias string) error {
 		Alias:      alias,
 		Headed:     true,
 		ChromePath: app.Cfg.ChromePath,
+		Verbose:    app.Cfg.Verbose,
 	})
 	if err != nil {
 		return err
@@ -159,6 +160,7 @@ func browserLogin(ctx context.Context, app *App, alias string) error {
 	// LinkedIn hands out a session-scoped li_at unless "keep me logged in"
 	// applied, and a session cookie lives only in memory — so without this
 	// the profile can come back empty on the very next run.
+	b.DumpCookies("after sign-in")
 	promoted, err := b.PersistSession(ctx)
 	if err != nil {
 		return err
@@ -167,6 +169,11 @@ func browserLogin(ctx context.Context, app *App, alias string) error {
 	if err != nil {
 		return err
 	}
+	// Export the jar ourselves rather than trusting Chromium to commit it.
+	if err := b.SaveSession(ctx, alias); err != nil {
+		return err
+	}
+	b.DumpCookies("before close")
 	if promoted {
 		fmt.Fprintln(os.Stderr, "note: LinkedIn issued a session-scoped login; lion gave it an "+
 			"expiry so it survives the browser closing (the same thing \"keep me logged in\" does)")
@@ -636,6 +643,9 @@ func newAuthLogoutCmd() *cobra.Command {
 			if app.Cfg.Browser {
 				if alias == "" {
 					alias = "default"
+				}
+				if err := browser.DeleteSession(alias); err != nil {
+					return err
 				}
 				if err := browser.DeleteProfile(alias); err != nil {
 					return err

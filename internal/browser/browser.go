@@ -73,6 +73,9 @@ type Options struct {
 	ChromePath string
 	// Timeout bounds browser startup and page load.
 	Timeout time.Duration
+	// Verbose dumps the cookie jar to stderr at each step. Names, domains,
+	// and expiries only — never values.
+	Verbose bool
 }
 
 // defaultTimeout bounds launch plus the initial page load. Generous compared
@@ -86,6 +89,7 @@ type Browser struct {
 	browser *rod.Browser
 	page    *rod.Page
 	cleanup func()
+	verbose bool
 }
 
 // ProfileDir returns the Chromium user-data directory backing alias.
@@ -154,6 +158,10 @@ func Launch(ctx context.Context, opts Options) (*Browser, error) {
 		// keeps the child from outliving a killed parent on macOS.
 		Leakless(true).
 		Headless(!opts.Headed)
+	// rod sets enable-automation unconditionally, which is what turns on
+	// navigator.webdriver and Chrome's "controlled by automated test
+	// software" state. Removing it is squarely the point of this package.
+	l = l.Delete("enable-automation")
 	if !opts.Headed {
 		// navigator.webdriver and the AutomationControlled blink feature are
 		// the two signals that separate a CDP-driven Chrome from a hand-driven
@@ -179,6 +187,7 @@ func Launch(ctx context.Context, opts Options) (*Browser, error) {
 
 	b := &Browser{
 		browser: br,
+		verbose: opts.Verbose,
 		cleanup: func() {
 			// Ask Chromium to shut down and give it time to finish before
 			// resorting to force. This ordering is load-bearing: Chromium
@@ -213,6 +222,13 @@ func Launch(ctx context.Context, opts Options) (*Browser, error) {
 		}
 	}
 	b.page = page
+	// Inject before the caller navigates: cookies have to be in place for
+	// the very first request, which is the one that decides whether LinkedIn
+	// serves the feed or the login wall.
+	if err := b.RestoreSession(ctx, opts.Alias); err != nil {
+		b.Close()
+		return nil, err
+	}
 	return b, nil
 }
 
@@ -230,6 +246,10 @@ func (b *Browser) Open(ctx context.Context) error {
 	if err := b.page.Context(ctx).WaitLoad(); err != nil {
 		return fmt.Errorf("load linkedin: %w", err)
 	}
+	// Dumped before the verdict, so a --verbose run shows what the jar
+	// actually held when the decision was made rather than only that it
+	// went badly.
+	b.DumpCookies("after loading linkedin")
 	if !b.signedIn() {
 		return ErrLoggedOut
 	}
@@ -387,6 +407,35 @@ func (b *Browser) PersistSession(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	return false, ErrLoggedOut
+}
+
+// DumpCookies writes the live jar to stderr under label when Verbose is set.
+// Deliberately names, domains, and expiries only: the values are the session
+// itself, and a diagnostic that prints them turns a support paste into a
+// credential leak.
+func (b *Browser) DumpCookies(label string) {
+	if !b.verbose {
+		return
+	}
+	cookies, err := b.page.Cookies(nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[cookies %s] error: %v\n", label, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[cookies %s] page=%s count=%d\n", label, b.page.MustInfo().URL, len(cookies))
+	names := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		exp := "session"
+		if c.Expires > 0 {
+			exp = time.Unix(int64(c.Expires), 0).UTC().Format(time.RFC3339)
+		}
+		names = append(names, fmt.Sprintf("    %-14s domain=%-22s path=%-4s secure=%v httpOnly=%v sameSite=%-6s expires=%s",
+			c.Name, c.Domain, c.Path, c.Secure, c.HTTPOnly, c.SameSite, exp))
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		fmt.Fprintln(os.Stderr, n)
+	}
 }
 
 // Close shuts the browser down and releases the profile lock. Safe to call
