@@ -369,3 +369,144 @@ func TestResolveLoginCookiesNormalizesJSessionAcrossPaths(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveLoginCookiesInteractivePromptsForHeader covers the interactive
+// path with no flags at all: it must ask for the whole Cookie header and
+// parse it as one, rather than asking for li_at and JSESSIONID separately.
+// The two-cookie prompt authenticated /me — so `auth login` reported success
+// — while producing a jar the GraphQL endpoints reject and LinkedIn drops
+// shortly afterwards.
+func TestResolveLoginCookiesInteractivePromptsForHeader(t *testing.T) {
+	header := "li_at=x; JSESSIONID=\"ajax:2\"; bcookie=\"v=2&b\"; bscookie=\"v=1&bs\"; lidc=y\n"
+	var got map[string]string
+	var err error
+	prompt := captureStderr(t, func() {
+		got, err = resolveLoginCookies("", "", false, "", "", false, strings.NewReader(header))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "Cookie:") {
+		t.Errorf("interactive prompt = %q, want it to ask for the Cookie header", prompt)
+	}
+	want := map[string]string{
+		"li_at": "x", "JSESSIONID": `"ajax:2"`,
+		"bcookie": `"v=2&b"`, "bscookie": `"v=1&bs"`, "lidc": "y",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("interactive resolveLoginCookies = %#v, want %#v", got, want)
+	}
+}
+
+// TestResolveLoginCookiesInteractiveAcceptsCookiePrefix confirms the prompt
+// tolerates the leading "Cookie:" that comes along when the header is copied
+// out of DevTools whole.
+func TestResolveLoginCookiesInteractiveAcceptsCookiePrefix(t *testing.T) {
+	var got map[string]string
+	var err error
+	captureStderr(t, func() {
+		got, err = resolveLoginCookies("", "", false, "", "", false,
+			strings.NewReader("Cookie: li_at=x; JSESSIONID=\"ajax:2\"\n"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"li_at": "x", "JSESSIONID": `"ajax:2"`}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("interactive resolveLoginCookies with Cookie: prefix = %#v, want %#v", got, want)
+	}
+}
+
+// TestResolveLoginCookiesLegacyPromptStillReachable keeps the compatibility
+// path working: --li-at given on its own must still prompt for the one
+// missing value rather than for a whole header.
+func TestResolveLoginCookiesLegacyPromptStillReachable(t *testing.T) {
+	var got map[string]string
+	var err error
+	prompt := captureStderr(t, func() {
+		got, err = resolveLoginCookies("", "", false, "abc", "", false, strings.NewReader("ajax:1\n"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "JSESSIONID cookie:") {
+		t.Errorf("legacy prompt = %q, want the single-value JSESSIONID prompt", prompt)
+	}
+	want := map[string]string{"li_at": "abc", "JSESSIONID": `"ajax:1"`}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("legacy prompt resolveLoginCookies = %#v, want %#v", got, want)
+	}
+}
+
+// TestResolveLoginCookiesNoInputSkipsPrompt confirms --no-input never blocks
+// on the header prompt; the caller then reports the missing cookies.
+func TestResolveLoginCookiesNoInputSkipsPrompt(t *testing.T) {
+	got, err := resolveLoginCookies("", "", false, "", "", true, strings.NewReader("li_at=x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("resolveLoginCookies(--no-input) = %#v, want empty", got)
+	}
+}
+
+// TestWarnThinCookieJar covers the second half of the same failure: a jar
+// carrying only li_at + JSESSIONID is missing the cookies that identify the
+// browser the session belongs to, and must say so.
+func TestWarnThinCookieJar(t *testing.T) {
+	full := map[string]string{
+		"li_at": "x", "JSESSIONID": `"ajax:2"`,
+		"bcookie": "b", "bscookie": "bs",
+	}
+	if out := captureStderr(t, func() { warnThinCookieJar(full) }); out != "" {
+		t.Errorf("warnThinCookieJar(full jar) warned: %q", out)
+	}
+
+	// Assertions match the full rendered clause rather than a bare cookie
+	// name: "bscookie" contains "bcookie", so a substring check on either
+	// name alone passes for a message naming only the other one.
+	thin := map[string]string{"li_at": "x", "JSESSIONID": `"ajax:2"`}
+	out := captureStderr(t, func() { warnThinCookieJar(thin) })
+	for _, want := range []string{"omit bcookie and bscookie,", "--cookies-stdin"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warnThinCookieJar(thin jar) = %q, want it to mention %q", out, want)
+		}
+	}
+
+	partial := map[string]string{"li_at": "x", "JSESSIONID": `"ajax:2"`, "bcookie": "b"}
+	out = captureStderr(t, func() { warnThinCookieJar(partial) })
+	if !strings.Contains(out, "omit bscookie,") {
+		t.Errorf("warnThinCookieJar(partial jar) = %q, want only bscookie named", out)
+	}
+
+	// The message describes the supplied cookies, not the credential that
+	// gets saved: login persists the post-validation jar, into which
+	// LinkedIn has by then injected its own bcookie/bscookie, so a claim
+	// about what is "missing" from the stored jar would be false.
+	if strings.Contains(out, "jar is missing") {
+		t.Errorf("warnThinCookieJar described the saved jar rather than the input: %q", out)
+	}
+}
+
+// TestMissingCookiesMsg checks the error names what is missing and how many
+// cookies were parsed — the signal that separates "my session expired" from
+// "what I pasted wasn't a Cookie header" — without echoing the input back.
+func TestMissingCookiesMsg(t *testing.T) {
+	msg := missingCookiesMsg(map[string]string{})
+	for _, want := range []string{"missing required cookies li_at and JSESSIONID", "parsed 0 cookie(s)", "--cookies-stdin"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missingCookiesMsg(empty) = %q, want it to mention %q", msg, want)
+		}
+	}
+
+	msg = missingCookiesMsg(map[string]string{"li_at": "x", "lidc": "y"})
+	if !strings.Contains(msg, "missing required cookie JSESSIONID") {
+		t.Errorf("missingCookiesMsg(no jsession) = %q", msg)
+	}
+	if !strings.Contains(msg, "parsed 2 cookie(s)") {
+		t.Errorf("missingCookiesMsg did not report the parsed count: %q", msg)
+	}
+	if strings.Contains(msg, "lidc") {
+		t.Errorf("missingCookiesMsg echoed a parsed cookie name: %q", msg)
+	}
+}
