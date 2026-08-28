@@ -1,0 +1,79 @@
+{
+  "data": {
+    "data": {
+      "$type": "com.linkedin.messenger.MessengerConversationsBySyncToken",
+      "messengerConversationsBySyncToken": {
+        "$type": "com.linkedin.messenger.CollectionResponse",
+        "*elements": [
+          "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz)",
+          "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAtestada,2-ZGVmNDU2)"
+        ],
+        "metadata": { "newSyncToken": "sync-token-1" }
+      }
+    }
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.messenger.Conversation",
+      "entityUrn": "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz)",
+      "lastActivityAt": 1753359484773,
+      "createdAt": 1753359000000,
+      "read": false,
+      "unreadCount": 1,
+      "groupChat": false,
+      "*conversationParticipants": [
+        "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAgrace"
+      ],
+      "messages": { "*elements": ["urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m1)"] }
+    },
+    {
+      "$type": "com.linkedin.messenger.Conversation",
+      "entityUrn": "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAtestada,2-ZGVmNDU2)",
+      "lastActivityAt": 1753272000000,
+      "createdAt": 1753200000000,
+      "read": true,
+      "unreadCount": 0,
+      "groupChat": false,
+      "*conversationParticipants": [
+        "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAalan"
+      ],
+      "messages": { "*elements": ["urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-ZGVmNDU2-m1)"] }
+    },
+    {
+      "$type": "com.linkedin.messenger.Message",
+      "entityUrn": "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m1)",
+      "deliveredAt": 1753359484773,
+      "body": { "text": "Are you free for a quick call this week?" }
+    },
+    {
+      "$type": "com.linkedin.messenger.Message",
+      "entityUrn": "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-ZGVmNDU2-m1)",
+      "deliveredAt": 1753272000000,
+      "body": { "text": "Thanks for the introduction." }
+    },
+    {
+      "$type": "com.linkedin.messenger.MessagingParticipant",
+      "entityUrn": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAgrace",
+      "hostIdentityUrn": "urn:li:fsd_profile:ACoAAgrace",
+      "participantType": {
+        "member": {
+          "firstName": { "text": "Grace" },
+          "lastName": { "text": "Hopper" },
+          "headline": { "text": "Rear Admiral" }
+        }
+      }
+    },
+    {
+      "$type": "com.linkedin.messenger.MessagingParticipant",
+      "entityUrn": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAalan",
+      "hostIdentityUrn": "urn:li:fsd_profile:ACoAAalan",
+      "participantType": {
+        "member": {
+          "firstName": { "text": "Alan" },
+          "lastName": { "text": "Turing" },
+          "headline": { "text": "Logician" }
+        }
+      }
+    }
+  ]
+}

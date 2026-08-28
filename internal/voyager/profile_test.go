@@ -20,10 +20,14 @@ type fixtureTransport struct {
 	routes map[string]string
 	// lastReq captures the most recent request for header/URL assertions.
 	lastReq *Request
+	// requested records every request URL in order, for tests that assert on
+	// how many calls a code path makes rather than only on the last one.
+	requested []string
 }
 
 func (f *fixtureTransport) Do(_ context.Context, req *Request) (*Response, error) {
 	f.lastReq = req
+	f.requested = append(f.requested, req.URL)
 	for sub, file := range f.routes {
 		if strings.Contains(req.URL, sub) {
 			b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", file))
