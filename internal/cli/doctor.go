@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/jodok/lion/internal/browser"
@@ -49,6 +48,7 @@ type check struct {
 
 func newDoctorCmd() *cobra.Command {
 	var skipNetwork bool
+	var storePath string
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check that lion's session, browser, and store are working",
@@ -57,7 +57,9 @@ func newDoctorCmd() *cobra.Command {
 			"stored session still authenticates, and the state of the local " +
 			"archive. Read-only with respect to LinkedIn — it never posts, sends, " +
 			"or mutates anything there — so it works under --readonly and never " +
-			"prompts.\n\n" +
+			"prompts. Locally it opens the store to read its schema version, " +
+			"which applies any pending migration, the same one every other " +
+			"command would.\n\n" +
 			"Exits non-zero if any check fails, so a script or timer can gate on " +
 			"it. A warning alone does not fail the command: an empty archive is " +
 			"worth saying, not worth failing over.\n\n" +
@@ -66,7 +68,7 @@ func newDoctorCmd() *cobra.Command {
 		Args: usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
-			checks := runDoctor(cmd.Context(), app, skipNetwork)
+			checks := runDoctor(cmd.Context(), app, storePath, skipNetwork)
 
 			r := app.Renderer()
 			if app.Cfg.JSON {
@@ -94,6 +96,10 @@ func newDoctorCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&skipNetwork, "offline", false, "skip the check that talks to LinkedIn")
+	// Every other store-touching command takes this; without it doctor would
+	// confidently report "no archive yet" at anyone using a non-default
+	// database, which is the one thing a diagnostic must not do.
+	cmd.Flags().StringVar(&storePath, "store", "", "path to the store database (default $LION_HOME/store.db)")
 	return cmd
 }
 
@@ -105,7 +111,7 @@ var errDoctorFailed = errors.New("one or more checks failed")
 // layer first: a broken home directory explains a broken store, which
 // explains an empty archive, and reading them in that order is how someone
 // finds the actual cause rather than the first symptom.
-func runDoctor(ctx context.Context, app *App, skipNetwork bool) []check {
+func runDoctor(ctx context.Context, app *App, storePath string, skipNetwork bool) []check {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -113,7 +119,7 @@ func runDoctor(ctx context.Context, app *App, skipNetwork bool) []check {
 		checkHome(),
 		checkTransport(app),
 		checkBrowserBinary(app),
-		checkStore(ctx, app),
+		checkStore(ctx, storePath),
 	}
 	if skipNetwork {
 		checks = append(checks, check{
@@ -168,11 +174,26 @@ func checkBrowserBinary(app *App) check {
 
 // checkStore reports the archive without creating one. Opening the store
 // would create an empty database as a side effect of a diagnostic, which is
-// the kind of thing a read-only check has no business doing.
-func checkStore(ctx context.Context, app *App) check {
-	path := filepath.Join(config.Home(), "store.db")
+// the kind of thing a check has no business doing — so a missing file is
+// reported by stat, before store.Open is ever reached.
+//
+// It does open an archive that already exists, which runs any pending schema
+// migration. That is deliberate and is what the help text says: reporting the
+// schema version means reading it through the store, and a store lion has
+// opened is a store lion has migrated. It is the same upgrade every other
+// command would apply, and it is additive.
+func checkStore(ctx context.Context, storePath string) check {
+	path := storePath
+	if path == "" {
+		var err error
+		path, err = store.DefaultPath()
+		if err != nil {
+			return check{"store", statusFail, fmt.Sprintf("cannot resolve the store path: %v", err)}
+		}
+	}
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return check{"store", statusWarn, "no archive yet; run `lion sync` to create one"}
+		return check{"store", statusWarn,
+			fmt.Sprintf("no archive at %s yet; run `lion sync` to create one", path)}
 	} else if err != nil {
 		return check{"store", statusFail, fmt.Sprintf("cannot stat %s: %v", path, err)}
 	}

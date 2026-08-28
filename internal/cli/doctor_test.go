@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jodok/lion/internal/config"
+	"github.com/jodok/lion/internal/store"
 )
 
 // statusOf finds one check's verdict by name.
@@ -28,7 +29,7 @@ func TestDoctorReportsAFreshSetup(t *testing.T) {
 	cfg := &config.Config{Browser: true}
 	app := &App{Cfg: cfg}
 
-	checks := runDoctor(context.Background(), app, true)
+	checks := runDoctor(context.Background(), app, "", true)
 
 	if c, ok := statusOf(checks, "home"); !ok || c.Status != statusOK {
 		t.Errorf("home = %+v, want ok", c)
@@ -51,7 +52,7 @@ func TestDoctorDoesNotCreateAStore(t *testing.T) {
 	isolateHome(t)
 	app := &App{Cfg: &config.Config{Browser: true}}
 
-	runDoctor(context.Background(), app, true)
+	runDoctor(context.Background(), app, "", true)
 
 	path := filepath.Join(config.Home(), "store.db")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -66,7 +67,7 @@ func TestDoctorFlagsTheCookieTransport(t *testing.T) {
 	isolateHome(t)
 	app := &App{Cfg: &config.Config{Browser: false}}
 
-	checks := runDoctor(context.Background(), app, true)
+	checks := runDoctor(context.Background(), app, "", true)
 
 	c, ok := statusOf(checks, "transport")
 	if !ok {
@@ -91,7 +92,7 @@ func TestDoctorFailsOnAMissingBrowser(t *testing.T) {
 	isolateHome(t)
 	app := &App{Cfg: &config.Config{Browser: true, ChromePath: filepath.Join(t.TempDir(), "nope")}}
 
-	checks := runDoctor(context.Background(), app, true)
+	checks := runDoctor(context.Background(), app, "", true)
 
 	c, ok := statusOf(checks, "browser")
 	if !ok {
@@ -114,9 +115,49 @@ func TestDoctorExitCodeGatesOnFailures(t *testing.T) {
 	// A fresh home warns (no archive) but nothing fails, once the network
 	// check is skipped — that must still be exit 0.
 	app := &App{Cfg: &config.Config{Browser: true}}
-	for _, c := range runDoctor(context.Background(), app, true) {
+	for _, c := range runDoctor(context.Background(), app, "", true) {
 		if c.Status == statusFail {
 			t.Fatalf("unexpected failure on a fresh home: %+v", c)
 		}
+	}
+}
+
+// TestDoctorHonoursStoreFlag: every other store-touching command takes
+// --store, and a diagnostic that ignores it would tell anyone using a
+// non-default database that they have no archive — confidently, and wrongly.
+func TestDoctorHonoursStoreFlag(t *testing.T) {
+	isolateHome(t)
+	app := &App{Cfg: &config.Config{Browser: true}}
+
+	// A store somewhere other than the default location.
+	custom := filepath.Join(t.TempDir(), "elsewhere.db")
+	st, err := store.Open(custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(context.Background(), func(tx *store.Tx) error {
+		return tx.UpsertConversation(context.Background(),
+			store.Conversation{ID: "c1", URN: "urn:c1", UpdatedAt: 1}, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// Without the flag, doctor looks at the default path and finds nothing.
+	def, _ := statusOf(runDoctor(context.Background(), app, "", true), "store")
+	if def.Status != statusWarn {
+		t.Errorf("default path = %+v, want a warning (nothing there)", def)
+	}
+
+	// With it, it must report the archive that actually exists.
+	got, ok := statusOf(runDoctor(context.Background(), app, custom, true), "store")
+	if !ok {
+		t.Fatal("no store check")
+	}
+	if got.Status != statusOK {
+		t.Errorf("store = %+v, want ok for a populated --store database", got)
+	}
+	if !strings.Contains(got.Detail, "1 conversations") {
+		t.Errorf("store detail = %q, want it to describe the --store database", got.Detail)
 	}
 }
