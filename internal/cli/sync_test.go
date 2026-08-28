@@ -56,6 +56,20 @@ func (r *routeFixtureTransport) Do(_ context.Context, req *voyager.Request) (*vo
 	// argument voyager.Client's own get()/getRawQuery use), so strip it
 	// before matching.
 	path := strings.TrimPrefix(u.Path, "/voyager/api")
+	// Messaging moved onto one GraphQL path, so the path alone no longer
+	// identifies a call: conversations and messages differ only by queryId,
+	// and one conversation's messages from another's only by the
+	// conversationUrn variable. Fold both into the routing key.
+	if qid := u.Query().Get("queryId"); qid != "" {
+		name := qid
+		if i := strings.Index(name, "."); i > 0 {
+			name = name[:i]
+		}
+		path += ":" + name
+		if vars := u.Query().Get("variables"); strings.Contains(vars, "conversationUrn") {
+			path += ":" + conversationIDFromVars(vars)
+		}
+	}
 
 	i := r.calls[path]
 	r.calls[path]++
@@ -124,26 +138,96 @@ func openSyncTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-func conversationsPageJSON(entries [][2]any) string {
-	els := make([]string, 0, len(entries))
-	for _, e := range entries {
-		id, last := e[0].(string), e[1].(int64)
-		els = append(els, fmt.Sprintf(
-			`{"entityUrn":"urn:li:fs_conversation:%s","unread":false,"lastActivityAt":%d,"participants":[{"miniProfile":{"entityUrn":"urn:li:fs_miniProfile:p1"}}],"events":[]}`,
-			id, last))
+// conversationIDFromVars pulls the thread segment out of a conversationUrn
+// variable, so one conversation's message route can be told from another's.
+func conversationIDFromVars(vars string) string {
+	dec, err := url.QueryUnescape(vars)
+	if err != nil {
+		dec = vars
 	}
-	return fmt.Sprintf(`{"data":{"elements":[%s]}}`, strings.Join(els, ","))
+	// Take the conversationUrn value specifically, not "whatever follows the
+	// last comma": once a syncToken is appended the variables read
+	// (conversationUrn:urn:li:msg_conversation:(mailbox,thread),syncToken:…)
+	// and the last comma belongs to the token.
+	const key = "conversationUrn:"
+	i := strings.Index(dec, key)
+	if i < 0 {
+		return ""
+	}
+	rest := dec[i+len(key):]
+	// The URN carries exactly one paren group, so it ends at the first ")".
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		return ""
+	}
+	urn := rest[:end]
+	if j := strings.LastIndex(urn, ","); j >= 0 {
+		return urn[j+1:]
+	}
+	return urn
 }
 
-func messagesPageJSON(entries [][2]any) string {
+const (
+	routeConversations = "/voyagerMessagingGraphQL/graphql:messengerConversations"
+	routeMessagesBase  = "/voyagerMessagingGraphQL/graphql:messengerMessages"
+)
+
+// routeMessages is the routing key for one conversation's message stream.
+func routeMessages(conversationID string) string {
+	return routeMessagesBase + ":" + conversationID
+}
+
+// meJSON is the /me response the client resolves its mailbox URN from. The
+// result is memoized per Client, so one is enough for a whole sync pass.
+const meJSON = `{"data":{"*miniProfile":"urn:li:fs_miniProfile:me"},` +
+	`"included":[{"$type":"com.linkedin.voyager.identity.shared.MiniProfile",` +
+	`"entityUrn":"urn:li:fs_miniProfile:me","firstName":"Test","lastName":"User",` +
+	`"publicIdentifier":"test-user"}]}`
+
+// conversationsSyncJSON builds a conversations response in the messaging
+// sync-token shape: *elements naming the result set, included[] carrying the
+// entities, and the SyncMetadata block the drain reads.
+func conversationsSyncJSON(entries [][2]any) string {
 	els := make([]string, 0, len(entries))
+	inc := make([]string, 0, len(entries))
+	for _, e := range entries {
+		id, last := e[0].(string), e[1].(int64)
+		urn := fmt.Sprintf("urn:li:msg_conversation:(urn:li:fsd_profile:me,%s)", id)
+		els = append(els, fmt.Sprintf("%q", urn))
+		inc = append(inc, fmt.Sprintf(
+			`{"$type":"com.linkedin.messenger.Conversation","entityUrn":%q,`+
+				`"lastActivityAt":%d,"read":true,`+
+				`"*conversationParticipants":["urn:li:msg_messagingParticipant:p1"]}`, urn, last))
+	}
+	inc = append(inc, `{"$type":"com.linkedin.messenger.MessagingParticipant",`+
+		`"entityUrn":"urn:li:msg_messagingParticipant:p1",`+
+		`"hostIdentityUrn":"urn:li:fsd_profile:p1",`+
+		`"participantType":{"member":{"firstName":{"text":"Pat"},"lastName":{"text":"Lee"}}}}`)
+	return fmt.Sprintf(`{"data":{"data":{"messengerConversationsBySyncToken":{`+
+		`"*elements":[%s],"metadata":{"newSyncToken":"tok-%d","deletedUrns":[],`+
+		`"shouldClearCache":true}}}},"included":[%s]}`,
+		strings.Join(els, ","), len(entries), strings.Join(inc, ","))
+}
+
+// messagesSyncJSON builds a messages response in the same sync-token shape.
+func messagesSyncJSON(entries [][2]any) string {
+	els := make([]string, 0, len(entries))
+	inc := make([]string, 0, len(entries))
 	for _, e := range entries {
 		urn, sent := e[0].(string), e[1].(int64)
-		els = append(els, fmt.Sprintf(
-			`{"entityUrn":"%s","createdAt":%d,"from":{"miniProfile":{"entityUrn":"urn:li:fs_miniProfile:p1"}},"eventContent":{"com.linkedin.voyager.messaging.event.MessageEvent":{"body":"hi"}}}`,
-			urn, sent))
+		els = append(els, fmt.Sprintf("%q", urn))
+		inc = append(inc, fmt.Sprintf(
+			`{"$type":"com.linkedin.messenger.Message","entityUrn":%q,"deliveredAt":%d,`+
+				`"body":{"text":"hi"},"*sender":"urn:li:msg_messagingParticipant:p1"}`, urn, sent))
 	}
-	return fmt.Sprintf(`{"data":{"elements":[%s]}}`, strings.Join(els, ","))
+	inc = append(inc, `{"$type":"com.linkedin.messenger.MessagingParticipant",`+
+		`"entityUrn":"urn:li:msg_messagingParticipant:p1",`+
+		`"hostIdentityUrn":"urn:li:fsd_profile:p1",`+
+		`"participantType":{"member":{"firstName":{"text":"Pat"},"lastName":{"text":"Lee"}}}}`)
+	return fmt.Sprintf(`{"data":{"data":{"messengerMessagesBySyncToken":{`+
+		`"*elements":[%s],"metadata":{"newSyncToken":"mtok-%d","deletedUrns":[],`+
+		`"shouldClearCache":true}}}},"included":[%s]}`,
+		strings.Join(els, ","), len(entries), strings.Join(inc, ","))
 }
 
 // TestSyncPopulatesStore is the required "populates the store" test: a
@@ -153,12 +237,13 @@ func messagesPageJSON(entries [][2]any) string {
 func TestSyncPopulatesStore(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
-			messagesPageJSON(nil))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+			messagesSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -195,12 +280,13 @@ func TestSyncSecondRunIsIdempotent(t *testing.T) {
 	st := openSyncTestStore(t)
 	newRT := func() *voyager.Client {
 		rt := newRouteFixtureTransport().
-			on("/messaging/conversations",
-				conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-				conversationsPageJSON(nil)).
-			on("/messaging/conversations/c1/events",
-				messagesPageJSON([][2]any{{"m1", int64(100)}}),
-				messagesPageJSON(nil))
+			on("/me", meJSON).
+			on(routeConversations,
+				conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+				conversationsSyncJSON(nil)).
+			on(routeMessages("c1"),
+				messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+				messagesSyncJSON(nil))
 		return newFixtureClient(rt)
 	}
 
@@ -245,15 +331,16 @@ func TestSyncCatchUpStopsAtKnownMessage(t *testing.T) {
 	// The newest page mixes one genuinely new message (m2) with the
 	// already-known m1 — catch-up must stop after this one page.
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
 			// A second page would only be fetched if catch-up incorrectly
 			// kept paging; make it look like more new history so the test
 			// fails loudly (extra messages_added) rather than silently.
-			messagesPageJSON([][2]any{{"m0", int64(50)}}))
+			messagesSyncJSON([][2]any{{"m0", int64(50)}}))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -263,7 +350,7 @@ func TestSyncCatchUpStopsAtKnownMessage(t *testing.T) {
 	if summary.MessagesAdded != 1 {
 		t.Errorf("messages_added = %d, want 1 (only m2 is new)", summary.MessagesAdded)
 	}
-	if got := rt.callCount("/messaging/conversations/c1/events"); got != 1 {
+	if got := rt.callCount(routeMessages("c1")); got != 1 {
 		t.Errorf("events endpoint called %d times, want 1 (catch-up must stop at the known message)", got)
 	}
 }
@@ -274,15 +361,16 @@ func TestSyncCatchUpStopsAtKnownMessage(t *testing.T) {
 func TestSyncBackfillReachesEndAndSetsFlag(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
 			// Catch-up's first (and only) page...
-			messagesPageJSON([][2]any{{"m2", int64(200)}}),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}}),
 			// ...then backfill continues from OldestSynced=200 downward:
-			messagesPageJSON([][2]any{{"m1", int64(100)}}),
-			messagesPageJSON(nil)) // the terminal empty page
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil)) // the terminal empty page
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{backfill: true}, discardProgress(t))
@@ -317,17 +405,18 @@ func TestSyncMidRunErrorLeavesConsistentStoreAndReportsIncomplete(t *testing.T) 
 	st := openSyncTestStore(t)
 	boom := errors.New("simulated rate limit")
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m1", int64(100)}}),
-			messagesPageJSON(nil)).
-		on("/messaging/conversations/c2/events",
-			messagesPageJSON([][2]any{{"m2", int64(100)}}))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil)).
+		on(routeMessages("c2"),
+			messagesSyncJSON([][2]any{{"m2", int64(100)}}))
 	// c2's very first page fails outright, simulating a rate limit hit
 	// partway through the run (c1 must have already been fully processed).
-	rt.failOnCall("/messaging/conversations/c2/events", 0, boom)
+	rt.failOnCall(routeMessages("c2"), 0, boom)
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -366,9 +455,10 @@ func TestSyncMidRunErrorLeavesConsistentStoreAndReportsIncomplete(t *testing.T) 
 func TestSyncMaxConversationsTruncatesAndReportsIncomplete(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}})).
-		on("/messaging/conversations/c1/events", messagesPageJSON(nil))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}})).
+		on(routeMessages("c1"), messagesSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{maxConversations: 1}, discardProgress(t))
@@ -391,14 +481,15 @@ func TestSyncMaxConversationsTruncatesAndReportsIncomplete(t *testing.T) {
 func TestSyncMaxMessagesTruncatesAndReportsIncomplete(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
 		// The page exactly consumes the --max-messages=2 budget, and (unlike
 		// a genuine "caught up" page) both messages are new, so nothing
 		// signals a stopping point other than the budget itself.
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{maxMessages: 2}, discardProgress(t))
@@ -420,17 +511,18 @@ func TestSyncMaxMessagesTruncatesAndReportsIncomplete(t *testing.T) {
 func TestSyncStalledMessagesCursorReportsIncomplete(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
 			// First page: genuinely new, decreasing cursor (oldest=200).
-			messagesPageJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
+			messagesSyncJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
 			// Second page: also new messages, but its oldest (220) does not
 			// decrease below the createdBefore (200) just sent — the server
 			// ignored the cursor, which is exactly the condition
 			// MessagesPage's ErrPaginationStalled guard exists to catch.
-			messagesPageJSON([][2]any{{"m3", int64(250)}, {"m4", int64(220)}}))
+			messagesSyncJSON([][2]any{{"m3", int64(250)}, {"m4", int64(220)}}))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -460,11 +552,12 @@ func TestSyncPlainRerunAfterInterruptedInitialSyncReportsIncomplete(t *testing.T
 	// Run 1: capped mid-conversation, exactly like a real interrupted or
 	// --max-messages-limited initial sync.
 	rt1 := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
 	first, err := runSyncPass(context.Background(), newFixtureClient(rt1), st, syncOptions{maxMessages: 2}, discardProgress(t))
 	if err != nil {
 		t.Fatalf("first (capped) run: %v", err)
@@ -480,11 +573,12 @@ func TestSyncPlainRerunAfterInterruptedInitialSyncReportsIncomplete(t *testing.T
 	// on the server, so the newest page it fetches is exactly what run 1
 	// already stored — entirely duplicates.
 	rt2 := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
 	second, err := runSyncPass(context.Background(), newFixtureClient(rt2), st, syncOptions{}, discardProgress(t))
 	if err != nil {
 		t.Fatalf("second (plain) run: %v", err)
@@ -495,7 +589,7 @@ func TestSyncPlainRerunAfterInterruptedInitialSyncReportsIncomplete(t *testing.T
 	if second.MessagesAdded != 0 {
 		t.Errorf("second run MessagesAdded = %d, want 0 (the fetched page was entirely duplicates)", second.MessagesAdded)
 	}
-	if got := rt2.callCount("/messaging/conversations/c1/events"); got != 1 {
+	if got := rt2.callCount(routeMessages("c1")); got != 1 {
 		t.Errorf("events endpoint called %d times, want 1 (plain sync must still stop at the duplicate page, not loop)", got)
 	}
 
@@ -518,35 +612,37 @@ func TestSyncBackfillResumesFromOldestSyncedAfterInterruptedInitialSync(t *testi
 	st := openSyncTestStore(t)
 
 	rt1 := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}))
 	if _, err := runSyncPass(context.Background(), newFixtureClient(rt1), st, syncOptions{maxMessages: 2}, discardProgress(t)); err != nil {
 		t.Fatalf("first (capped) run: %v", err)
 	}
 
 	rt2 := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
 			// Call 1 (catch-up, createdBefore=0): the same newest page run 1
 			// already stored — entirely duplicates, so catch-up stops here
 			// (see the plain-rerun test above) without ever calling this
 			// route again itself.
-			messagesPageJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}),
+			messagesSyncJSON([][2]any{{"m4", int64(400)}, {"m3", int64(300)}}),
 			// Call 2 (backfill, resuming from OldestSynced=300): genuinely
 			// older, new-to-the-store messages.
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
 			// Call 3 (backfill continues from 100): the server re-serves the
 			// same page instead of a true empty one — modeling a
 			// conversation whose paging never actually reaches its true
 			// start. MessagesPage's own stalled-cursor guard trips here
 			// (oldest=100 no longer decreases below createdBefore=100),
 			// which is what must end the walk, not a fabricated empty page.
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}))
 	second, err := runSyncPass(context.Background(), newFixtureClient(rt2), st, syncOptions{backfill: true}, discardProgress(t))
 	if err != nil {
 		t.Fatalf("second (backfill) run: %v", err)
@@ -588,19 +684,20 @@ func TestSyncBackfillResumesFromOldestSyncedAfterInterruptedInitialSync(t *testi
 func TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
 			// Call 1 (createdBefore=0, no stall guard active yet): both
 			// messages are genuinely new.
-			messagesPageJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
+			messagesSyncJSON([][2]any{{"m1", int64(300)}, {"m2", int64(200)}}),
 			// Call 2 (createdBefore=200): re-serves m2 alone. m2 is already
 			// stored (from call 1), so this page is entirely duplicates
 			// (pageAdded=0 < len=1) -- AND its oldest (200) does not
 			// decrease below createdBefore (200), which is simultaneously
 			// the exact ErrPaginationStalled condition.
-			messagesPageJSON([][2]any{{"m2", int64(200)}}))
+			messagesSyncJSON([][2]any{{"m2", int64(200)}}))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -613,7 +710,7 @@ func TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp(t *testing.T) {
 	if summary.MessagesAdded != 2 {
 		t.Errorf("MessagesAdded = %d, want 2 (m1 and m2, both added from call 1)", summary.MessagesAdded)
 	}
-	if got := rt.callCount("/messaging/conversations/c1/events"); got != 2 {
+	if got := rt.callCount(routeMessages("c1")); got != 2 {
 		t.Errorf("events endpoint called %d times, want 2 (must stop once the stall is detected, not loop)", got)
 	}
 }
@@ -630,18 +727,19 @@ func TestSyncStalledDuplicatePageIsNotTreatedAsCaughtUp(t *testing.T) {
 func TestSyncAfterFiltersStoredMessagesButPaginationStillAdvances(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
 		// One page straddling the cutoff (--after=150): m2 (200) is at or
 		// after it, m1 (100) is strictly older. A second page would only be
 		// fetched if the straddling page didn't correctly signal "reached
 		// the cutoff" — make it look like more new history so the test
 		// fails loudly (extra messages_added, extra call) rather than
 		// silently if pagination doesn't stop here.
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
-			messagesPageJSON([][2]any{{"m0", int64(50)}}))
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(200)}, {"m1", int64(100)}}),
+			messagesSyncJSON([][2]any{{"m0", int64(50)}}))
 	cl := newFixtureClient(rt)
 
 	afterMs := int64(150)
@@ -652,7 +750,7 @@ func TestSyncAfterFiltersStoredMessagesButPaginationStillAdvances(t *testing.T) 
 	if summary.MessagesAdded != 1 {
 		t.Errorf("MessagesAdded = %d, want 1 (only m2 is at or after --after)", summary.MessagesAdded)
 	}
-	if got := rt.callCount("/messaging/conversations/c1/events"); got != 1 {
+	if got := rt.callCount(routeMessages("c1")); got != 1 {
 		t.Errorf("events endpoint called %d times, want 1 (pagination must stop once the page's oldest message is before --after)", got)
 	}
 
@@ -694,11 +792,12 @@ func TestSyncMaxDBSizeAlreadyAtLimitDoesNotMutate(t *testing.T) {
 	}
 
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events",
-			messagesPageJSON([][2]any{{"m1", int64(100)}}))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(ctx, cl, st, syncOptions{maxDBSizeBytes: limit}, discardProgress(t))
@@ -746,9 +845,10 @@ func TestSyncMaxDBSizeAlreadyAtLimitBlocksDiscovery(t *testing.T) {
 	}
 
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}}),
-			conversationsPageJSON(nil))
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(ctx, cl, st, syncOptions{maxDBSizeBytes: limit}, discardProgress(t))
@@ -835,15 +935,16 @@ func TestParseTimeFlagAcceptsBothForms(t *testing.T) {
 func TestSyncDeduplicatesRepeatedConversationPages(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations",
-			conversationsPageJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}}),
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}, {"c2", int64(4000)}}),
 			// Inclusive boundary: c2 (UpdatedAt == the cursor just sent)
 			// re-served at the head, then a genuinely older c3.
-			conversationsPageJSON([][2]any{{"c2", int64(4000)}, {"c3", int64(3000)}}),
-			conversationsPageJSON(nil)).
-		on("/messaging/conversations/c1/events", messagesPageJSON([][2]any{{"m1", int64(10)}}), messagesPageJSON(nil)).
-		on("/messaging/conversations/c2/events", messagesPageJSON([][2]any{{"m2", int64(20)}}), messagesPageJSON(nil)).
-		on("/messaging/conversations/c3/events", messagesPageJSON([][2]any{{"m3", int64(30)}}), messagesPageJSON(nil))
+			conversationsSyncJSON([][2]any{{"c2", int64(4000)}, {"c3", int64(3000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"), messagesSyncJSON([][2]any{{"m1", int64(10)}}), messagesSyncJSON(nil)).
+		on(routeMessages("c2"), messagesSyncJSON([][2]any{{"m2", int64(20)}}), messagesSyncJSON(nil)).
+		on(routeMessages("c3"), messagesSyncJSON([][2]any{{"m3", int64(30)}}), messagesSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
 	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
@@ -856,7 +957,7 @@ func TestSyncDeduplicatesRepeatedConversationPages(t *testing.T) {
 	// c2 must have been walked exactly once, like c1 and c3: each
 	// conversation fetches one data page plus one terminating empty page.
 	// A duplicate discovery entry would double that to four.
-	if got, want := rt.callCount("/messaging/conversations/c2/events"), rt.callCount("/messaging/conversations/c1/events"); got != want {
+	if got, want := rt.callCount(routeMessages("c2")), rt.callCount(routeMessages("c1")); got != want {
 		t.Errorf("c2 events fetched %d times, c1 %d — c2 was re-walked by a duplicate discovery entry", got, want)
 	}
 }

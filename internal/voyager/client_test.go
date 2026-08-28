@@ -16,9 +16,13 @@ import (
 type sequenceTransport struct {
 	responses []*Response
 	calls     int
+	// lastURL records the most recent request URL, for tests asserting on
+	// how a query was built rather than only on what came back.
+	lastURL string
 }
 
-func (s *sequenceTransport) Do(_ context.Context, _ *Request) (*Response, error) {
+func (s *sequenceTransport) Do(_ context.Context, req *Request) (*Response, error) {
+	s.lastURL = req.URL
 	i := s.calls
 	s.calls++
 	if i < len(s.responses) {

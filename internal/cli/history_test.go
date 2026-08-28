@@ -184,13 +184,14 @@ func TestHistoryBackfillResumesFromStoredCursor(t *testing.T) {
 	}
 
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations/c1/events",
+		on("/me", meJSON).
+		on(routeMessages("c1"),
 			// Backfill must page from createdBefore=200 (the stored
 			// OldestSynced), not from "now" — a fixture with only these two
 			// pages queued would return the wrong/stale page indefinitely
 			// if resumption didn't work, and the test would see 0 added.
-			messagesPageJSON([][2]any{{"m1", int64(100)}}),
-			messagesPageJSON(nil)) // terminal empty page -> BackfillDone
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil)) // terminal empty page -> BackfillDone
 	cl := newFixtureClient(rt)
 
 	targets, err := resolveBackfillTargets(ctx, st, "")
@@ -247,8 +248,9 @@ func TestHistoryBackfillPartialRunIsHonest(t *testing.T) {
 
 	boom := errors.New("simulated rate limit")
 	rt := newRouteFixtureTransport().
-		on("/messaging/conversations/c1/events", messagesPageJSON(nil)). // c1 reaches an empty page: backfill_done
-		on("/messaging/conversations/c2/events", messagesPageJSON([][2]any{{"m2", int64(50)}}))
+		on("/me", meJSON).
+		on(routeMessages("c1"), messagesSyncJSON(nil)). // c1 reaches an empty page: backfill_done
+		on(routeMessages("c2"), messagesSyncJSON([][2]any{{"m2", int64(50)}}))
 	rt.failOnCall("/messaging/conversations/c2/events", 0, boom)
 	cl := newFixtureClient(rt)
 
