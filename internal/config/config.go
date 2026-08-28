@@ -45,6 +45,15 @@ type Config struct {
 
 	// Max caps result counts for list/search commands (0 = command default).
 	Max int
+
+	// Browser routes LinkedIn traffic through a real Chromium instance lion
+	// drives, instead of replaying stored cookies over a synthesized HTTP
+	// client. Opt-in for now; see internal/browser's package doc.
+	Browser bool
+	// Headed shows that browser's window. Sign-in forces it on regardless.
+	Headed bool
+	// ChromePath overrides the Chromium binary the browser transport uses.
+	ChromePath string
 }
 
 // Home returns the lion home directory, honoring LION_HOME then XDG/OS
@@ -104,6 +113,12 @@ type fileConfig struct {
 	// Output selects the default render format: "json", "plain", or "table"
 	// (or empty/omitted for the built-in default).
 	Output string `json:"output,omitempty"`
+	// Browser opts into the browser transport from the config file, so an
+	// unattended `lion sync` on a timer does not need the flag on every
+	// invocation. Pointer so an absent key means "not set" rather than
+	// "explicitly false" (see this struct's doc).
+	Browser    *bool  `json:"browser,omitempty"`
+	ChromePath string `json:"chrome_path,omitempty"`
 }
 
 // loadFile reads and parses a config file. A missing file is not an error —
@@ -161,6 +176,27 @@ func Apply(cfg *Config, flags *pflag.FlagSet) error {
 			cfg.ReadOnly = b
 		} else if fc.ReadOnly != nil {
 			cfg.ReadOnly = *fc.ReadOnly
+		}
+	}
+
+	if !flags.Changed("browser") {
+		// Unlike LION_READONLY this may fail open: the browser transport is
+		// a routing choice, not a safety gate, and a value we cannot parse
+		// should not stop an otherwise valid command.
+		if v, ok := os.LookupEnv("LION_BROWSER"); ok && v != "" {
+			if b, err := parseBoolStrict(v); err == nil {
+				cfg.Browser = b
+			}
+		} else if fc.Browser != nil {
+			cfg.Browser = *fc.Browser
+		}
+	}
+
+	if !flags.Changed("chrome-path") && cfg.ChromePath == "" {
+		if v := os.Getenv("LION_CHROME_PATH"); v != "" {
+			cfg.ChromePath = v
+		} else if fc.ChromePath != "" {
+			cfg.ChromePath = fc.ChromePath
 		}
 	}
 

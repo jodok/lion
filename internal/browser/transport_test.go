@@ -1,0 +1,888 @@
+package browser
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/jodok/lion/internal/voyager"
+)
+
+// newTestBrowser launches a real headless Chromium against a throwaway
+// profile, pointed at srv instead of LinkedIn, and loads the home page.
+//
+// It deliberately does not call Open: Open also asserts that the profile is
+// signed in, and most of what needs testing here — issuing a request from
+// the page, reading the csrf cookie, recognising a session-less profile —
+// either does not need a session or is specifically about its absence.
+// Tests that want Open's check call it themselves.
+//
+// It skips rather than fails when no Chrome is installed: the transport
+// cannot be exercised without a browser, and a machine without one should
+// not turn a green suite red.
+func newTestBrowser(t *testing.T, srvURL string) *Browser {
+	t.Helper()
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping browser transport test")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+
+	orig := homeURL
+	homeURL = srvURL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancel)
+
+	b, err := Launch(ctx, Options{Alias: "test"})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(b.Close)
+	if err := b.page.Context(ctx).Navigate(homeURL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	if err := b.page.Context(ctx).WaitLoad(); err != nil {
+		t.Fatalf("wait load: %v", err)
+	}
+	return b
+}
+
+// TestTransportDoIssuesRequestFromThePage is the core guarantee: a
+// voyager.Request goes out as a same-origin fetch() from the loaded page and
+// comes back as a voyager.Response carrying status, body, headers, and the
+// post-redirect URL.
+func TestTransportDoIssuesRequestFromThePage(t *testing.T) {
+	var gotMethod, gotBody, gotCSRF, gotCookie string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: `"ajax:42"`, Path: "/"})
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	mux.HandleFunc("/api/thing", func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotCSRF = r.Header.Get("Csrf-Token")
+		gotCookie = r.Header.Get("Cookie")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("X-Marker", "seen")
+		w.WriteHeader(201)
+		io.WriteString(w, `{"ok":true}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	tr := b.Transport()
+
+	resp, err := tr.Do(context.Background(), &voyager.Request{
+		Method:  "POST",
+		URL:     srv.URL + "/api/thing",
+		Headers: map[string]string{"Csrf-Token": "ajax:42", "User-Agent": "should-be-dropped"},
+		Body:    []byte(`{"hello":"world"}`),
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	if resp.StatusCode != 201 {
+		t.Errorf("StatusCode = %d, want 201", resp.StatusCode)
+	}
+	if string(resp.Body) != `{"ok":true}` {
+		t.Errorf("Body = %q", resp.Body)
+	}
+	if got := resp.Headers.Get("X-Marker"); got != "seen" {
+		t.Errorf("response header X-Marker = %q, want %q", got, "seen")
+	}
+	if resp.FinalURL != srv.URL+"/api/thing" {
+		t.Errorf("FinalURL = %q", resp.FinalURL)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("server saw method %q", gotMethod)
+	}
+	if gotBody != `{"hello":"world"}` {
+		t.Errorf("server saw body %q", gotBody)
+	}
+	if gotCSRF != "ajax:42" {
+		t.Errorf("server saw Csrf-Token %q", gotCSRF)
+	}
+	// The page's own cookie jar must ride along without lion supplying it —
+	// that is the whole point of issuing the request from inside the page.
+	if !strings.Contains(gotCookie, "JSESSIONID") {
+		t.Errorf("server saw Cookie %q, want the page's JSESSIONID", gotCookie)
+	}
+	// User-Agent is a forbidden fetch header; the browser's own value must
+	// win rather than lion's synthesized one leaking through.
+	if strings.Contains(gotCookie, "should-be-dropped") {
+		t.Errorf("synthesized User-Agent leaked into the request")
+	}
+}
+
+// TestTransportDoReportsRedirectTarget covers what classifyRedirect depends
+// on: a request that gets redirected must report where it actually landed,
+// since that is how an expired session (bounced to the login wall) is
+// detected now that Set-Cookie is invisible to page script.
+func TestTransportDoReportsRedirectTarget(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	mux.HandleFunc("/api/thing", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/uas/login", http.StatusFound)
+	})
+	mux.HandleFunc("/uas/login", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "sign in")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	resp, err := b.Transport().Do(context.Background(), &voyager.Request{
+		Method: "GET", URL: srv.URL + "/api/thing",
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if !strings.HasSuffix(resp.FinalURL, "/uas/login") {
+		t.Errorf("FinalURL = %q, want the redirect target", resp.FinalURL)
+	}
+}
+
+// TestCSRFTokenReadsPageCookie confirms the csrf token is taken from the
+// page's own JSESSIONID, quotes stripped, the way LinkedIn's web app does it.
+func TestCSRFTokenReadsPageCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: `"ajax:99"`, Path: "/"})
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	tok, err := b.CSRFToken(context.Background())
+	if err != nil {
+		t.Fatalf("CSRFToken: %v", err)
+	}
+	if tok != "ajax:99" {
+		t.Errorf("CSRFToken = %q, want %q (quotes stripped)", tok, "ajax:99")
+	}
+}
+
+// TestTransportDoRejectsUnreachableHost checks a network failure surfaces as
+// a Go error rather than a phantom success: fetchJS returns the failure as
+// data, and Do must turn that back into an error.
+func TestTransportDoRejectsUnreachableHost(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	// Port 1 on loopback: nothing listens, and the connection is refused
+	// rather than hanging.
+	if _, err := b.Transport().Do(context.Background(), &voyager.Request{
+		Method: "GET", URL: "http://127.0.0.1:1/nope",
+	}); err == nil {
+		t.Fatal("Do succeeded against an unreachable host, want an error")
+	}
+}
+
+// TestProfileDirRejectsTraversal keeps an alias from placing — and later
+// deleting — a profile outside the lion home directory.
+func TestProfileDirRejectsTraversal(t *testing.T) {
+	t.Setenv("LION_HOME", t.TempDir())
+	for _, bad := range []string{"../escape", "a/b", "..", ".", "/abs"} {
+		if _, err := ProfileDir(bad); err == nil {
+			t.Errorf("ProfileDir(%q) succeeded, want rejection", bad)
+		}
+	}
+	dir, err := ProfileDir("work")
+	if err != nil {
+		t.Fatalf("ProfileDir(work): %v", err)
+	}
+	if filepath.Base(dir) != "work" {
+		t.Errorf("ProfileDir(work) = %q", dir)
+	}
+}
+
+// TestListProfilesSortedAndEmpty covers both shapes auth status depends on.
+func TestListProfilesSortedAndEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("LION_HOME", home)
+
+	got, err := ListProfiles()
+	if err != nil {
+		t.Fatalf("ListProfiles on a fresh home: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListProfiles = %v, want none before any login", got)
+	}
+
+	for _, a := range []string{"work", "default", "alt"} {
+		if _, err := ProfileDir(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A stray file alongside the profile directories must not become an alias.
+	if err := os.WriteFile(filepath.Join(home, "profiles", "notes.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"alt", "default", "work"}
+	if len(got) != len(want) {
+		t.Fatalf("ListProfiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListProfiles = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestSignedInRequiresSessionCookie is the regression test for a login that
+// reported success while storing nothing.
+//
+// The original check asked only whether the URL looked logged *out* — not
+// /login, /authwall, or /checkpoint/ — which passes for about:blank during
+// an in-flight navigation and for LinkedIn's logged-out homepage. `auth
+// login` therefore announced "signed in" the moment the window opened, and
+// the profile it saved held only anonymous cookies. A session is the li_at
+// cookie, so that is what gets asserted.
+func TestSignedInRequiresSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	// A perfectly ordinary URL that names none of the logged-out paths, and
+	// sets no session cookie — exactly the shape that used to pass.
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>marketing homepage</body></html>")
+	})
+	mux.HandleFunc("/authed", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	got, err := b.signedIn()
+	if err != nil {
+		t.Fatalf("signedIn: %v", err)
+	}
+	if got {
+		t.Error("signedIn() = true on a page with no li_at cookie")
+	}
+
+	if err := b.page.Navigate(srv.URL + "/authed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.page.WaitLoad(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = b.signedIn()
+	if err != nil {
+		t.Fatalf("signedIn: %v", err)
+	}
+	if !got {
+		t.Error("signedIn() = false after li_at was set")
+	}
+}
+
+// TestOpenReportsLoggedOutWithoutSessionCookie covers the same failure from
+// the caller's side: every command routes through Open, and a profile with
+// no session must be reported as logged out rather than used.
+func TestOpenReportsLoggedOutWithoutSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>marketing homepage</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.Open(context.Background()); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("Open() on a session-less profile = %v, want ErrLoggedOut", err)
+	}
+}
+
+// TestLoginWaitsRatherThanFalselySucceeding pins the behaviour that broke:
+// with no sign-in ever completing, Login must keep waiting until its context
+// expires, not return nil.
+func TestLoginWaitsRatherThanFalselySucceeding(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	// Served at a path naming none of the logged-out markers, which is what
+	// made this fail in the wild: LinkedIn moved the window to a URL the old
+	// check had not enumerated, so "not obviously logged out" was read as
+	// "signed in" and login returned success within a second.
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>sign in</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+
+	origLogin := loginURL
+	loginURL = srv.URL + "/signin"
+	defer func() { loginURL = origLogin }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := b.Login(ctx, 200*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Login() with no sign-in = %v, want it to keep waiting until the deadline", err)
+	}
+}
+
+// TestPersistSessionPromotesSessionCookie covers the second half of the
+// vanishing-session bug: LinkedIn issues li_at as a session cookie unless
+// "keep me logged in" applied, and Chromium keeps session cookies in memory
+// only, so the profile came back empty on the next run even after a clean
+// shutdown.
+func TestPersistSessionPromotesSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	// No Expires and no Max-Age: a session cookie, exactly as LinkedIn
+	// issues it without "keep me logged in".
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+
+	before, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := cookieExpiry(before, "li_at"); exp > 0 {
+		t.Fatalf("li_at started persistent (expires=%v); the test server should issue a session cookie", exp)
+	}
+
+	promoted, err := b.PersistSession(context.Background())
+	if err != nil {
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if !promoted {
+		t.Error("PersistSession reported no change for a session-scoped li_at")
+	}
+
+	after, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := cookieExpiry(after, "li_at")
+	if exp <= 0 {
+		t.Fatalf("li_at is still a session cookie after PersistSession (expires=%v)", exp)
+	}
+	if got := time.Until(time.Unix(int64(exp), 0)); got < 300*24*time.Hour {
+		t.Errorf("li_at expires in %v, want roughly a year", got)
+	}
+	// The value must survive the rewrite — a promoted cookie that lost its
+	// token would be worse than the bug it fixes.
+	if v := cookieValue(after, "li_at"); v != "session-token" {
+		t.Errorf("li_at value = %q after promotion, want it unchanged", v)
+	}
+}
+
+// TestPersistSessionLeavesPersistentCookieAlone confirms lion does not
+// rewrite an expiry LinkedIn already chose.
+func TestPersistSessionLeavesPersistentCookieAlone(t *testing.T) {
+	want := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "tok", Path: "/", Expires: want})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	promoted, err := b.PersistSession(context.Background())
+	if err != nil {
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if promoted {
+		t.Error("PersistSession rewrote a cookie LinkedIn had already made persistent")
+	}
+	after, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(cookieExpiry(after, "li_at")); got != want.Unix() {
+		t.Errorf("li_at expiry = %d, want %d (unchanged)", got, want.Unix())
+	}
+}
+
+// TestPersistSessionWithoutSessionReportsLoggedOut keeps the promotion step
+// from quietly succeeding on a profile that never signed in.
+func TestPersistSessionWithoutSessionReportsLoggedOut(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if _, err := b.PersistSession(context.Background()); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("PersistSession with no li_at = %v, want ErrLoggedOut", err)
+	}
+}
+
+func cookieExpiry(cookies []*proto.NetworkCookie, name string) proto.TimeSinceEpoch {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c.Expires
+		}
+	}
+	return 0
+}
+
+func cookieValue(cookies []*proto.NetworkCookie, name string) string {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// TestSessionSurvivesBrowserRestart is the end-to-end guarantee the whole
+// package exists for: sign in once, and a later, separate run of lion finds
+// the session still there.
+//
+// It is the test whose absence let two bugs ship. Everything else here
+// exercises one live browser, and both failures were about what reaches
+// disk between browsers — a SIGKILL arriving before Chromium committed its
+// cookie store, and a session-scoped cookie that is never written at all.
+// So this launches a browser, signs in, closes it properly, and launches a
+// second one against the same profile, exactly as two lion invocations do.
+func TestSessionSurvivesBrowserRestart(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping browser restart test")
+	}
+
+	// One LION_HOME for both launches: the profile is the thing under test.
+	home := t.TempDir()
+	t.Setenv("LION_HOME", home)
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		// Only the first launch signs in. The second must find the session
+		// already in the profile rather than being handed a fresh one.
+		if issue {
+			http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	// First run: sign in, promote the cookie, shut down cleanly.
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "restart"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, err := first.PersistSession(ctx); err != nil {
+		first.Close()
+		t.Fatalf("PersistSession: %v", err)
+	}
+	first.Close()
+
+	// Second run: a different browser process, same profile, and the server
+	// no longer hands out a session.
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "restart"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — the session did not survive the restart", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "session-token" {
+		t.Errorf("li_at after restart = %q, want the value from the first run", got)
+	}
+}
+
+// TestPersistentSessionSurvivesRestart covers the path a real sign-in
+// actually takes: LinkedIn issues li_at with an expiry already set, so
+// PersistSession leaves it alone and everything depends on Chromium writing
+// it out. Distinct from TestSessionSurvivesBrowserRestart, which promotes a
+// session-scoped cookie and therefore rewrites it on the way past — a rewrite
+// that could be doing the persisting all by itself and masking this case.
+func TestPersistentSessionSurvivesRestart(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping browser restart test")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		if issue {
+			http.SetCookie(w, &http.Cookie{
+				Name: "li_at", Value: "persistent-token", Path: "/",
+				Expires: time.Now().Add(365 * 24 * time.Hour),
+			})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "persistent"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	promoted, err := first.PersistSession(ctx)
+	if err != nil {
+		first.Close()
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if promoted {
+		first.Close()
+		t.Fatal("PersistSession rewrote an already-persistent cookie; this test must exercise the untouched path")
+	}
+	first.Close()
+
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "persistent"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — an already-persistent li_at did not survive the restart", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "persistent-token" {
+		t.Errorf("li_at after restart = %q, want it carried over", got)
+	}
+}
+
+// TestSessionSurvivesProfileLoss is the guarantee that replaced trusting
+// Chromium to commit its cookie store.
+//
+// A real sign-in showed all twelve cookies live in the browser at close and
+// none of them on disk afterwards, while every local reproduction persisted
+// correctly. Rather than keep chasing Chromium's commit timing, lion exports
+// the jar itself and injects it on the next run — so this deletes the
+// Chromium profile outright between the two browsers. If the session still
+// comes back, nothing about Chromium's flushing behaviour can break it.
+func TestSessionSurvivesProfileLoss(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping session persistence test")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		if issue {
+			http.SetCookie(w, &http.Cookie{
+				Name: "li_at", Value: "the-session", Path: "/", HttpOnly: true,
+				Expires: time.Now().Add(365 * 24 * time.Hour),
+			})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "lost"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	if err := first.SaveSession(ctx, "lost"); err != nil {
+		first.Close()
+		t.Fatalf("SaveSession: %v", err)
+	}
+	first.Close()
+
+	// The exported jar is the session; the file holding it must not be
+	// world- or group-readable.
+	path, err := sessionPath("lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("saved session: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("saved session mode = %04o, want 0600", perm)
+	}
+
+	// Destroy everything Chromium owns. Only lion's export remains.
+	profile, err := ProfileDir("lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "lost"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — the session did not survive losing the profile", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "the-session" {
+		t.Errorf("li_at after profile loss = %q, want it restored from lion's export", got)
+	}
+}
+
+// TestSaveSessionRefusesAnonymousJar keeps a signed-out browser from
+// overwriting a good stored session, which would turn "sign in again" into a
+// session that looks present and never works.
+func TestSaveSessionRefusesAnonymousJar(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "bcookie", Value: "anon", Path: "/"})
+		io.WriteString(w, "<html><body>logged out</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.SaveSession(context.Background(), "anon"); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("SaveSession with no li_at = %v, want ErrLoggedOut", err)
+	}
+	if path, err := sessionPath("anon"); err == nil {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Error("SaveSession wrote a file for a jar with no session in it")
+		}
+	}
+}
+
+// TestRestoreSessionPreservesAttributes checks the cookie comes back the way
+// LinkedIn issued it. Storing only name and value would drop HttpOnly and
+// SameSite, which decide whether the browser sends the cookie at all.
+func TestRestoreSessionPreservesAttributes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name: "li_at", Value: "tok", Path: "/", HttpOnly: true,
+			Expires: time.Now().Add(365 * 24 * time.Hour),
+		})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if err := b.SaveSession(context.Background(), "attrs"); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	path, err := sessionPath("attrs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored []storedCookie
+	if err := json.Unmarshal(blob, &stored); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range stored {
+		if c.Name != "li_at" {
+			continue
+		}
+		found = true
+		if !c.HTTPOnly {
+			t.Error("stored li_at lost its HttpOnly flag")
+		}
+		if c.Expires <= 0 {
+			t.Error("stored li_at lost its expiry")
+		}
+		if c.Value != "tok" {
+			t.Errorf("stored li_at value = %q", c.Value)
+		}
+	}
+	if !found {
+		t.Fatal("li_at missing from the exported jar")
+	}
+
+	// DeleteSession is what logout relies on to actually revoke access.
+	if err := DeleteSession("attrs"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Error("DeleteSession left the session file behind")
+	}
+	if err := DeleteSession("attrs"); err != nil {
+		t.Errorf("DeleteSession on an already-deleted session = %v, want nil", err)
+	}
+}
+
+// TestLoginFailsFastWhenBrowserCloses is the regression test for lion
+// polling in silence for ten minutes after the sign-in window went away.
+// A dead browser answers every probe with an error, which the loop used to
+// read as "not signed in yet".
+func TestLoginFailsFastWhenBrowserCloses(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>sign in</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	origLogin := loginURL
+	loginURL = srv.URL + "/signin"
+	defer func() { loginURL = origLogin }()
+
+	// The person gives up and closes the window.
+	b.Close()
+
+	// A deadline far longer than this should take: the point is that Login
+	// returns because the browser is gone, not because it timed out.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := b.Login(ctx, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("Login returned nil after the browser was closed")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Login waited for the deadline instead of noticing the browser was gone: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("Login took %v to notice a closed browser", elapsed)
+	}
+}
+
+// TestRestoreSessionIgnoresUnreadableFile keeps a corrupt session file from
+// blocking the one command that would replace it. Launch restores before
+// returning, and auth login goes through Launch.
+func TestRestoreSessionIgnoresUnreadableFile(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+	path, err := sessionPath("broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	// Launch must succeed despite the unreadable file, or sign-in is
+	// unreachable and the only remedy is deleting it by hand.
+	b, err := Launch(ctx, Options{Alias: "broken"})
+	if err != nil {
+		t.Fatalf("Launch with an unreadable session file = %v, want it ignored", err)
+	}
+	b.Close()
+}
+
+// TestWaitForExitReportsExit covers the signal the close path branches on:
+// force-killing is skipped when the browser has already gone.
+func TestWaitForExitReportsExit(t *testing.T) {
+	if got := waitForExit(0, time.Second); !got {
+		t.Error("waitForExit(0) = false, want true (nothing to wait for)")
+	}
+	// Our own process is unambiguously alive, so the wait must time out and
+	// report that a kill is still needed.
+	start := time.Now()
+	if got := waitForExit(os.Getpid(), 200*time.Millisecond); got {
+		t.Error("waitForExit on a live process = true, want false")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Errorf("waitForExit returned after %v, want it to wait out the grace period", elapsed)
+	}
+}

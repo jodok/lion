@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jodok/lion/internal/auth"
+	"github.com/jodok/lion/internal/browser"
 	"github.com/jodok/lion/internal/config"
 	"github.com/jodok/lion/internal/output"
 	"github.com/jodok/lion/internal/ratelimit"
@@ -51,6 +52,14 @@ type App struct {
 	// concurrent `auth login` that replaced this alias mid-command doesn't get
 	// the old session's cookies spliced onto its record.
 	clientLiAt string
+
+	// browser is the Chromium session backing --browser, launched lazily on
+	// the first Client() call and shared by every later one in the same
+	// invocation. Starting a browser costs seconds and a profile lock, so
+	// one per command is the most that can be afforded — and the second
+	// launch would fail anyway, since Chromium refuses to open a profile
+	// another process already holds.
+	browser *browser.Browser
 }
 
 type ctxKey struct{}
@@ -87,6 +96,9 @@ func (a *App) Renderer() *output.Renderer {
 // management), and applying dry-run from global flags. It returns
 // ErrAuth-mappable errors.
 func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
+	if a.Cfg.Browser {
+		return a.browserClient(opts...)
+	}
 	cred, err := auth.Get(a.Cfg.Account)
 	if err != nil {
 		return nil, err
@@ -118,6 +130,54 @@ func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 	return cl, nil
 }
 
+// browserClient builds a client whose requests are issued by a real Chromium
+// lion drives, rather than by replaying stored cookies (see internal/browser).
+//
+// There are no cookies to pass: the session lives in the browser profile, and
+// the transport's fetch() runs inside a linkedin.com page that already
+// carries it. The one thing the Client still needs is the csrf-token, which
+// Voyager derives from JSESSIONID — read out of the page the same way
+// LinkedIn's own web app reads it.
+func (a *App) browserClient(opts ...voyager.Option) (*voyager.Client, error) {
+	ctx := context.Background()
+	if a.browser == nil {
+		b, err := browser.Launch(ctx, browser.Options{
+			Alias:      a.Cfg.Account,
+			Headed:     a.Cfg.Headed,
+			ChromePath: a.Cfg.ChromePath,
+			Verbose:    a.Cfg.Verbose,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := b.Open(ctx); err != nil {
+			b.Close()
+			return nil, err
+		}
+		a.browser = b
+	}
+	csrf, err := a.browser.CSRFToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// csrf is passed where a JSESSIONID would go: voyager.New derives the
+	// header by stripping that value's quotes, and this one is already
+	// stripped, so the two agree.
+	base := []voyager.Option{
+		voyager.WithTransport(a.browser.Transport()),
+		voyager.WithDryRun(a.Cfg.DryRun),
+	}
+	return voyager.New("", csrf, append(base, opts...)...), nil
+}
+
+// closeBrowser shuts down the browser this invocation started, if any.
+func (a *App) closeBrowser() {
+	if a.browser != nil {
+		a.browser.Close()
+		a.browser = nil
+	}
+}
+
 // persistRotatedCookies writes back any cookies LinkedIn rotated during this
 // command's run — JSESSIONID, li_at, and lidc rotate continuously, and the
 // Cloudflare __cf_bm cookie expires (DESIGN.md §3.3) — so the next
@@ -132,6 +192,12 @@ func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 // It's reported on stderr only under --verbose, since otherwise it would be
 // noise on every single command that happens to hit it.
 func (a *App) persistRotatedCookies() {
+	// Under --browser the session belongs to the Chromium profile and the
+	// credential store holds nothing for this account. Writing back here
+	// would create a second, diverging copy of a session lion does not own.
+	if a.Cfg.Browser {
+		return
+	}
 	if len(a.clients) == 0 {
 		return
 	}
@@ -225,6 +291,7 @@ func Execute() int {
 	ctx := context.WithValue(context.Background(), ctxKey{}, app)
 
 	err := root.ExecuteContext(ctx)
+	defer app.closeBrowser()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		// A failed command still rotated cookies on its way to failing, and
@@ -309,6 +376,9 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 	pf.IntVar(&cfg.Max, "max", 0, "cap number of results (0 = command default)")
 	pf.StringVar(&cfg.Account, "account", "", "account alias (default: primary)")
 	pf.StringVar(&cfg.ConfigPath, "config", "", "path to config file (default: $LION_HOME/config.json)")
+	pf.BoolVar(&cfg.Browser, "browser", false, "route LinkedIn traffic through a real Chromium lion drives (sign in with: lion auth login --browser)")
+	pf.BoolVar(&cfg.Headed, "headed", false, "show the browser window (--browser only; sign-in always shows it)")
+	pf.StringVar(&cfg.ChromePath, "chrome-path", "", "Chromium binary for --browser (default: system Chrome, else a downloaded build)")
 
 	app := &App{Cfg: cfg}
 
@@ -369,7 +439,12 @@ func exitCode(err error) int {
 		return ExitOK
 	case errors.As(err, new(usageError)), isCobraUsageError(err):
 		return ExitUsage
-	case errors.Is(err, auth.ErrNoAccount), errors.Is(err, voyager.ErrUnauthorized):
+	// browser.ErrLoggedOut is the --browser spelling of the same condition
+	// as ErrUnauthorized: there is no usable session and the fix is to sign
+	// in again. Scripts branching on exit 3 should not have to care which
+	// transport produced it.
+	case errors.Is(err, auth.ErrNoAccount), errors.Is(err, voyager.ErrUnauthorized),
+		errors.Is(err, browser.ErrLoggedOut):
 		return ExitAuth
 	// ErrBudgetLock/ErrBudgetPersist are the limiter refusing to act because it
 	// could not account for the action (lock unavailable, state unwritable).
