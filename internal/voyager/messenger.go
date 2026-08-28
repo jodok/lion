@@ -330,11 +330,23 @@ func decodeMessengerMessages(body []byte, max int) ([]Message, error) {
 		}
 		out = append(out, m)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].SentAt < out[j].SentAt })
-	if max > 0 && len(out) > max {
-		out = out[len(out)-max:]
+	sortMessagesOldestFirst(out)
+	return capNewest(out, max), nil
+}
+
+// sortMessagesOldestFirst orders a conversation the way it reads, which is
+// also the order the retired endpoint produced.
+func sortMessagesOldestFirst(msgs []Message) {
+	sort.SliceStable(msgs, func(i, j int) bool { return msgs[i].SentAt < msgs[j].SentAt })
+}
+
+// capNewest keeps at most max messages, taken from the newest end: asking for
+// twenty messages of a long thread means the last twenty, not the first.
+func capNewest(msgs []Message, max int) []Message {
+	if max > 0 && len(msgs) > max {
+		return msgs[len(msgs)-max:]
 	}
-	return out, nil
+	return msgs
 }
 
 // collectionElements finds the *elements reference list in a GraphQL

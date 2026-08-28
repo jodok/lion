@@ -353,273 +353,178 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 	return summary, nil
 }
 
-// discoverConversations pages newest-to-older through ConversationsPage,
-// upserting each page (one store transaction per page) and collecting the
-// conversations this pass will sync messages for. It stops when
-// --max-conversations is reached, when a page's oldest conversation is
-// already older than --after (pages are newest-first, so nothing further
-// back can pass the filter either), or when there are no more pages.
+// discoverConversations drains the mailbox sync stream, upserts every
+// conversation it yields, and collects the ones this pass will sync messages
+// for. It stops early at --max-conversations or --max-db-size.
 //
-// The returned bool is true only when discovery ran to genuine exhaustion
-// (an empty page, or the --after cutoff) — it is false when
-// --max-conversations cut the walk short or when ConversationsPage reported
-// ErrPaginationStalled, since in both cases older conversations may exist
-// that this pass never saw. That's a truncation, not a failure: the error
-// return stays nil so a caller doesn't turn it into a non-zero exit, but the
-// caller must fold the bool into the pass's complete:false summary field.
+// This replaced a newest-to-older page walk when LinkedIn retired the REST
+// messaging endpoints. The sync-token surface has no cursor — its metadata
+// carries a token, deleted urns, and a clear-cache flag, and nothing else —
+// so there is no createdBefore to advance, no page to re-serve, and so no
+// stalled cursor to detect. voyager.AllConversations drains until a response
+// brings nothing new, which is what makes this correct whether or not
+// LinkedIn chunks a large mailbox — a property that could not be verified
+// directly, since the only account available to test against holds two
+// conversations (see voyager/sync.go).
+//
+// The returned bool is true only when discovery ran to genuine exhaustion —
+// false when --max-conversations cut it short, or when the drain hit its own
+// request limit. Both are truncations, not failures: err stays nil so a
+// caller doesn't turn them into a non-zero exit, but the caller must fold the
+// bool into the pass's complete:false summary field.
 func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.Store, opts syncOptions, progress *progressReporter) ([]voyager.Conversation, bool, error) {
-	var toProcess []voyager.Conversation
-	var createdBefore int64
-	// seen dedups by conversation id. A page can legitimately re-serve a
-	// conversation: a stalled cursor returns the same page twice before the
-	// stall is detected, and an inclusive createdBefore re-serves the boundary
-	// conversation at the head of the next page. Without this, that
-	// conversation would be walked (a rate-limited MessagesPage) twice and
-	// counted twice toward --max-conversations.
-	seen := map[string]bool{}
+	if ctx.Err() != nil {
+		return nil, false, ctx.Err()
+	}
+	if opts.maxDBSizeBytes > 0 {
+		// Checked before anything is fetched, never after it has been
+		// committed — the same ordering rule the message walk follows, so a
+		// store already at the limit is never touched at all.
+		if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
+			return nil, false, sErr
+		} else if reached {
+			return nil, false, errMaxDBSizeReached
+		}
+	}
 
-	for {
-		if ctx.Err() != nil {
-			return toProcess, false, ctx.Err()
-		}
-		if opts.maxDBSizeBytes > 0 {
-			// Same ordering rule as catchUpMessages/backfillMessages: checked
-			// before this page is even fetched, never after it's already been
-			// committed via UpsertConversation. Discovery used to have no
-			// --max-db-size check at all, so a store already at the limit
-			// still got mutated, and kept growing through the whole
-			// discovery walk regardless of the bound.
-			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
-				return toProcess, false, sErr
-			} else if reached {
-				return toProcess, false, errMaxDBSizeReached
-			}
-		}
-		convs, next, err := cl.ConversationsPage(ctx, createdBefore, defaultConversationPageSize)
-		stalled := errors.Is(err, voyager.ErrPaginationStalled)
-		if err != nil && !stalled {
-			return toProcess, false, err
-		}
-		if len(convs) == 0 {
-			return toProcess, true, nil
-		}
+	// Drained without a cap so --max-conversations counts conversations that
+	// actually pass the --after filter, the way the page walk did. The drain
+	// bounds its own request count.
+	convs, drained, err := cl.AllConversations(ctx, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(convs) == 0 {
+		return nil, drained, nil
+	}
+	if !drained {
+		progress.Warn("conversation sync stream did not run out; older conversations may not have been discovered")
+	}
 
-		now := time.Now().UnixMilli()
-		txErr := st.WithTx(ctx, func(tx *store.Tx) error {
-			for _, c := range convs {
-				if c.ID == "" {
-					// conversationIDFromURN couldn't parse this one (an
-					// unexpected URN shape) — nothing to key a row on, so
-					// skip it rather than guess an id (see voyager.Conversation.ID).
-					progress.Warn("skipping a conversation with no parseable id (urn=%q)", c.URN)
-					continue
-				}
-				if err := tx.UpsertConversation(ctx, toStoreConversation(c), now); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if txErr != nil {
-			// SizeBytes() is a pre-check, advisory by nature (it can't predict
-			// a not-yet-fetched page's own footprint), so the hard backstop —
-			// SQLite itself refusing a transaction that would exceed
-			// PRAGMA max_page_count, see store.SetMaxSize — is what actually
-			// guarantees the bound when a single page is bigger than the
-			// pre-check anticipated. translateStoreFull folds that into the
-			// same errMaxDBSizeReached truncation every other --max-db-size
-			// stop already reports.
-			return toProcess, false, translateStoreFull(txErr)
-		}
-
-		oldestInPage := convs[0].UpdatedAt
+	now := time.Now().UnixMilli()
+	txErr := st.WithTx(ctx, func(tx *store.Tx) error {
 		for _, c := range convs {
-			if c.UpdatedAt < oldestInPage {
-				oldestInPage = c.UpdatedAt
-			}
 			if c.ID == "" {
+				// The URN didn't parse into an id (an unexpected shape) —
+				// nothing to key a row on, so skip rather than guess (see
+				// voyager.Conversation.ID).
+				progress.Warn("skipping a conversation with no parseable id (urn=%q)", c.URN)
 				continue
 			}
-			if opts.afterMs != nil && c.UpdatedAt < *opts.afterMs {
-				continue
-			}
-			if seen[c.ID] {
-				continue
-			}
-			seen[c.ID] = true
-			toProcess = append(toProcess, c)
-			progress.Event("conversation_discovered", map[string]any{"id": c.ID, "urn": c.URN})
-			if opts.maxConversations > 0 && len(toProcess) >= opts.maxConversations {
-				progress.Warn("--max-conversations reached; older conversations were not discovered")
-				return toProcess, false, nil
+			if err := tx.UpsertConversation(ctx, toStoreConversation(c), now); err != nil {
+				return err
 			}
 		}
+		return nil
+	})
+	if txErr != nil {
+		// SizeBytes() is advisory (it can't predict a not-yet-fetched
+		// response's footprint), so SQLite refusing a transaction past
+		// PRAGMA max_page_count is the hard backstop. translateStoreFull
+		// folds that into the same errMaxDBSizeReached truncation every other
+		// --max-db-size stop reports.
+		return nil, false, translateStoreFull(txErr)
+	}
 
-		if stalled {
-			progress.Warn("conversations pagination cursor did not advance; older conversations may not have been discovered")
+	var toProcess []voyager.Conversation
+	seen := map[string]bool{}
+	for _, c := range convs {
+		if c.ID == "" || seen[c.ID] {
+			continue
+		}
+		if opts.afterMs != nil && c.UpdatedAt < *opts.afterMs {
+			continue
+		}
+		seen[c.ID] = true
+		toProcess = append(toProcess, c)
+		progress.Event("conversation_discovered", map[string]any{"id": c.ID, "urn": c.URN})
+		if opts.maxConversations > 0 && len(toProcess) >= opts.maxConversations {
+			progress.Warn("--max-conversations reached; older conversations were not discovered")
 			return toProcess, false, nil
 		}
-		if next == 0 {
-			return toProcess, true, nil
-		}
-		if opts.afterMs != nil && oldestInPage < *opts.afterMs {
-			return toProcess, true, nil
-		}
-		createdBefore = next
 	}
+	return toProcess, drained, nil
 }
 
-// catchUpMessages walks a conversation's messages newest-to-older, one page
-// per store transaction, stopping as soon as a fetched page contains a
-// message already in the store (RecordMessagePage's added count comes back
-// short of the page size) — that's the "already caught up" signal, per
-// sync's catch-up contract. It also stops at --after, at a --max-messages
-// budget, or at --max-db-size.
+// drainConversationMessages fetches a conversation's messages through the
+// sync-token stream and stores the ones not already held, honouring --after,
+// a --max-messages budget, and --max-db-size. phase only labels the progress
+// event.
 //
-// The returned bool is true only when the walk reached a genuine stopping
-// point (an empty page, or --after) — it is false when a --max-messages
-// budget ran out before that, when MessagesPage reported
-// ErrPaginationStalled, or when it stopped on an already-known message
-// without the conversation's history having actually reached its true start
-// (see the pageAdded < len(msgs) branch below for why hitting a known
-// message alone isn't proof of that). A caller must fold that into the
-// pass's complete:false summary field; it is not itself a returned error,
-// matching --max-db-size's existing "truncated, not failed" treatment via
-// errMaxDBSizeReached below.
-func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
-	var createdBefore int64
-	for {
-		if ctx.Err() != nil {
-			return added, false, ctx.Err()
+// The page walk this replaced went with the REST endpoints. The sync-token
+// surface returns a conversation's history without a cursor, so there is no
+// createdBefore to advance, no short page to read as "caught up", and no
+// stalled cursor to guard against. Re-storing a message already held is a
+// no-op, which is what the old duplicate-page detection was approximating.
+//
+// complete is true only when the drain genuinely ran out — false when the
+// budget, --max-db-size, or the drain's own request limit stopped it short,
+// since older messages may then exist that this pass never saw.
+func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conversationID string, opts syncOptions, budget *int, progress *progressReporter, phase string) (added int, complete bool, err error) {
+	if ctx.Err() != nil {
+		return 0, false, ctx.Err()
+	}
+	if budget != nil && *budget <= 0 {
+		return 0, false, nil
+	}
+	if opts.maxDBSizeBytes > 0 {
+		// Before fetching, never after committing: a store already at
+		// --max-db-size must not be touched.
+		if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
+			return 0, false, sErr
+		} else if reached {
+			return 0, false, errMaxDBSizeReached
 		}
-		if budget != nil && *budget <= 0 {
-			return added, false, nil
-		}
-		if opts.maxDBSizeBytes > 0 {
-			// Checked before this page is even fetched, never after it's
-			// already committed — the defect this guards against was
-			// exactly that ordering: a store already at --max-db-size kept
-			// growing because the check only ran once a page had already
-			// landed. SizeBytes() only reflects what's actually durable on
-			// disk, so this can't predict a not-yet-fetched page's own
-			// footprint in advance and stop that specific page from
-			// landing — but nothing further is ever attempted once the
-			// bound is reached, and a store already at the limit is never
-			// touched at all.
-			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
-				return added, false, sErr
-			} else if reached {
-				return added, false, errMaxDBSizeReached
-			}
-		}
-		pageSize := defaultMessagePageSize
-		if budget != nil && *budget < pageSize {
-			pageSize = *budget
-		}
+	}
 
-		msgs, next, err := cl.MessagesPage(ctx, conv.ID, createdBefore, pageSize)
-		stalled := errors.Is(err, voyager.ErrPaginationStalled)
-		if err != nil && !stalled {
+	limit := 0
+	if budget != nil {
+		limit = *budget
+	}
+	msgs, drained, err := cl.AllMessages(ctx, conversationID, limit)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// toStore is what gets persisted; the completeness decision below reads
+	// drained — the drain's own verdict — never the filtered set, so an
+	// --after-trimmed result is not mistaken for a short history.
+	toStore := msgs
+	if opts.afterMs != nil {
+		toStore = messagesAtOrAfter(msgs, *opts.afterMs)
+	}
+	added, aErr := applyMessagePage(ctx, st, conversationID, toStore)
+	if aErr != nil {
+		return 0, false, translateStoreFull(aErr)
+	}
+	if budget != nil {
+		*budget -= len(msgs)
+	}
+	progress.Status("syncing %s: +%d messages", conversationID, added)
+	progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": added, "phase": phase})
+
+	if !drained {
+		progress.Warn("message sync stream did not run out for conversation %s; older messages may not have been fetched", conversationID)
+		return added, false, nil
+	}
+	// BackfillDone means the store holds this conversation's full history, so
+	// it can only be claimed when what the drain fetched is also what was
+	// stored. Under --after the trimmed messages were seen and deliberately
+	// discarded; marking done would drop the conversation from every future
+	// `history backfill` target list and report backfill_done=true for an
+	// archive that has a hole in it.
+	if len(toStore) == len(msgs) {
+		if err := markBackfillDone(ctx, st, conversationID); err != nil {
 			return added, false, err
 		}
-		if len(msgs) == 0 {
-			// A genuine end-of-history signal, same as backfillMessages'
-			// own empty-page case: catch-up can reach it directly for a
-			// conversation whose entire history fits before ever hitting a
-			// duplicate (e.g. a brand new conversation, or one short enough
-			// that a single pass covers it). Marking BackfillDone here too
-			// means a later plain sync never needs --backfill to know
-			// there's nothing older left for this conversation.
-			if err := markBackfillDone(ctx, st, conv.ID); err != nil {
-				return added, false, err
-			}
-			return added, true, nil
-		}
-
-		// toStore, not msgs, is what actually gets persisted below — every
-		// pagination/completeness decision from here on (the stalled check,
-		// the duplicate-page check, next, the --after cutoff itself) keeps
-		// reading msgs, the page the server actually returned, never
-		// toStore. Filtering only decides what applyMessagePage is allowed
-		// to write; conflating the two would make a --after-trimmed page
-		// look like a short or duplicate page to that cursor logic, which
-		// has nothing to do with why it was trimmed.
-		toStore := msgs
-		if opts.afterMs != nil {
-			toStore = messagesAtOrAfter(msgs, *opts.afterMs)
-		}
-		pageAdded, aErr := applyMessagePage(ctx, st, conv.ID, toStore)
-		if aErr != nil {
-			return added, false, aErr
-		}
-		added += pageAdded
-		if budget != nil {
-			*budget -= len(msgs)
-		}
-		progress.Status("syncing %s: +%d messages (%d so far)", conv.ID, pageAdded, added)
-		progress.Event("messages_stored", map[string]any{"conversation_id": conv.ID, "added": pageAdded, "phase": "catch_up"})
-
-		// stalled must be checked before the duplicate-page branch below: a
-		// server that ignores createdBefore keeps re-serving the same page,
-		// which — once this loop has already stored it once — looks
-		// identical to a legitimate "caught up" duplicate (pageAdded <
-		// len(toStore), or even pageAdded == 0). Checking the dup case first
-		// would silently treat a stalled cursor as a successful catch-up,
-		// bypassing ErrPaginationStalled's guard in exactly the failure
-		// mode it exists to catch.
-		if stalled {
-			progress.Warn("messages pagination cursor did not advance for conversation %s; older messages may not have been fetched", conv.ID)
-			return added, false, nil
-		}
-		if pageAdded < len(toStore) {
-			// This page reconnected with a message already in the store —
-			// proof catch-up has caught this conversation up to whatever
-			// newest range was previously synced. It is NOT proof the
-			// conversation's full history (back to its true start) is held:
-			// that range could itself be the product of an earlier
-			// interrupted or --max-messages-capped run that never reached
-			// an empty page. Trust "caught up" as "conversation fully
-			// synced" only when a prior pass already walked all the way
-			// back (BackfillDone); otherwise stop here — a --backfill pass
-			// is what actually resumes from OldestSynced (see
-			// backfillMessages) — but report the pass incomplete so the
-			// summary doesn't claim a full archive that isn't one.
-			//
-			// Comparing against len(toStore) rather than len(msgs) matters
-			// once --after is set: toStore can be shorter than msgs simply
-			// because older messages were trimmed, which is not evidence of
-			// a duplicate and must not be misread as one — the cutoff check
-			// below is what correctly recognizes that case.
-			done, dErr := conversationBackfillDone(ctx, st, conv.ID)
-			if dErr != nil {
-				return added, false, dErr
-			}
-			return added, done, nil
-		}
-		if next == 0 {
-			if err := markBackfillDone(ctx, st, conv.ID); err != nil {
-				return added, false, err
-			}
-			return added, true, nil
-		}
-		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
-			return added, true, nil
-		}
-		createdBefore = next
 	}
+	return added, true, nil
 }
 
-// conversationBackfillDone reports whether a previous pass already walked a
-// conversation's history all the way back to an empty page (see
-// MarkBackfillDone). catchUpMessages consults this before trusting a
-// duplicate-page stop as genuine completion — see that function's doc
-// comment.
-func conversationBackfillDone(ctx context.Context, st *store.Store, conversationID string) (bool, error) {
-	conv, ok, err := st.Conversation(ctx, conversationID)
-	if err != nil {
-		return false, err
-	}
-	return ok && conv.BackfillDone, nil
+// catchUpMessages brings a conversation up to date. See
+// drainConversationMessages for the contract.
+func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
+	return drainConversationMessages(ctx, cl, st, conv.ID, opts, budget, progress, "catch_up")
 }
 
 // markBackfillDone records that paging a conversation's messages backwards
@@ -648,20 +553,14 @@ func translateStoreFull(err error) error {
 	return err
 }
 
-// backfillMessages continues paging a conversation's messages backwards
-// from where it's already synced to (OldestSynced) until a page comes back
-// empty — the signal that paging reached the true start of the
-// conversation — at which point it marks BackfillDone so a later plain sync
-// knows there's nothing older to fetch. Stopping early (--after, a budget,
-// --max-db-size, or MessagesPage reporting ErrPaginationStalled) does NOT
-// set BackfillDone: only actually reaching the start does.
+// backfillMessages reaches older history for a conversation an earlier pass
+// left partially synced.
 //
-// The returned bool mirrors catchUpMessages': true only when this walk
-// reached a genuine stopping point (the true start), false when a
-// --max-messages budget or a stalled cursor cut it short and older messages
-// may remain. A caller must fold that into the pass's complete:false
-// summary field rather than only checking the error, which stays nil for
-// this kind of truncation (see catchUpMessages' doc comment for why).
+// Under the sync-token surface a drain returns a conversation's whole
+// history, so there is no separate older range to walk: backfilling is
+// draining. What survives from the page-walk era is the part that still
+// matters — the BackfillDone short-circuit, so a conversation already known
+// to be fully held costs no requests at all.
 func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conversationID string, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
 	current, ok, err := st.Conversation(ctx, conversationID)
 	if err != nil {
@@ -670,82 +569,11 @@ func backfillMessages(ctx context.Context, cl *voyager.Client, st *store.Store, 
 	if !ok || current.BackfillDone {
 		return 0, true, nil
 	}
-	var createdBefore int64
-	if current.OldestSynced != nil {
-		createdBefore = *current.OldestSynced
+	added, complete, err = drainConversationMessages(ctx, cl, st, conversationID, opts, budget, progress, "backfill")
+	if err == nil && complete {
+		progress.Event("backfill_done", map[string]any{"conversation_id": conversationID})
 	}
-
-	for {
-		if ctx.Err() != nil {
-			return added, false, ctx.Err()
-		}
-		if budget != nil && *budget <= 0 {
-			return added, false, nil
-		}
-		if opts.maxDBSizeBytes > 0 {
-			// See catchUpMessages' identical guard for why this runs before
-			// the page is fetched rather than after it's already committed.
-			if reached, sErr := storeSizeReached(st, opts.maxDBSizeBytes); sErr != nil {
-				return added, false, sErr
-			} else if reached {
-				return added, false, errMaxDBSizeReached
-			}
-		}
-		pageSize := defaultMessagePageSize
-		if budget != nil && *budget < pageSize {
-			pageSize = *budget
-		}
-
-		msgs, next, err := cl.MessagesPage(ctx, conversationID, createdBefore, pageSize)
-		stalled := errors.Is(err, voyager.ErrPaginationStalled)
-		if err != nil && !stalled {
-			return added, false, err
-		}
-		if len(msgs) == 0 {
-			if err := markBackfillDone(ctx, st, conversationID); err != nil {
-				return added, false, err
-			}
-			progress.Event("backfill_done", map[string]any{"conversation_id": conversationID})
-			return added, true, nil
-		}
-
-		// See catchUpMessages' identical split: toStore is what actually
-		// gets persisted, but next/stalled/the --after check below all keep
-		// reading the unfiltered msgs the server returned.
-		toStore := msgs
-		if opts.afterMs != nil {
-			toStore = messagesAtOrAfter(msgs, *opts.afterMs)
-		}
-		pageAdded, aErr := applyMessagePage(ctx, st, conversationID, toStore)
-		if aErr != nil {
-			return added, false, aErr
-		}
-		added += pageAdded
-		if budget != nil {
-			*budget -= len(msgs)
-		}
-		progress.Status("backfilling %s: +%d messages (%d so far)", conversationID, pageAdded, added)
-		progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": pageAdded, "phase": "backfill"})
-
-		// Ordering audit (see catchUpMessages' equivalent comment, added for
-		// the same class of bug): unlike catchUpMessages, none of the
-		// branches below ever report success (added, true, nil) — every one
-		// returns added, false, nil (or an error) — so there's no "treat a
-		// stalled page as a duplicate-triggered success" hazard here for
-		// stalled to be checked ahead of. The order among them only changes
-		// which stderr warning fires, not the returned completeness.
-		if opts.afterMs != nil && oldestSentAt(msgs) < *opts.afterMs {
-			return added, false, nil // hit the user's --after bound, not the true start
-		}
-		if stalled {
-			progress.Warn("messages pagination cursor did not advance while backfilling conversation %s; older messages may not have been fetched", conversationID)
-			return added, false, nil
-		}
-		if next == 0 {
-			return added, false, nil // shouldn't happen without stalled being set; treated conservatively as incomplete
-		}
-		createdBefore = next
-	}
+	return added, complete, err
 }
 
 // applyMessagePage upserts one fetched page inside its own transaction, so

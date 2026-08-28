@@ -25,20 +25,17 @@ Working today:
 
 **Known v1 limitations.** These fail with a clear error rather than pretending:
 
-- **`lion sync` and paged message history.** LinkedIn retired the REST
-  messaging endpoints; `message list` and `message read` now use the messaging
-  GraphQL surface, but that query takes no pagination variables (`count` and
-  `lastUpdatedBefore` are accepted and ignored). LinkedIn's own web app pages
-  it by sync token instead, which `sync`, `export`, and history backfill have
-  yet to be migrated to — they still call the retired endpoint and fail with
-  HTTP 500. Rewriting them to fetch a single page would have quietly cost
-  those commands their paging and resume behaviour, so the migration is left
-  to its own change.
+- **Message history is a fresh snapshot each run, not a delta.** LinkedIn's
+  messaging surface is a sync-token protocol: each response carries a token,
+  the urns of anything deleted, and a clear-cache flag. `lion sync` drains
+  that stream — calling with the newest token until a response brings nothing
+  new — but does not yet persist the token between runs, so every sync takes a
+  full snapshot rather than asking only for changes. Storing the token is the
+  natural follow-up.
 - **Participant identity changed shape.** The messaging GraphQL surface
   identifies people by `urn:li:fsd_profile:…` where the retired one returned
   `urn:li:fs_miniProfile:…`. Conversations already in a local store carry the
   old form and will not match the new one without a translation step.
-
 - **Viewing someone else's profile by public id.** LinkedIn retired the REST
   `profileView` endpoint (HTTP 410) and its modern replacement is a set of
   GraphQL cards lion doesn't model yet. `profile view me` and
