@@ -493,7 +493,7 @@ func TestWarnThinCookieJar(t *testing.T) {
 // "what I pasted wasn't a Cookie header" — without echoing the input back.
 func TestMissingCookiesMsg(t *testing.T) {
 	msg := missingCookiesMsg(map[string]string{})
-	for _, want := range []string{"li_at and JSESSIONID", "parsed 0 cookie(s)", "--cookies-stdin"} {
+	for _, want := range []string{"missing required cookies li_at and JSESSIONID", "parsed 0 cookie(s)", "--cookies-stdin"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missingCookiesMsg(empty) = %q, want it to mention %q", msg, want)
 		}

@@ -123,8 +123,6 @@ func warnArgvCredentials(liAt, jsession, cookiesFlag string) {
 // auth.Save persists.
 func resolveLoginCookies(cookiesFlag, cookiesFile string, cookiesStdin bool, liAt, jsession string, noInput bool, stdin io.Reader) (map[string]string, error) {
 	var cookies map[string]string
-	// One buffered reader shared by every prompt below; see promptSecret.
-	prompts := bufio.NewReader(stdin)
 	switch {
 	case cookiesStdin, cookiesFlag == "-":
 		b, err := io.ReadAll(stdin)
@@ -150,6 +148,15 @@ func resolveLoginCookies(cookiesFlag, cookiesFile string, cookiesStdin bool, liA
 		// that is missing the browser-identity cookies LinkedIn expects to
 		// see alongside a session (DESIGN.md §3.3). --li-at/--jsessionid
 		// still select the old path, prompting for whichever one they omit.
+		// One buffered reader shared by every prompt below (see
+		// promptSecret), constructed here rather than beside `cookies`
+		// above: this is the only branch that prompts, and the
+		// --cookies-stdin branch reads the same stdin directly with
+		// io.ReadAll. Two readers over one source is safe only as long as
+		// the buffered one is never read from first, so it is scoped to
+		// where it is actually used instead of leaving that invariant for a
+		// later edit to trip over.
+		prompts := bufio.NewReader(stdin)
 		if liAt == "" && jsession == "" {
 			cookies = parseCookieHeader(promptSecret(cookieHeaderPrompt, noInput, prompts))
 			break
@@ -244,11 +251,15 @@ func missingCookiesMsg(cookies map[string]string) string {
 			missing = append(missing, name)
 		}
 	}
-	return fmt.Sprintf("missing required cookie %s (parsed %d cookie(s) from the input). "+
+	noun := "cookie"
+	if len(missing) > 1 {
+		noun = "cookies"
+	}
+	return fmt.Sprintf("missing required %s %s (parsed %d cookie(s) from the input). "+
 		"Copy the whole Cookie: header for linkedin.com — DevTools -> Network -> any "+
 		"linkedin.com request -> Request Headers -> Cookie — and pipe it in with "+
 		"`pbpaste | lion auth login --cookies-stdin`",
-		strings.Join(missing, " and "), len(cookies))
+		noun, strings.Join(missing, " and "), len(cookies))
 }
 
 // parseCookieHeader parses a `Cookie:` header value (e.g. `li_at=..; ` +
