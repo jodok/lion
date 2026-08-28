@@ -507,10 +507,16 @@ func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *stor
 		progress.Warn("message sync stream did not run out for conversation %s; older messages may not have been fetched", conversationID)
 		return added, false, nil
 	}
-	// The drain reached the end of this conversation's history, so nothing
-	// older is left for a --backfill pass to find.
-	if err := markBackfillDone(ctx, st, conversationID); err != nil {
-		return added, false, err
+	// BackfillDone means the store holds this conversation's full history, so
+	// it can only be claimed when what the drain fetched is also what was
+	// stored. Under --after the trimmed messages were seen and deliberately
+	// discarded; marking done would drop the conversation from every future
+	// `history backfill` target list and report backfill_done=true for an
+	// archive that has a hole in it.
+	if len(toStore) == len(msgs) {
+		if err := markBackfillDone(ctx, st, conversationID); err != nil {
+			return added, false, err
+		}
 	}
 	return added, true, nil
 }
@@ -519,19 +525,6 @@ func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *stor
 // drainConversationMessages for the contract.
 func catchUpMessages(ctx context.Context, cl *voyager.Client, st *store.Store, conv voyager.Conversation, opts syncOptions, budget *int, progress *progressReporter) (added int, complete bool, err error) {
 	return drainConversationMessages(ctx, cl, st, conv.ID, opts, budget, progress, "catch_up")
-}
-
-// conversationBackfillDone reports whether a previous pass already walked a
-// conversation's history all the way back to an empty page (see
-// MarkBackfillDone). catchUpMessages consults this before trusting a
-// duplicate-page stop as genuine completion — see that function's doc
-// comment.
-func conversationBackfillDone(ctx context.Context, st *store.Store, conversationID string) (bool, error) {
-	conv, ok, err := st.Conversation(ctx, conversationID)
-	if err != nil {
-		return false, err
-	}
-	return ok && conv.BackfillDone, nil
 }
 
 // markBackfillDone records that paging a conversation's messages backwards

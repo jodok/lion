@@ -272,3 +272,70 @@ func TestAllMessagesCapReportsIncomplete(t *testing.T) {
 		t.Errorf("uncapped drain = %d messages complete=%v, want 3 and true", len(msgs), complete)
 	}
 }
+
+// TestAllMessagesCapStopsFetching: --max-messages must bound the requests a
+// pass makes, not just the rows it writes. Capping only at the end left the
+// drain fetching a whole conversation and discarding most of it, which
+// inverts what the budget is for — lion's limiter meters reads so a real
+// account does not look automated.
+func TestAllMessagesCapStopsFetching(t *testing.T) {
+	body := func(token string, ids ...string) string {
+		var els, inc []string
+		for i, id := range ids {
+			urn := "urn:li:msg_message:" + id
+			els = append(els, fmt.Sprintf("%q", urn))
+			inc = append(inc, fmt.Sprintf(`{"$type":"com.linkedin.messenger.Message",
+				"entityUrn":%q,"deliveredAt":%d,"body":{"text":"hi"}}`, urn, 100+i))
+		}
+		return fmt.Sprintf(`{"data":{"data":{"messengerMessagesBySyncToken":{
+			"*elements":[%s],"metadata":{"newSyncToken":%q}}}},"included":[%s]}`,
+			strings.Join(els, ","), token, strings.Join(inc, ","))
+	}
+	// Three responses' worth of history, but a cap of 2 met by the first.
+	c, st := syncClient(t,
+		body("t1", "m1", "m2"),
+		body("t2", "m3", "m4"),
+		body("t3", "m5"),
+		body("t4"))
+	msgs, complete, err := c.AllMessages(context.Background(), "2-abc", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want the cap of 2", len(msgs))
+	}
+	if complete {
+		t.Error("complete = true after the cap stopped the drain, want false")
+	}
+	if st.calls != 1 {
+		t.Errorf("made %d requests, want 1 (the cap was met by the first response)", st.calls)
+	}
+}
+
+// TestSyncMetadataKeptWithoutToken: a final response may report deletions
+// while offering no further token. Requiring a token to accept the metadata
+// dropped those deletions silently.
+func TestSyncMetadataKeptWithoutToken(t *testing.T) {
+	body := `{
+	  "data": {"data": {"messengerConversationsBySyncToken": {
+	    "*elements": [],
+	    "metadata": {"newSyncToken": "", "deletedUrns": ["urn:li:msg_conversation:(x,2-gone)"],
+	                 "shouldClearCache": true}
+	  }}},
+	  "included": []
+	}`
+	c, _ := syncClient(t, body)
+	page, err := c.ConversationsSync(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.DeletedURNs) != 1 {
+		t.Errorf("DeletedURNs = %v, want the removal reported alongside an empty token", page.DeletedURNs)
+	}
+	if !page.ClearCache {
+		t.Error("ClearCache = false, want true")
+	}
+	if page.NextToken != "" {
+		t.Errorf("NextToken = %q, want empty", page.NextToken)
+	}
+}

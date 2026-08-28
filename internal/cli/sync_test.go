@@ -787,3 +787,63 @@ func TestSyncDeduplicatesRepeatedConversationPages(t *testing.T) {
 		t.Errorf("c2 events fetched %d times, c1 %d — c2 was re-walked by a duplicate discovery entry", got, want)
 	}
 }
+
+// TestSyncAfterDoesNotClaimFullBackfill: BackfillDone means the store holds a
+// conversation's whole history. Under --after the drain sees every message
+// and deliberately discards the old ones, so claiming a full archive would
+// drop the conversation from future `history backfill` targets and report
+// backfill_done=true for an archive with a hole in it.
+func TestSyncAfterDoesNotClaimFullBackfill(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(300)}, {"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	after := int64(250)
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{afterMs: &after}, discardProgress(t)); err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("conversation not stored")
+	}
+	if conv.BackfillDone {
+		t.Error("BackfillDone = true after --after trimmed older messages, want false")
+	}
+}
+
+// TestSyncWithoutAfterClaimsFullBackfill is the other half: an unfiltered
+// drain that ran out really does hold the whole conversation, and must say so
+// or every later run pays to rediscover history it already has.
+func TestSyncWithoutAfterClaimsFullBackfill(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m2", int64(300)}, {"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatalf("runSyncPass: %v", err)
+	}
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !conv.BackfillDone {
+		t.Error("BackfillDone = false after a complete unfiltered drain, want true")
+	}
+}

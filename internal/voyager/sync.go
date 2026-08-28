@@ -89,7 +89,11 @@ func decodeSyncMetadata(body []byte) syncMetadata {
 		if err := json.Unmarshal(raw, &probe); err != nil {
 			continue // not an object (e.g. the $type string)
 		}
-		if probe.Metadata != nil && probe.Metadata.NewSyncToken != "" {
+		// Keyed on the metadata object being present, not on the token being
+		// non-empty. A final response may report deletions while offering no
+		// further token — "these were removed, and that is everything" — and
+		// requiring a token would drop those deletions on the floor.
+		if probe.Metadata != nil {
 			return *probe.Metadata
 		}
 	}
@@ -228,6 +232,13 @@ func (c *Client) AllMessages(ctx context.Context, conversationID string, max int
 			seen[m.URN] = true
 			msgs = append(msgs, m)
 			added++
+		}
+		// Stop fetching once the cap is met. Applying it only at the end
+		// would let --max-messages bound the rows written while leaving the
+		// requests unbounded, which inverts what the budget is for: lion's
+		// limiter meters reads so a real account does not look automated.
+		if max > 0 && len(msgs) >= max {
+			return finishMessages(msgs, max, false)
 		}
 		if added == 0 || page.NextToken == "" || page.NextToken == token {
 			return finishMessages(msgs, max, true)
