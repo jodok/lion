@@ -489,6 +489,11 @@ func (b *Browser) Close() {
 	}
 }
 
+// ChromePath reports which Chromium lion would drive, without starting it,
+// so a diagnostic can name a missing browser as itself rather than as the
+// failure of whatever command needed one first.
+func ChromePath(override string) (string, error) { return resolveChrome(override) }
+
 // resolveChrome picks the Chromium binary: an explicit override, then a
 // system Chrome, then a pinned build fetched into rod's cache.
 //

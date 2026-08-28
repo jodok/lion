@@ -21,6 +21,7 @@ Working today:
 - `lion connection list|invite|remove`
 - `lion message list|read|send`
 - `lion feed read|post|comment|react|engagement`
+- `lion doctor` — self-checks: home, transport, browser, store, session
 - `lion schema --json` · `lion version`
 
 **Known v1 limitations.** These fail with a clear error rather than pretending:
