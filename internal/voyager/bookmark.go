@@ -47,19 +47,76 @@ type SavedPost struct {
 	LinkedSubtitle string `json:"linked_subtitle,omitempty"`
 }
 
+// savedPostsPageSize is how many saved posts one request asks for. LinkedIn
+// decides what it actually returns; the walk below follows the reported total
+// rather than trusting this.
+const savedPostsPageSize = 20
+
+// savedPostsPageLimit bounds the walk. A server that keeps reporting a total
+// it never reaches would otherwise loop forever; this turns that into a
+// bounded, reportable stop.
+const savedPostsPageLimit = 50
+
 // SavedPosts returns the member's saved posts, most recently saved first.
-// max caps the result (0 = LinkedIn's default page).
+// max caps the result (0 = every saved post).
+//
+// It pages rather than taking the first response: bookmarks exist to be
+// archived completely, so silently returning one page's worth and letting the
+// caller believe that is everything would defeat the point. profile search
+// shares this query and does not page, which is right for a browse command
+// where the first page is the answer.
 func (c *Client) SavedPosts(ctx context.Context, max int) ([]SavedPost, error) {
-	count := max
-	if count <= 0 {
-		count = 10
+	var out []SavedPost
+	seen := map[string]bool{}
+	start := 0
+	for page := 0; page < savedPostsPageLimit; page++ {
+		vars := fmt.Sprintf("(start:%d,count:%d,query:(flagshipSearchIntent:%s))",
+			start, savedPostsPageSize, savedPostsIntent)
+		body, err := c.getGraphQL(ctx, queryIDSearchClusters, vars)
+		if err != nil {
+			return nil, err
+		}
+		posts, total, err := decodeSavedPostsPage(body)
+		if err != nil {
+			return nil, err
+		}
+		added := 0
+		for _, p := range posts {
+			if seen[p.URN] {
+				continue
+			}
+			seen[p.URN] = true
+			out = append(out, p)
+			added++
+			if max > 0 && len(out) >= max {
+				return out, nil
+			}
+		}
+		// A page that adds nothing ends the walk, checked before the total:
+		// a server that keeps reporting a count it never delivers must not
+		// spin here.
+		if added == 0 {
+			return out, nil
+		}
+		if total > 0 && len(out) >= total {
+			return out, nil
+		}
+		start += len(posts)
 	}
-	vars := fmt.Sprintf("(start:0,count:%d,query:(flagshipSearchIntent:%s))", count, savedPostsIntent)
-	body, err := c.getGraphQL(ctx, queryIDSearchClusters, vars)
+	return out, nil
+}
+
+// decodeSavedPosts is the single-response decoder, kept for tests and for
+// callers that already hold a body.
+func decodeSavedPosts(body []byte, max int) ([]SavedPost, error) {
+	posts, _, err := decodeSavedPostsPage(body)
 	if err != nil {
 		return nil, err
 	}
-	return decodeSavedPosts(body, max)
+	if max > 0 && len(posts) > max {
+		posts = posts[:max]
+	}
+	return posts, nil
 }
 
 // savedPostsEnvelope is the shape the cluster items arrive in. Only the
@@ -76,6 +133,9 @@ type savedPostsEnvelope struct {
 						} `json:"item"`
 					} `json:"items"`
 				} `json:"elements"`
+				Metadata struct {
+					TotalResultCount int `json:"totalResultCount"`
+				} `json:"metadata"`
 			} `json:"searchDashClustersByAll"`
 		} `json:"data"`
 	} `json:"data"`
@@ -90,14 +150,14 @@ type savedPostsEnvelope struct {
 // be indistinguishable from a real hit. (decodePeopleSearch does sweep, and
 // gets away with it because it filters on the navigation URL looking like a
 // member profile; there is no equivalent tell here.)
-func decodeSavedPosts(body []byte, max int) ([]SavedPost, error) {
+func decodeSavedPostsPage(body []byte) ([]SavedPost, int, error) {
 	_, idx, err := parseNormalized(body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var env savedPostsEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("decode saved posts: %w", err)
+		return nil, 0, fmt.Errorf("decode saved posts: %w", err)
 	}
 
 	var out []SavedPost
@@ -148,10 +208,23 @@ func decodeSavedPosts(body []byte, max int) ([]SavedPost, error) {
 				p.LinkedSubtitle = strings.TrimSpace(e.Embedded.PrimarySub.Text)
 			}
 			out = append(out, p)
-			if max > 0 && len(out) >= max {
-				return out, nil
-			}
 		}
 	}
-	return out, nil
+
+	// Shape-drift guard, matching connection.go, feed.go and messaging.go: if
+	// included[] carries saved posts but the items referenced none of them,
+	// the decoder has fallen behind a Voyager change. Reporting that as "you
+	// have no saved posts" would let an archiving job stop capturing anything
+	// and still look healthy.
+	if len(out) == 0 {
+		if n := len(idx.ofType(typeEntityResultViewModel)); n > 0 {
+			return nil, 0, fmt.Errorf("saved posts response shape not recognized: %d entity result(s) "+
+				"present in included[] but none referenced by the cluster items; the decoder likely "+
+				"needs updating for a changed Voyager response shape: %w", n, ErrNotFound)
+		}
+	}
+	return out, env.Data.Data.Clusters.Metadata.TotalResultCount, nil
 }
+
+// typeEntityResultViewModel is the included[] $type saved posts arrive as.
+const typeEntityResultViewModel = "com.linkedin.voyager.dash.search.EntityResultViewModel"
