@@ -45,6 +45,7 @@ func newSyncCmd() *cobra.Command {
 		storePath        string
 		once             bool
 		follow           bool
+		full             bool
 		interval         time.Duration
 		events           bool
 		lockWait         time.Duration
@@ -149,6 +150,7 @@ func newSyncCmd() *cobra.Command {
 			opts := syncOptions{
 				afterMs:          afterMs,
 				maxConversations: maxConversations,
+				full:             full,
 				maxMessages:      maxMessages,
 				maxDBSizeBytes:   maxDBSizeBytes,
 			}
@@ -191,6 +193,7 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&maxDBSize, "max-db-size", "", "stop cleanly before the store would exceed this size (e.g. 500MB, 2GB)")
 	cmd.Flags().StringVar(&storePath, "store", "", "path to the store database (default $LION_HOME/store.db)")
 	cmd.Flags().BoolVar(&once, "once", false, "sync a single pass and exit (the default; accepted explicitly to match wacli)")
+	cmd.Flags().BoolVar(&full, "full", false, "ignore stored sync tokens and take a complete snapshot")
 	cmd.Flags().BoolVar(&follow, "follow", false, "keep syncing every --interval instead of exiting after one pass (opt-in — see command help)")
 	cmd.Flags().DurationVar(&interval, "interval", 60*time.Second, "how often to sync again under --follow")
 	cmd.Flags().BoolVar(&events, "events", false, "emit NDJSON progress events on stderr instead of a status line")
@@ -203,8 +206,11 @@ func newSyncCmd() *cobra.Command {
 type syncOptions struct {
 	afterMs          *int64
 	maxConversations int
-	maxMessages      int
-	maxDBSizeBytes   int64
+	// full ignores stored sync tokens and takes a complete snapshot — the
+	// escape hatch for a delta stream that has drifted from what is stored.
+	full           bool
+	maxMessages    int
+	maxDBSizeBytes int64
 }
 
 // syncSummary is sync's stdout contract: conversations seen/updated,
@@ -335,6 +341,37 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 	return summary, nil
 }
 
+// conversationsSyncTokenKey is where the mailbox stream's resume point lives.
+// Keyed by nothing else because the store itself is per-LION_HOME and holds
+// one account's conversations; switching --account against the same store
+// would want a per-mailbox key, which is a change to make when the store
+// grows an account column rather than guessed at here.
+const conversationsSyncTokenKey = "sync_token:conversations"
+
+// applyDeletedConversations removes conversations the sync stream reported as
+// deleted.
+//
+// This only starts mattering once tokens are persisted: a full snapshot every
+// run made a removed conversation simply stop appearing, whereas a delta
+// stream names it once and never mentions it again. Ignoring that would leave
+// it in the store forever.
+func applyDeletedConversations(ctx context.Context, st *store.Store, urns []string, progress *progressReporter) error {
+	for _, urn := range urns {
+		// voyager owns this parse, because it is the same one that derives
+		// Conversation.ID. A second copy here would have to be kept in step
+		// by hand, and a drift would make deletions silently match nothing.
+		id := voyager.ConversationIDFromURN(urn)
+		if id == "" {
+			continue
+		}
+		if err := st.DeleteConversation(ctx, id); err != nil {
+			return err
+		}
+		progress.Event("conversation_deleted", map[string]any{"id": id, "urn": urn})
+	}
+	return nil
+}
+
 // discoverConversations drains the mailbox sync stream, upserts every
 // conversation it yields, and collects the ones this pass will sync messages
 // for. It stops early at --max-conversations or --max-db-size.
@@ -369,14 +406,56 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 		}
 	}
 
+	// Resume from where the last run left off, unless --full was asked for.
+	// An empty token means a full snapshot, which is also what a first run,
+	// an account switch, or a rejected token gets.
+	var token string
+	if !opts.full {
+		if v, ok, mErr := st.Meta(ctx, conversationsSyncTokenKey); mErr != nil {
+			return nil, false, mErr
+		} else if ok {
+			token = v
+		}
+	}
+
 	// Drained without a cap so --max-conversations counts conversations that
 	// actually pass the --after filter, the way the page walk did. The drain
 	// bounds its own request count.
-	convs, drained, err := cl.AllConversations(ctx, 0)
+	convs, drained, next, deleted, err := cl.ConversationsFrom(ctx, token, 0)
+	if err != nil && token != "" {
+		// A stored token the server will not accept must not wedge sync
+		// forever. Drop it and take a full snapshot; the next run then has a
+		// fresh resume point.
+		progress.Warn("stored sync token was rejected (%v); taking a full snapshot", err)
+		if cErr := st.WithTx(ctx, func(tx *store.Tx) error {
+			return tx.SetMeta(ctx, conversationsSyncTokenKey, "")
+		}); cErr != nil {
+			return nil, false, cErr
+		}
+		token = ""
+		convs, drained, next, deleted, err = cl.ConversationsFrom(ctx, "", 0)
+	}
 	if err != nil {
 		return nil, false, err
 	}
+	if len(deleted) > 0 {
+		if dErr := applyDeletedConversations(ctx, st, deleted, progress); dErr != nil {
+			return nil, false, dErr
+		}
+	}
 	if len(convs) == 0 {
+		// Still record the resume point. A delta reporting no changes is the
+		// steady state for a periodic sync, and returning here without
+		// advancing would leave the stored token ageing forever until
+		// LinkedIn stops accepting it and the recovery path pays for a full
+		// snapshot of the whole mailbox.
+		if next != "" {
+			if tErr := st.WithTx(ctx, func(tx *store.Tx) error {
+				return tx.SetMeta(ctx, conversationsSyncTokenKey, next)
+			}); tErr != nil {
+				return nil, false, tErr
+			}
+		}
 		return nil, drained, nil
 	}
 	if !drained {
@@ -396,6 +475,12 @@ func discoverConversations(ctx context.Context, cl *voyager.Client, st *store.St
 			if err := tx.UpsertConversation(ctx, toStoreConversation(c), now); err != nil {
 				return err
 			}
+		}
+		// Written in the same transaction as the rows it describes: a token
+		// saved without its conversations would skip them forever, and
+		// conversations saved without their token would refetch them.
+		if next != "" {
+			return tx.SetMeta(ctx, conversationsSyncTokenKey, next)
 		}
 		return nil
 	})
@@ -463,9 +548,39 @@ func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *stor
 	if budget != nil {
 		limit = *budget
 	}
-	msgs, drained, err := cl.AllMessages(ctx, conversationID, limit)
+
+	// Resume this conversation's stream where the last run left it.
+	var token string
+	if !opts.full {
+		if conv, ok, cErr := st.Conversation(ctx, conversationID); cErr != nil {
+			return 0, false, cErr
+		} else if ok {
+			token = conv.MessagesSyncToken
+		}
+	}
+	msgs, drained, next, deleted, err := cl.MessagesFrom(ctx, conversationID, token, limit)
+	if err != nil && token != "" {
+		// A rejected token must not wedge this conversation forever: drop it
+		// and take a full snapshot of the thread.
+		progress.Warn("stored sync token for %s was rejected (%v); refetching the conversation", conversationID, err)
+		if cErr := st.WithTx(ctx, func(tx *store.Tx) error {
+			return tx.SetMessagesSyncToken(ctx, conversationID, "")
+		}); cErr != nil {
+			return 0, false, cErr
+		}
+		token = ""
+		msgs, drained, next, deleted, err = cl.MessagesFrom(ctx, conversationID, "", limit)
+	}
 	if err != nil {
 		return 0, false, err
+	}
+	if len(deleted) > 0 {
+		if dErr := st.WithTx(ctx, func(tx *store.Tx) error {
+			return tx.DeleteMessages(ctx, deleted)
+		}); dErr != nil {
+			return 0, false, dErr
+		}
+		progress.Event("messages_deleted", map[string]any{"conversation_id": conversationID, "count": len(deleted)})
 	}
 
 	// toStore is what gets persisted; the completeness decision below reads
@@ -485,9 +600,38 @@ func drainConversationMessages(ctx context.Context, cl *voyager.Client, st *stor
 	progress.Status("syncing %s: +%d messages", conversationID, added)
 	progress.Event("messages_stored", map[string]any{"conversation_id": conversationID, "added": added, "phase": phase})
 
+	// Advance the resume point only past messages this run actually stored.
+	//
+	// Two ways a run fetches more than it keeps: --max-messages caps via
+	// capNewest, which keeps the newest N of a response and discards the
+	// older ones from that same response, and --after trims below the
+	// cutoff. Moving the token past either means no later run — not even
+	// `history backfill`, which resumes from the same token — ever asks for
+	// them again, and they are gone from the archive for good. Leaving the
+	// old token costs a refetch, which is the right side to err on: an
+	// incremental sync that silently misses messages is worse than a slow
+	// full one.
+	storedEverythingFetched := len(toStore) == len(msgs)
+	if next != "" && drained && storedEverythingFetched {
+		if tErr := st.WithTx(ctx, func(tx *store.Tx) error {
+			return tx.SetMessagesSyncToken(ctx, conversationID, next)
+		}); tErr != nil {
+			return added, false, tErr
+		}
+	}
+
 	if !drained {
 		progress.Warn("message sync stream did not run out for conversation %s; older messages may not have been fetched", conversationID)
 		return added, false, nil
+	}
+	// A drain that resumed from a token running out means "nothing changed
+	// since last time" — it says nothing about whether the whole history is
+	// held, because the delta never replays what came before. Only a full
+	// snapshot proves that, so only a full snapshot may claim it. Without
+	// this, the first incremental run would mark every conversation fully
+	// archived regardless of how little of it the store actually has.
+	if token != "" {
+		return added, true, nil
 	}
 	// BackfillDone means the store holds this conversation's full history, so
 	// it can only be claimed when what the drain fetched is also what was

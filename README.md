@@ -25,13 +25,12 @@ Working today:
 
 **Known v1 limitations.** These fail with a clear error rather than pretending:
 
-- **Message history is a fresh snapshot each run, not a delta.** LinkedIn's
-  messaging surface is a sync-token protocol: each response carries a token,
-  the urns of anything deleted, and a clear-cache flag. `lion sync` drains
-  that stream — calling with the newest token until a response brings nothing
-  new — but does not yet persist the token between runs, so every sync takes a
-  full snapshot rather than asking only for changes. Storing the token is the
-  natural follow-up.
+- **Incremental sync trusts LinkedIn's delta stream.** `lion sync` stores the
+  sync token each run and asks only for what changed since, which is what
+  makes a periodic sync cheap. If the delta ever drifts from what is stored —
+  a conversation that changed without being reported, say — `lion sync --full`
+  ignores the stored tokens and takes a complete snapshot. A token the server
+  rejects is dropped automatically and the run falls back to a full snapshot.
 - **Participant identity changed shape.** The messaging GraphQL surface
   identifies people by `urn:li:fsd_profile:…` where the retired one returned
   `urn:li:fs_miniProfile:…`. Conversations already in a local store carry the

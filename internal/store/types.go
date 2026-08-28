@@ -28,6 +28,10 @@ type Conversation struct {
 	// OldestSynced until a page comes back empty.
 	NewestSynced *int64
 	OldestSynced *int64
+	// MessagesSyncToken is where this conversation's message stream was
+	// left off, so a later run can ask only for what changed. Empty means
+	// no resume point: the next drain starts from a full snapshot.
+	MessagesSyncToken string
 	// BackfillDone is true once paging backwards reached the start of the
 	// conversation (an empty page), so a later plain sync knows there is
 	// nothing older left to fetch even without --backfill.

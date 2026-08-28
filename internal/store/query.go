@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -12,7 +13,7 @@ import (
 // needs exclusivity, and letting export/search block on a long sync would
 // defeat the point of separating the network pass from the read pass.
 
-const conversationColumns = `id, urn, participants, updated_at, unread, newest_synced, oldest_synced, backfill_done, first_seen_at, last_synced_at`
+const conversationColumns = `id, urn, participants, updated_at, unread, newest_synced, oldest_synced, backfill_done, first_seen_at, last_synced_at, messages_sync_token`
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows, so
 // scanConversation works for a single-row lookup and a list query alike.
@@ -26,13 +27,15 @@ func scanConversation(rs rowScanner) (Conversation, error) {
 		participantsJSON      string
 		unreadInt, backfillN  int
 		newestSync, oldestSyn sql.NullInt64
+		syncToken             sql.NullString
 	)
 	if err := rs.Scan(&c.ID, &c.URN, &participantsJSON, &c.UpdatedAt, &unreadInt,
-		&newestSync, &oldestSyn, &backfillN, &c.FirstSeenAt, &c.LastSyncedAt); err != nil {
+		&newestSync, &oldestSyn, &backfillN, &c.FirstSeenAt, &c.LastSyncedAt, &syncToken); err != nil {
 		return Conversation{}, err
 	}
 	c.Unread = unreadInt != 0
 	c.BackfillDone = backfillN != 0
+	c.MessagesSyncToken = syncToken.String
 	if newestSync.Valid {
 		v := newestSync.Int64
 		c.NewestSynced = &v
@@ -519,4 +522,19 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	st.SchemaVersion = version
 
 	return st, nil
+}
+
+// Meta reads a key from the store's key/value table, reporting whether it was
+// present. Used for state that belongs to the store as a whole rather than to
+// any one conversation — the mailbox sync token, for instance.
+func (s *Store) Meta(ctx context.Context, key string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: read meta %s: %w", key, err)
+	}
+	return v, true, nil
 }
