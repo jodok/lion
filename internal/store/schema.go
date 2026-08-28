@@ -10,7 +10,7 @@ import (
 // currentSchemaVersion is the schema this build knows how to create/migrate
 // to. Bumping it and adding a case to migrate is how a later version adds
 // its own migration step.
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // schemaV1 creates the store from nothing. Each statement runs individually
 // (rather than as one multi-statement Exec) so this doesn't depend on a
@@ -90,6 +90,20 @@ var schemaV1 = []string{
 // TABLE / CREATE statements here rather than rewriting v1's.
 var migrations = map[int][]string{
 	1: schemaV1,
+	2: schemaV2,
+}
+
+// schemaV2 adds per-conversation message sync tokens.
+//
+// LinkedIn's messaging surface is a sync-token protocol: a response carries a
+// token, and passing it back asks only for what changed since. Without
+// somewhere to keep the token, every run had to take a full snapshot of every
+// conversation. The column lives on conversations rather than in meta so it
+// is scoped to the row it describes and disappears with it on delete —
+// keeping a token for a conversation that no longer exists would be a way to
+// resume a stream that has nothing to resume.
+var schemaV2 = []string{
+	`ALTER TABLE conversations ADD COLUMN messages_sync_token TEXT`,
 }
 
 // migrate brings the store up to currentSchemaVersion, running whichever

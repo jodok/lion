@@ -174,12 +174,28 @@ func (c *Client) MessagesSync(ctx context.Context, conversationID, token string)
 // early and older conversations may exist that this pass never saw — the
 // caller must not record such a pass as a full sync.
 func (c *Client) AllConversations(ctx context.Context, max int) (convs []Conversation, complete bool, err error) {
+	convs, complete, _, _, err = c.ConversationsFrom(ctx, "", max)
+	return convs, complete, err
+}
+
+// ConversationsFrom drains the mailbox stream starting from token, and
+// reports the token to resume from next time along with any conversations the
+// server said were deleted.
+//
+// An empty token asks for a full snapshot. The returned token is the newest
+// the server offered during the drain; it is empty when the server offered
+// none, which a caller should persist as "start over next time" rather than
+// keeping a stale one.
+func (c *Client) ConversationsFrom(ctx context.Context, token string, max int) (convs []Conversation, complete bool, next string, deleted []string, err error) {
 	seen := map[string]bool{}
-	var token string
 	for i := 0; i < syncDrainLimit; i++ {
 		page, err := c.ConversationsSync(ctx, token)
 		if err != nil {
-			return convs, false, err
+			return convs, false, next, deleted, err
+		}
+		deleted = append(deleted, page.DeletedURNs...)
+		if page.NextToken != "" {
+			next = page.NextToken
 		}
 		added := 0
 		for _, cv := range page.Conversations {
@@ -194,7 +210,7 @@ func (c *Client) AllConversations(ctx context.Context, max int) (convs []Convers
 			convs = append(convs, cv)
 			added++
 			if max > 0 && len(convs) >= max {
-				return convs, false, nil
+				return convs, false, next, deleted, nil
 			}
 		}
 		// A response that adds nothing is the end of the stream. Checked
@@ -202,14 +218,14 @@ func (c *Client) AllConversations(ctx context.Context, max int) (convs []Convers
 		// for an unchanged mailbox — which this one does — would otherwise
 		// never terminate.
 		if added == 0 {
-			return convs, true, nil
+			return convs, true, next, deleted, nil
 		}
 		if page.NextToken == "" || page.NextToken == token {
-			return convs, true, nil
+			return convs, true, next, deleted, nil
 		}
 		token = page.NextToken
 	}
-	return convs, false, nil
+	return convs, false, next, deleted, nil
 }
 
 // AllMessages drains one conversation's message sync stream, oldest first.
@@ -217,12 +233,22 @@ func (c *Client) AllConversations(ctx context.Context, max int) (convs []Convers
 // complete carries the same meaning as AllConversations': false means the cap
 // or the request limit stopped the walk, not that the conversation ended.
 func (c *Client) AllMessages(ctx context.Context, conversationID string, max int) (msgs []Message, complete bool, err error) {
+	msgs, complete, _, _, err = c.MessagesFrom(ctx, conversationID, "", max)
+	return msgs, complete, err
+}
+
+// MessagesFrom drains one conversation's stream from token, reporting where
+// to resume and what the server said was deleted. See ConversationsFrom.
+func (c *Client) MessagesFrom(ctx context.Context, conversationID, token string, max int) (msgs []Message, complete bool, next string, deleted []string, err error) {
 	seen := map[string]bool{}
-	var token string
 	for i := 0; i < syncDrainLimit; i++ {
 		page, err := c.MessagesSync(ctx, conversationID, token)
 		if err != nil {
-			return msgs, false, err
+			return msgs, false, next, deleted, err
+		}
+		deleted = append(deleted, page.DeletedURNs...)
+		if page.NextToken != "" {
+			next = page.NextToken
 		}
 		added := 0
 		for _, m := range page.Messages {
@@ -238,14 +264,17 @@ func (c *Client) AllMessages(ctx context.Context, conversationID string, max int
 		// requests unbounded, which inverts what the budget is for: lion's
 		// limiter meters reads so a real account does not look automated.
 		if max > 0 && len(msgs) >= max {
-			return finishMessages(msgs, max, false)
+			out, ok, fErr := finishMessages(msgs, max, false)
+			return out, ok, next, deleted, fErr
 		}
 		if added == 0 || page.NextToken == "" || page.NextToken == token {
-			return finishMessages(msgs, max, true)
+			out, ok, fErr := finishMessages(msgs, max, true)
+			return out, ok, next, deleted, fErr
 		}
 		token = page.NextToken
 	}
-	return finishMessages(msgs, max, false)
+	out, ok, fErr := finishMessages(msgs, max, false)
+	return out, ok, next, deleted, fErr
 }
 
 // finishMessages orders a drained conversation and applies the cap.

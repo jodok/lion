@@ -28,17 +28,49 @@ type routeFixtureTransport struct {
 	// return err instead of a fixture body — used to simulate a mid-run
 	// failure (e.g. rate limiting) partway through a sync.
 	errOnCall map[string]int
-	err       error
+	// errOnce marks a route whose injected failure applies to that one call
+	// only, for scenarios where the code is expected to recover and retry.
+	errOnce map[string]bool
+	err     error
+	lastURL map[string]string
+	// badStatusOnce makes a route's Nth call answer with an HTTP status
+	// instead of a fixture. Distinct from errOnCall: voyager retries a GET
+	// once on a transport error, so a transport-level failure is masked by
+	// that retry, while a 4xx comes straight back — which is what a rejected
+	// sync token actually looks like.
+	badStatusOnce map[string]int
 }
 
 func newRouteFixtureTransport() *routeFixtureTransport {
-	return &routeFixtureTransport{routes: map[string][]string{}, calls: map[string]int{}, errOnCall: map[string]int{}}
+	return &routeFixtureTransport{routes: map[string][]string{}, calls: map[string]int{},
+		errOnCall: map[string]int{}, errOnce: map[string]bool{}, lastURL: map[string]string{},
+		badStatusOnce: map[string]int{}}
 }
 
 func (r *routeFixtureTransport) on(path string, bodies ...string) *routeFixtureTransport {
 	r.routes[path] = bodies
 	return r
 }
+
+// failOnCallOnce injects a failure for a single call, for paths the code is
+// expected to recover from rather than give up on.
+func (r *routeFixtureTransport) failOnCallOnce(path string, call int, err error) *routeFixtureTransport {
+	r.errOnCall[path] = call
+	r.errOnce[path] = true
+	r.err = err
+	return r
+}
+
+// badRequestOnce makes a route's next call answer 400, the way LinkedIn
+// rejects a stale sync token.
+func (r *routeFixtureTransport) badRequestOnce(path string) *routeFixtureTransport {
+	r.badStatusOnce[path] = 400
+	return r
+}
+
+// lastURLFor returns the most recent request URL seen on a route, for tests
+// asserting on how a query was built.
+func (r *routeFixtureTransport) lastURLFor(path string) string { return r.lastURL[path] }
 
 func (r *routeFixtureTransport) failOnCall(path string, call int, err error) *routeFixtureTransport {
 	r.errOnCall[path] = call
@@ -73,6 +105,7 @@ func (r *routeFixtureTransport) Do(_ context.Context, req *voyager.Request) (*vo
 
 	i := r.calls[path]
 	r.calls[path]++
+	r.lastURL[path] = req.URL
 
 	// >= (not ==): a real failure mode this simulates (rate limiting,
 	// session expiry) doesn't clear itself on GET's built-in one-shot
@@ -80,7 +113,15 @@ func (r *routeFixtureTransport) Do(_ context.Context, req *voyager.Request) (*vo
 	// one-call-only failure would let that retry silently mask the
 	// scenario this test exists to cover.
 	if failAt, ok := r.errOnCall[path]; ok && i >= failAt {
+		if r.errOnce[path] {
+			delete(r.errOnCall, path)
+		}
 		return nil, r.err
+	}
+
+	if status, ok := r.badStatusOnce[path]; ok {
+		delete(r.badStatusOnce, path)
+		return &voyager.Response{StatusCode: status, Body: []byte(`{"status":400}`)}, nil
 	}
 
 	bodies, ok := r.routes[path]
@@ -845,5 +886,201 @@ func TestSyncWithoutAfterClaimsFullBackfill(t *testing.T) {
 	}
 	if !ok || !conv.BackfillDone {
 		t.Error("BackfillDone = false after a complete unfiltered drain, want true")
+	}
+}
+
+// TestSyncResumesFromStoredToken is the point of persisting tokens: a second
+// run must ask the server to continue from where the first stopped rather
+// than replaying the whole mailbox.
+func TestSyncResumesFromStoredToken(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// The mailbox resume point is persisted...
+	tok, ok, err := st.Meta(context.Background(), conversationsSyncTokenKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || tok == "" {
+		t.Fatal("no mailbox sync token stored after a pass")
+	}
+	// ...and so is the conversation's.
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || conv.MessagesSyncToken == "" {
+		t.Fatal("no message sync token stored for c1")
+	}
+
+	// A second pass must send the stored token back.
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if !strings.Contains(rt.lastURLFor(routeConversations), "syncToken") {
+		t.Errorf("second pass did not resume: %s", rt.lastURLFor(routeConversations))
+	}
+}
+
+// TestSyncFullIgnoresStoredToken: --full is the escape hatch for a delta
+// stream that has drifted from what is stored, so it must not send the token.
+func TestSyncFullIgnoresStoredToken(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{full: true}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rt.lastURLFor(routeConversations), "syncToken") {
+		t.Errorf("--full sent a stored token: %s", rt.lastURLFor(routeConversations))
+	}
+}
+
+// TestIncrementalRunDoesNotClaimFullBackfill is the trap worth guarding: a
+// delta drain running out means "nothing changed", not "the whole history is
+// held". Marking BackfillDone on it would tell `history coverage` a
+// conversation was fully archived on the strength of a stream that never
+// replays what came before.
+//
+// The fixture has to keep returning c1 on the second pass, or discovery finds
+// nothing, the message drain is never reached, and the test passes without
+// exercising the guard at all — which is exactly how the first version of it
+// failed to catch anything.
+func TestIncrementalRunDoesNotClaimFullBackfill(t *testing.T) {
+	st := openSyncTestStore(t)
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		on(routeConversations,
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}), // pass 1 fetch
+			conversationsSyncJSON(nil),                           // pass 1 drain ends
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}), // pass 2 fetch
+			conversationsSyncJSON(nil)).                          // pass 2 drain ends
+		on(routeMessages("c1"),
+			// Pass 1 is capped at one message, so it never proves it holds
+			// the whole thread and must not set BackfillDone.
+			messagesSyncJSON([][2]any{{"m3", int64(300)}, {"m2", int64(200)}, {"m1", int64(100)}}),
+			// Pass 2 resumes from the stored token and its delta runs dry.
+			messagesSyncJSON(nil))
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{maxMessages: 1}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	conv, ok, err := st.Conversation(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("c1 not stored by the first pass")
+	}
+	if conv.BackfillDone {
+		t.Fatal("BackfillDone = true after a capped first pass, want false")
+	}
+	if conv.MessagesSyncToken == "" {
+		t.Fatal("no resume point stored, so the next run cannot be incremental")
+	}
+
+	if _, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	// The second pass must actually have reached the message stream —
+	// otherwise the guard below is never exercised.
+	if got := rt.callCount(routeMessages("c1")); got < 2 {
+		t.Fatalf("messages fetched %d times across two passes, want the second pass to reach the drain", got)
+	}
+	if !strings.Contains(rt.lastURLFor(routeMessages("c1")), "syncToken") {
+		t.Fatalf("second pass did not resume the message stream: %s", rt.lastURLFor(routeMessages("c1")))
+	}
+	conv, _, err = st.Conversation(context.Background(), "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conv.BackfillDone {
+		t.Error("BackfillDone = true after an incremental drain ran dry; a delta never replays older history")
+	}
+}
+
+// TestSyncDropsRejectedToken: a stored token the server refuses must not
+// wedge sync. It is discarded and the pass falls back to a full snapshot.
+func TestSyncDropsRejectedToken(t *testing.T) {
+	st := openSyncTestStore(t)
+	if err := st.WithTx(context.Background(), func(tx *store.Tx) error {
+		return tx.SetMeta(context.Background(), conversationsSyncTokenKey, "stale-token")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := newRouteFixtureTransport().
+		on("/me", meJSON).
+		// The rejected call consumes the first slot, so the full-snapshot
+		// retry lands on the second — which has to carry the mailbox.
+		on(routeConversations,
+			conversationsSyncJSON(nil),
+			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
+			conversationsSyncJSON(nil)).
+		on(routeMessages("c1"),
+			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
+			messagesSyncJSON(nil))
+	// The call carrying the stale token is rejected the way LinkedIn does it.
+	rt.badRequestOnce(routeConversations)
+	cl := newFixtureClient(rt)
+
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
+	if err != nil {
+		t.Fatalf("a rejected token must not fail the pass: %v", err)
+	}
+	if summary.ConversationsSeen != 1 {
+		t.Errorf("conversations_seen = %d, want 1 (the full-snapshot retry)", summary.ConversationsSeen)
+	}
+}
+
+// TestSyncAppliesDeletedConversations: a delta stream names a removed
+// conversation once and never mentions it again, so ignoring deletedUrns
+// would leave it in the store forever.
+func TestSyncAppliesDeletedConversations(t *testing.T) {
+	ctx := context.Background()
+	st := openSyncTestStore(t)
+	if err := st.WithTx(ctx, func(tx *store.Tx) error {
+		return tx.UpsertConversation(ctx, store.Conversation{ID: "gone", URN: "urn:gone", UpdatedAt: 1}, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"data":{"data":{"messengerConversationsBySyncToken":{"*elements":[],
+		"metadata":{"newSyncToken":"t2","deletedUrns":["urn:li:msg_conversation:(urn:li:fsd_profile:me,gone)"],
+		"shouldClearCache":false}}}},"included":[]}`
+	rt := newRouteFixtureTransport().on("/me", meJSON).on(routeConversations, body)
+	cl := newFixtureClient(rt)
+
+	if _, err := runSyncPass(ctx, cl, st, syncOptions{}, discardProgress(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := st.Conversation(ctx, "gone"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Error("a conversation the server reported deleted is still in the store")
 	}
 }

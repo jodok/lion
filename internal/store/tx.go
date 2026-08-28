@@ -294,3 +294,57 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// SetMeta writes a key/value pair to the store's meta table.
+func (t *Tx) SetMeta(ctx context.Context, key, value string) error {
+	_, err := t.tx.ExecContext(ctx,
+		`INSERT INTO meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("store: write meta %s: %w", key, err)
+	}
+	return nil
+}
+
+// SetMessagesSyncToken records where a conversation's message stream was left
+// off, so the next run can ask only for what changed rather than re-draining
+// the whole history.
+//
+// An empty token clears the column, which is how a caller says "this stream
+// has to start over" — the server rejecting a stale token, say. Storing an
+// empty string rather than deleting the row keeps the conversation itself
+// intact; only the resume point is discarded.
+func (t *Tx) SetMessagesSyncToken(ctx context.Context, conversationID, token string) error {
+	var v any
+	if token != "" {
+		v = token
+	}
+	_, err := t.tx.ExecContext(ctx,
+		`UPDATE conversations SET messages_sync_token = ? WHERE id = ?`, v, conversationID)
+	if err != nil {
+		return fmt.Errorf("store: write sync token for %s: %w", conversationID, err)
+	}
+	return nil
+}
+
+// DeleteMessages removes messages by URN.
+//
+// Needed once sync resumes from a token: a full snapshot every run made a
+// deleted message simply stop appearing, whereas a delta stream names it once
+// in deletedUrns and never mentions it again. Ignoring that would leave it in
+// the local archive forever, so `lion search` would keep returning something
+// the person deleted on LinkedIn.
+//
+// The FTS index follows through the AFTER DELETE trigger, so the body stops
+// being searchable too.
+func (t *Tx) DeleteMessages(ctx context.Context, urns []string) error {
+	for _, urn := range urns {
+		if urn == "" {
+			continue
+		}
+		if _, err := t.tx.ExecContext(ctx, `DELETE FROM messages WHERE urn = ?`, urn); err != nil {
+			return fmt.Errorf("store: delete message %s: %w", urn, err)
+		}
+	}
+	return nil
+}
