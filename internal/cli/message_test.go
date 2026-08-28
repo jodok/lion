@@ -184,7 +184,7 @@ func TestMessageSendPersonIDRejectedClearly(t *testing.T) {
 // later, e.g. on missing credentials, not on the id-shape check).
 func TestMessageSendConversationURNAcceptedPastValidation(t *testing.T) {
 	isolateHome(t) // no saved account, so app.Client() itself fails
-	err := runRoot(t, "message", "send", "urn:li:fs_conversation:12345", "hello")
+	err := runRoot(t, "--cookie-transport", "message", "send", "urn:li:fs_conversation:12345", "hello")
 	if err == nil {
 		t.Fatal("expected an error (no stored account), but the id-shape check should not be what causes it")
 	}
@@ -200,7 +200,7 @@ func TestMessageSendDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "message", "send", "urn:li:fs_conversation:12345", "hello", "there", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "message", "send", "urn:li:fs_conversation:12345", "hello", "there", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -231,7 +231,7 @@ func TestMessageSendDeclineAbortsWithoutMutating(t *testing.T) {
 
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "message", "send", "urn:li:fs_conversation:12345", "hello")
+		runErr = runRoot(t, "--cookie-transport", "message", "send", "urn:li:fs_conversation:12345", "hello")
 	})
 	if runErr != nil {
 		t.Fatalf("decline should exit cleanly (0), got error: %v", runErr)
@@ -251,7 +251,7 @@ func TestMessageSendProfileURNNotRejected(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "message", "send", "urn:li:fs_miniProfile:ACoAAA1", "hello", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "message", "send", "urn:li:fs_miniProfile:ACoAAA1", "hello", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatalf("a profile URN must be accepted, got %v", runErr)

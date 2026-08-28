@@ -61,35 +61,36 @@ LinkedHelper and Lemlist).
 make build
 # Sign in once, in a real browser window. lion keeps the session in a
 # Chromium profile it owns, so later runs need nothing pasted.
-./bin/lion --browser auth login
-./bin/lion --browser profile view me --json
-./bin/lion --browser profile search "compiler engineer" --max 10 --plain
+./bin/lion auth login
+./bin/lion profile view me --json
+./bin/lion profile search "compiler engineer" --max 10 --plain
 ```
 
-### Two transports
+### Transports
 
-`--browser` (recommended) drives a real Chromium that lion owns and issues
-Voyager calls as same-origin `fetch()` from inside a loaded linkedin.com
-page. The TLS handshake, headers, client hints, and origin are Chrome's own,
-because they are Chrome's. Sign-in happens in a visible window — lion never
-types a password or answers a challenge — and every later command runs
-headless, so a periodic `lion --browser sync` works from a timer. Put
-`{"browser": true}` in `$LION_HOME/config.json` (or set `LION_BROWSER=1`) to
-avoid passing the flag each time.
+lion drives a real Chromium it owns, and issues Voyager calls as same-origin
+`fetch()` from inside a loaded linkedin.com page — so the TLS handshake,
+headers, client hints, and origin are Chrome's own, because they are Chrome's.
+Sign-in happens in a visible window; lion never types a password or answers a
+challenge. Every later command runs headless against the profile it saved, so
+a periodic `lion sync` works from a timer.
 
-The older cookie transport is still the default: paste the whole `Cookie:`
-header for linkedin.com and lion replays it over a TLS fingerprint borrowed
-from uTLS.
+The older cookie transport is **deprecated**. It replays a pasted cookie jar
+over a synthesized TLS fingerprint, and LinkedIn cross-checks those signals:
+a session used that way can be **revoked account-wide within minutes**,
+signing you out of your own browser. It is still reachable with
+`--cookie-transport`, or by passing any of the cookie options to
+`auth login`, and both print a warning.
 
 ```sh
-./bin/lion auth login --cookies-stdin
+lion auth login                                  # browser, the default
+pbpaste | lion auth login --cookies-stdin        # deprecated cookie path
 ```
 
-Be aware of what it costs. That transport sends a synthesized User-Agent over
-a handshake it does not match, without the header set Chrome actually emits.
-LinkedIn's bot management cross-checks those signals, and a session used this
-way can be **revoked account-wide within minutes** — signing you out of your
-own browser, not merely failing the command. Prefer `--browser`.
+Upgrading from a cookie-only setup: your stored credential is not used
+automatically. Run `lion auth login` once to sign in through a browser, or
+pass `--cookie-transport` to keep the old behaviour — lion says as much if it
+finds stored cookies and no browser session.
 
 Every mutation is previewed with `--dry-run` and requires `--yes` to actually
 send. `--no-input` suppresses prompts but does **not** authorize a write.

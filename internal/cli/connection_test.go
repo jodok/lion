@@ -108,7 +108,7 @@ func TestConnectionInviteDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "connection", "invite", "some-id", "--note", "let's connect", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "connection", "invite", "some-id", "--note", "let's connect", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -135,7 +135,7 @@ func TestConnectionRemoveDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "connection", "remove", "some-id", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "connection", "remove", "some-id", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -162,7 +162,7 @@ func TestConnectionInviteDeclineAbortsWithoutMutating(t *testing.T) {
 
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "connection", "invite", "some-id")
+		runErr = runRoot(t, "--cookie-transport", "connection", "invite", "some-id")
 	})
 	if runErr != nil {
 		t.Fatalf("decline should exit cleanly (0), got error: %v", runErr)
@@ -180,7 +180,7 @@ func TestConnectionInviteNonTTYWithoutYesErrors(t *testing.T) {
 	restore := forceInteractive(false)
 	defer restore()
 
-	err := runRoot(t, "connection", "invite", "some-id")
+	err := runRoot(t, "--cookie-transport", "connection", "invite", "some-id")
 	if err == nil {
 		t.Fatal("expected an error for a non-interactive write without --yes")
 	}

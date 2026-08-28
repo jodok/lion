@@ -50,6 +50,9 @@ type Config struct {
 	// drives, instead of replaying stored cookies over a synthesized HTTP
 	// client. Opt-in for now; see internal/browser's package doc.
 	Browser bool
+	// CookieTransport opts back into the retired cookie path. It is the
+	// explicit inverse of Browser, which now defaults on.
+	CookieTransport bool
 	// Headed shows that browser's window. Sign-in forces it on regardless.
 	Headed bool
 	// ChromePath overrides the Chromium binary the browser transport uses.

@@ -38,7 +38,6 @@ var errMaxDBSizeReached = errors.New("store size limit reached (--max-db-size)")
 
 func newSyncCmd() *cobra.Command {
 	var (
-		backfill         bool
 		after            string
 		maxConversations int
 		maxMessages      int
@@ -148,7 +147,6 @@ func newSyncCmd() *cobra.Command {
 			defer release()
 
 			opts := syncOptions{
-				backfill:         backfill,
 				afterMs:          afterMs,
 				maxConversations: maxConversations,
 				maxMessages:      maxMessages,
@@ -187,7 +185,6 @@ func newSyncCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&backfill, "backfill", false, "after catching up, page backwards from the oldest stored message until history is exhausted")
 	cmd.Flags().StringVar(&after, "after", "", "only sync conversations/messages at or after this time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().IntVar(&maxConversations, "max-conversations", 0, "cap the number of conversations processed this run (0 = no cap)")
 	cmd.Flags().IntVar(&maxMessages, "max-messages", 0, "cap the number of messages fetched this run (0 = no cap)")
@@ -204,7 +201,6 @@ func newSyncCmd() *cobra.Command {
 // syncOptions bundles one pass's parameters so runSyncPass doesn't carry a
 // long, error-prone positional-argument list.
 type syncOptions struct {
-	backfill         bool
 	afterMs          *int64
 	maxConversations int
 	maxMessages      int
@@ -321,26 +317,12 @@ func runSyncPass(ctx context.Context, cl *voyager.Client, st *store.Store, opts 
 			summary.ConversationsUpdated++
 		}
 
-		if opts.backfill {
-			bAdded, backfillComplete, err := backfillMessages(ctx, cl, st, conv.ID, opts, budget, progress)
-			summary.MessagesAdded += bAdded
-			if bAdded > 0 && added == 0 {
-				summary.ConversationsUpdated++
-			}
-			if !backfillComplete {
-				summary.Complete = false
-			}
-			if err != nil {
-				if errors.Is(err, errMaxDBSizeReached) {
-					progress.Warn("%s", err)
-					summary.Complete = false
-					break
-				}
-				summary.Complete = false
-				summary.Elapsed = formatDuration(time.Since(start))
-				return summary, err
-			}
-		}
+		// No --backfill branch: a drain returns a conversation's whole
+		// history, so catch-up above has already fetched everything a
+		// separate backwards walk used to find. `lion history backfill` —
+		// which wacli also ships as a first-class command — remains the way
+		// to fill a conversation an earlier --after or budget-capped run
+		// left partial.
 	}
 
 	progress.Event("sync_complete", map[string]any{

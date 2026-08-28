@@ -166,7 +166,7 @@ func TestResolveBackfillTargetsUnknownConversationErrors(t *testing.T) {
 // backfill must continue paging backwards from the conversation's already-
 // recorded OldestSynced, not restart from scratch, and mark BackfillDone
 // once it reaches an empty page — using the exact same backfillMessages
-// code path `lion sync --backfill` uses.
+// code path `lion history backfill` uses.
 func TestHistoryBackfillResumesFromStoredCursor(t *testing.T) {
 	st := openSyncTestStore(t)
 	ctx := context.Background()
