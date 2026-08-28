@@ -34,15 +34,16 @@ func newAuthLoginCmd() *cobra.Command {
 		Use:   "login",
 		Short: "Store a LinkedIn session (full browser cookie jar)",
 		Long: "Store a LinkedIn session.\n\n" +
-			"With --browser (recommended), lion opens a real browser window; you " +
-			"sign in there yourself, including any two-factor or checkpoint step, " +
-			"and lion keeps the session in a Chromium profile it owns. Nothing is " +
-			"pasted, and later commands run headless, so a periodic run works from " +
-			"a timer.\n\n" +
-			"Without --browser, lion stores browser session cookies you supply and " +
-			"replays them over a synthesized TLS fingerprint. LinkedIn cross-checks " +
-			"those signals and can revoke the session account-wide within minutes, " +
-			"signing you out of your own browser — prefer --browser.\n\n" +
+			"By default lion opens a real browser window; you sign in there " +
+			"yourself, including any two-factor or checkpoint step, and lion keeps " +
+			"the session in a Chromium profile it owns. Nothing is pasted, and " +
+			"later commands run headless, so a periodic run works from a timer.\n\n" +
+			"The old cookie transport is deprecated and kept only for " +
+			"compatibility: it replays cookies you supply over a synthesized TLS " +
+			"fingerprint, and LinkedIn cross-checks those signals and can revoke " +
+			"the session account-wide within minutes, signing you out of your own " +
+			"browser. Passing any of the cookie options below selects it, as does " +
+			"--cookie-transport.\n\n" +
 			"Cookie transport: GraphQL endpoints (search, modern profile) reject a " +
 			"bare li_at+JSESSIONID pair and want the full linkedin.com cookie jar " +
 			"(bcookie, bscookie, lidc, li_gc, ...) — see DESIGN.md §3.3. Pipe the " +
@@ -57,8 +58,25 @@ func newAuthLoginCmd() *cobra.Command {
 			"when you do this.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app := appFrom(cmd)
-			if app.Cfg.Browser {
+			// Supplying cookies is itself a request for the cookie path.
+			// Without this, `pbpaste | lion auth login --cookies-stdin` would
+			// open a browser and ignore the piped jar now that --browser is
+			// the default — silently doing something else with input the
+			// person deliberately provided.
+			suppliedCookies := cookiesStdin || cookiesFile != "" || cookiesFlag != "" ||
+				liAt != "" || jsession != ""
+			if app.Cfg.Browser && !suppliedCookies {
 				return browserLogin(cmd.Context(), app, firstNonEmpty(alias, app.Cfg.Account, "default"))
+			}
+			if suppliedCookies && app.Cfg.Browser {
+				// The root warning keys on --cookie-transport, which this
+				// path does not require: supplying cookies selects it on its
+				// own, and that is the commonest way to reach the deprecated
+				// transport, so it has to say so here too.
+				fmt.Fprintln(os.Stderr, "warning: storing pasted cookies is deprecated. LinkedIn can revoke "+
+					"a session used this way account-wide within minutes, signing you out of your own "+
+					"browser. Run `lion auth login` with no cookie options to sign in through a real "+
+					"browser instead.")
 			}
 			warnArgvCredentials(liAt, jsession, cookiesFlag)
 			cookies, err := resolveLoginCookies(cookiesFlag, cookiesFile, cookiesStdin, liAt, jsession, app.Cfg.NoInput, cmd.InOrStdin())

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jodok/lion/internal/auth"
@@ -462,6 +463,94 @@ func TestExitCodeBudgetLockAndPersist(t *testing.T) {
 		wrapped := fmt.Errorf("invite: %w", err)
 		if got := exitCode(wrapped); got != ExitRateLimited {
 			t.Errorf("exitCode(wrapped %v) = %d, want ExitRateLimited (%d)", err, got, ExitRateLimited)
+		}
+	}
+}
+
+// TestBrowserIsTheDefaultTransport pins the flip. The cookie transport gets a
+// session revoked account-wide within minutes (see internal/browser), so it
+// cannot be what an unqualified `lion` command reaches for.
+func TestBrowserIsTheDefaultTransport(t *testing.T) {
+	isolateHome(t)
+	cfg := &config.Config{}
+	root, _ := newRootCmd(cfg)
+	root.SetArgs([]string{"version"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Browser {
+		t.Error("Browser = false with no flags, want true (the browser transport is the default)")
+	}
+}
+
+// TestCookieTransportOptsOut: --cookie-transport is the explicit escape
+// hatch, and must win over the default without the person having to know
+// which setting takes precedence.
+func TestCookieTransportOptsOut(t *testing.T) {
+	isolateHome(t)
+	cfg := &config.Config{}
+	root, _ := newRootCmd(cfg)
+	root.SetArgs([]string{"--cookie-transport", "version"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Browser {
+		t.Error("Browser = true with --cookie-transport, want false")
+	}
+}
+
+// TestSuppliedCookiesSelectTheCookiePath: `pbpaste | lion auth login
+// --cookies-stdin` must keep working without also naming --cookie-transport.
+// Otherwise the browser default would open a window and ignore a jar the
+// person deliberately piped in.
+//
+// The tell is which error comes back: the cookie path rejects an incomplete
+// jar as a usage error, where the browser path would have tried to launch
+// Chromium and reported a session problem instead.
+func TestSuppliedCookiesSelectTheCookiePath(t *testing.T) {
+	isolateHome(t)
+	cfg := &config.Config{}
+	root, app := newRootCmd(cfg)
+	root.SetArgs([]string{"auth", "login", "--cookies-stdin", "--no-input"})
+	root.SetIn(strings.NewReader("li_at=only-this-one\n"))
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	ctx := context.WithValue(context.Background(), ctxKey{}, app)
+
+	err := root.ExecuteContext(ctx)
+	if err == nil {
+		t.Fatal("expected an error for a jar missing JSESSIONID")
+	}
+	if !strings.Contains(err.Error(), "JSESSIONID") {
+		t.Errorf("error = %q, want the cookie path's complaint about the missing cookie "+
+			"(a browser-path error would mean the piped jar was ignored)", err)
+	}
+	if exitCode(err) != ExitUsage {
+		t.Errorf("exit code = %d, want %d (usage)", exitCode(err), ExitUsage)
+	}
+}
+
+// TestReadOnlyAliasMatchesWacli: wacli spells this --read-only, and lion
+// --readonly. Both are accepted so anyone driving the two tools does not have
+// to remember which is which; aliasing rather than renaming keeps existing
+// lion scripts working.
+func TestReadOnlyAliasMatchesWacli(t *testing.T) {
+	for _, spelling := range []string{"--readonly", "--read-only"} {
+		isolateHome(t)
+		cfg := &config.Config{}
+		root, _ := newRootCmd(cfg)
+		root.SetArgs([]string{spelling, "version"})
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("%s: %v", spelling, err)
+		}
+		if !cfg.ReadOnly {
+			t.Errorf("%s did not set ReadOnly", spelling)
 		}
 	}
 }

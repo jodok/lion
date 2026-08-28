@@ -66,7 +66,7 @@ func TestFeedPostDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "feed", "post", "hello", "world", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "feed", "post", "hello", "world", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -89,7 +89,7 @@ func TestFeedCommentDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "feed", "comment", "urn:li:activity:1", "nice", "post", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "feed", "comment", "urn:li:activity:1", "nice", "post", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -112,7 +112,7 @@ func TestFeedReactDryRunShowsIntendedPayload(t *testing.T) {
 	saveFakeAccount(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "feed", "react", "urn:li:activity:1", "--type", "celebrate", "--dry-run", "--json")
+		runErr = runRoot(t, "--cookie-transport", "feed", "react", "urn:li:activity:1", "--type", "celebrate", "--dry-run", "--json")
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -140,7 +140,7 @@ func TestFeedPostDeclineAbortsWithoutMutating(t *testing.T) {
 
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runRoot(t, "feed", "post", "hello", "world")
+		runErr = runRoot(t, "--cookie-transport", "feed", "post", "hello", "world")
 	})
 	if runErr != nil {
 		t.Fatalf("decline should exit cleanly (0), got error: %v", runErr)
@@ -158,7 +158,7 @@ func TestFeedPostDeclineAbortsWithoutMutating(t *testing.T) {
 func TestFeedPostDryRunValidatesVisibility(t *testing.T) {
 	isolateHome(t)
 	saveFakeAccount(t)
-	err := runRoot(t, "feed", "post", "hello", "--visibility", "friends", "--dry-run")
+	err := runRoot(t, "--cookie-transport", "feed", "post", "hello", "--visibility", "friends", "--dry-run")
 	if err == nil {
 		t.Fatal("dry-run with an invalid --visibility should fail, as the live run would")
 	}
@@ -172,7 +172,7 @@ func TestFeedPostDryRunValidatesVisibility(t *testing.T) {
 func TestFeedPostDryRunStillWorksWhenValid(t *testing.T) {
 	isolateHome(t)
 	saveFakeAccount(t)
-	if err := runRoot(t, "feed", "post", "hello", "--visibility", "public", "--dry-run"); err != nil {
+	if err := runRoot(t, "--cookie-transport", "feed", "post", "hello", "--visibility", "public", "--dry-run"); err != nil {
 		t.Fatalf("valid dry-run should succeed, got %v", err)
 	}
 }

@@ -193,14 +193,16 @@ func newHistoryBackfillCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "backfill",
-		Short: "Page further back into history for conversations not yet fully synced",
-		Long: "Backfill continues paging a conversation's messages backwards " +
-			"from wherever it's already synced to, until either it reaches " +
-			"the true start of the thread (recorded as backfill_done — see " +
-			"`lion history coverage`) or this run's limits are hit. It calls " +
-			"the exact same code path as `lion sync --backfill`, just " +
-			"without also re-discovering conversations or catching up to " +
-			"the newest messages first.\n\n" +
+		Short: "Fill in history for conversations not yet fully synced",
+		Long: "Backfill drains a conversation's message history until it " +
+			"reaches the true start of the thread (recorded as " +
+			"backfill_done — see `lion history coverage`) or this run's " +
+			"limits are hit.\n\n" +
+			"A plain `lion sync` already reaches the end of history on its " +
+			"own, which is why the old `sync --backfill` flag was dropped. " +
+			"This is what fills a conversation an --after or budget-capped " +
+			"run left partial, and unlike sync it skips re-discovering " +
+			"conversations and catching up to the newest messages first.\n\n" +
 			"With no --conversation, every stored conversation not yet " +
 			"backfill_done is processed. Like `lion sync`, this is " +
 			"read-only with respect to LinkedIn — it never posts, sends, or " +

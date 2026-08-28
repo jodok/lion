@@ -368,10 +368,16 @@ func TestSyncCatchUpDoesNotRestoreKnownMessages(t *testing.T) {
 	}
 }
 
-// TestSyncBackfillReachesEndAndSetsFlag is the required --backfill test:
-// paging backwards must continue until an empty page, at which point
-// BackfillDone must be set.
-func TestSyncBackfillReachesEndAndSetsFlag(t *testing.T) {
+// TestSyncPlainRunReachesEndOfHistory replaces
+// TestSyncBackfillReachesEndAndSetsFlag.
+//
+// That test drove `syncOptions{backfill: true}`, and the flag is gone: a
+// drain returns a conversation's whole history, so catch-up already fetches
+// everything the separate backwards walk used to find. What replaces the
+// assertion is the reason the flag became unnecessary — a plain sync, with
+// nothing opted into, must drain across responses to the end of history and
+// set BackfillDone itself.
+func TestSyncPlainRunReachesEndOfHistory(t *testing.T) {
 	st := openSyncTestStore(t)
 	rt := newRouteFixtureTransport().
 		on("/me", meJSON).
@@ -379,33 +385,27 @@ func TestSyncBackfillReachesEndAndSetsFlag(t *testing.T) {
 			conversationsSyncJSON([][2]any{{"c1", int64(5000)}}),
 			conversationsSyncJSON(nil)).
 		on(routeMessages("c1"),
-			// Catch-up's first (and only) page...
 			messagesSyncJSON([][2]any{{"m2", int64(200)}}),
-			// ...then backfill continues from OldestSynced=200 downward:
 			messagesSyncJSON([][2]any{{"m1", int64(100)}}),
-			messagesSyncJSON(nil)) // the terminal empty page
+			messagesSyncJSON(nil))
 	cl := newFixtureClient(rt)
 
-	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{backfill: true}, discardProgress(t))
+	summary, err := runSyncPass(context.Background(), cl, st, syncOptions{}, discardProgress(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if summary.MessagesAdded != 2 {
-		t.Fatalf("messages_added = %d, want 2 (m2 from catch-up, m1 from backfill)", summary.MessagesAdded)
+		t.Fatalf("messages_added = %d, want 2 (both drained without --backfill)", summary.MessagesAdded)
 	}
 	if !summary.Complete {
 		t.Error("Complete = false, want true")
 	}
-
 	conv, ok, err := st.Conversation(context.Background(), "c1")
-	if err != nil || !ok {
-		t.Fatalf("Conversation: ok=%v err=%v", ok, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !conv.BackfillDone {
-		t.Error("BackfillDone = false, want true once backfill reaches an empty page")
-	}
-	if conv.OldestSynced == nil || *conv.OldestSynced != 100 {
-		t.Errorf("OldestSynced = %v, want 100", conv.OldestSynced)
+	if !ok || !conv.BackfillDone {
+		t.Error("BackfillDone = false after a plain run reached the end of history, want true")
 	}
 }
 

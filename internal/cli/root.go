@@ -17,6 +17,7 @@ import (
 	"github.com/jodok/lion/internal/ratelimit"
 	"github.com/jodok/lion/internal/voyager"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 )
 
@@ -152,6 +153,21 @@ func (a *App) browserClient(opts ...voyager.Option) (*voyager.Client, error) {
 		}
 		if err := b.Open(ctx); err != nil {
 			b.Close()
+			// Someone upgrading arrives here with a working cookie
+			// credential and an empty browser profile, and "not signed in"
+			// alone would look like lion had lost their session. Name both
+			// ways forward instead. Deliberately not an automatic fallback:
+			// the cookie transport is what gets a session revoked
+			// account-wide, so choosing it has to be explicit.
+			if errors.Is(err, browser.ErrLoggedOut) {
+				if _, cErr := auth.Get(a.Cfg.Account); cErr == nil {
+					return nil, fmt.Errorf("%w\n\nThis account has stored cookies from an older lion, "+
+						"but lion now drives a real browser by default — replaying cookies gets the "+
+						"session revoked account-wide. Either run `lion auth login` to sign in once "+
+						"through a browser, or pass --cookie-transport to keep using the stored "+
+						"cookies (deprecated)", err)
+				}
+			}
 			return nil, err
 		}
 		a.browser = b
@@ -354,6 +370,19 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 			if err := config.Apply(cfg, cmd.Flags()); err != nil {
 				return err
 			}
+			// --cookie-transport is the explicit opt-out and wins over both
+			// the --browser default and anything the config file said, so a
+			// person reaching for the old path gets it without having to
+			// know which setting takes precedence.
+			if cmd.Flags().Changed("cookie-transport") && cfg.CookieTransport {
+				cfg.Browser = false
+			}
+			if !cfg.Browser {
+				fmt.Fprintln(os.Stderr, "warning: the cookie transport is deprecated. It replays stored "+
+					"cookies over a synthesized TLS fingerprint, and LinkedIn can revoke the session "+
+					"account-wide within minutes — signing you out of your own browser. Run `lion auth "+
+					"login` without --cookie-transport to sign in through a real browser instead.")
+			}
 			return nil
 		},
 	}
@@ -367,7 +396,16 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 	pf := root.PersistentFlags()
 	pf.BoolVar(&cfg.JSON, "json", false, "emit JSON")
 	pf.BoolVar(&cfg.Plain, "plain", false, "emit tab-separated values")
-	pf.BoolVar(&cfg.ReadOnly, "readonly", false, "block all mutating actions")
+	pf.BoolVar(&cfg.ReadOnly, "readonly", false, "block all mutating actions (--read-only also accepted, matching wacli)")
+	// wacli spells this --read-only. Accepting both costs a normalizer and
+	// spares anyone driving both tools from remembering which is which;
+	// aliasing rather than renaming keeps every existing lion script working.
+	root.SetGlobalNormalizationFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {
+		if name == "read-only" {
+			name = "readonly"
+		}
+		return pflag.NormalizedName(name)
+	})
 	pf.BoolVar(&cfg.DryRun, "dry-run", false, "print intended mutations without sending")
 	pf.BoolVar(&cfg.Yes, "yes", false, "assume yes for write confirmations")
 	pf.BoolVar(&cfg.NoInput, "no-input", false, "never prompt (for CI); writes still require --yes")
@@ -376,9 +414,14 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 	pf.IntVar(&cfg.Max, "max", 0, "cap number of results (0 = command default)")
 	pf.StringVar(&cfg.Account, "account", "", "account alias (default: primary)")
 	pf.StringVar(&cfg.ConfigPath, "config", "", "path to config file (default: $LION_HOME/config.json)")
-	pf.BoolVar(&cfg.Browser, "browser", false, "route LinkedIn traffic through a real Chromium lion drives (sign in with: lion auth login --browser)")
-	pf.BoolVar(&cfg.Headed, "headed", false, "show the browser window (--browser only; sign-in always shows it)")
-	pf.StringVar(&cfg.ChromePath, "chrome-path", "", "Chromium binary for --browser (default: system Chrome, else a downloaded build)")
+	// Default true: the cookie transport's synthesized fingerprint gets a
+	// session revoked account-wide within minutes (see internal/browser), so
+	// it cannot be what an unqualified `lion` command uses.
+	pf.BoolVar(&cfg.Browser, "browser", true, "route LinkedIn traffic through a real Chromium lion drives (the default)")
+	_ = pf.MarkDeprecated("browser", "it is the default; pass --cookie-transport for the old behaviour")
+	pf.BoolVar(&cfg.CookieTransport, "cookie-transport", false, "replay stored cookies instead of driving a browser (deprecated; LinkedIn can revoke the session account-wide)")
+	pf.BoolVar(&cfg.Headed, "headed", false, "show the browser window (sign-in always shows it regardless)")
+	pf.StringVar(&cfg.ChromePath, "chrome-path", "", "Chromium binary to drive (default: system Chrome, else a downloaded build)")
 
 	app := &App{Cfg: cfg}
 
