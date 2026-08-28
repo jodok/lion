@@ -199,8 +199,9 @@ func Launch(ctx context.Context, opts Options) (*Browser, error) {
 			// the browser is closed. The profile kept the anonymous cookies
 			// from the first page load and lost li_at.
 			_ = br.Close()
-			waitForExit(l.PID(), browserExitGrace)
-			l.Kill()
+			if !waitForExit(l.PID(), browserExitGrace) {
+				l.Kill() // ignored the close request; force it
+			}
 			cancel()
 		},
 	}
@@ -250,7 +251,11 @@ func (b *Browser) Open(ctx context.Context) error {
 	// actually held when the decision was made rather than only that it
 	// went badly.
 	b.DumpCookies("after loading linkedin")
-	if !b.signedIn() {
+	ok, err := b.signedIn()
+	if err != nil {
+		return fmt.Errorf("check session: %w", err)
+	}
+	if !ok {
 		return ErrLoggedOut
 	}
 	return nil
@@ -263,19 +268,19 @@ const sessionCookieName = "li_at"
 // hasSession reports whether the profile holds a LinkedIn session cookie.
 //
 // li_at is httpOnly, so this goes through CDP rather than document.cookie.
-func (b *Browser) hasSession() bool {
+func (b *Browser) hasSession() (bool, error) {
 	// Empty list means "cookies for the page we are actually on", which
 	// keeps this correct without hardcoding an origin the tests override.
 	cookies, err := b.page.Cookies(nil)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, c := range cookies {
 		if c.Name == sessionCookieName && c.Value != "" {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // signedIn reports whether this profile has an authenticated LinkedIn
@@ -294,20 +299,28 @@ func (b *Browser) hasSession() bool {
 // The URL check is kept as a second condition rather than replaced, because
 // the two catch different things: a checkpoint is reachable while li_at
 // still exists, and that is a session lion cannot use yet.
-func (b *Browser) signedIn() bool {
-	if !b.hasSession() {
-		return false
+func (b *Browser) signedIn() (bool, error) {
+	ok, err := b.hasSession()
+	if err != nil {
+		return false, err
 	}
-	u := strings.ToLower(b.page.MustInfo().URL)
+	if !ok {
+		return false, nil
+	}
+	info, err := b.page.Info()
+	if err != nil {
+		return false, err
+	}
+	u := strings.ToLower(info.URL)
 	switch {
 	case strings.Contains(u, "/uas/login"), strings.Contains(u, "/login"):
-		return false
+		return false, nil
 	case strings.Contains(u, "/authwall"):
-		return false
+		return false, nil
 	case strings.Contains(u, "/checkpoint/"):
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // Login drives an interactive sign-in: it opens the login page and waits
@@ -325,13 +338,31 @@ func (b *Browser) Login(ctx context.Context, poll time.Duration) error {
 	if err := b.page.Context(ctx).Navigate(loginURL); err != nil {
 		return fmt.Errorf("open login page: %w", err)
 	}
+	// A browser that has gone away answers every probe with an error, which
+	// is indistinguishable from "not signed in yet" if only the bool is
+	// consulted — so closing the sign-in window used to leave lion polling
+	// silently until the ten-minute deadline and then blaming the person for
+	// being slow. Consecutive failures mean the browser is gone; a single one
+	// can just be a navigation swapping the execution context out underfoot,
+	// which happens constantly during a real sign-in.
+	const goneAfter = 3
+	var consecutive int
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(poll):
 		}
-		if b.signedIn() {
+		ok, err := b.signedIn()
+		if err != nil {
+			consecutive++
+			if consecutive >= goneAfter {
+				return fmt.Errorf("browser closed before sign-in completed: %w", err)
+			}
+			continue
+		}
+		consecutive = 0
+		if ok {
 			return nil
 		}
 	}
@@ -348,23 +379,30 @@ const browserExitGrace = 10 * time.Second
 // produced with that box ticked.
 const sessionRetention = 365 * 24 * time.Hour
 
-// waitForExit blocks until pid is gone or the grace period elapses. Signal 0
-// performs the liveness check without delivering anything.
-func waitForExit(pid int, grace time.Duration) {
+// waitForExit blocks until pid is gone or the grace period elapses, and
+// reports whether it observed the exit. Signal 0 performs the liveness check
+// without delivering anything.
+//
+// The bool matters: rod's launcher.Kill sleeps a full second before
+// signalling, so calling it after the browser has already exited makes every
+// command a second slower and aims a kill at a PID the OS may since have
+// handed to something else.
+func waitForExit(pid int, grace time.Duration) bool {
 	if pid == 0 {
-		return
+		return true
 	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return
+		return true
 	}
 	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
 		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			return // exited
+			return true // exited
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return false
 }
 
 // PersistSession makes the session survive the browser closing.
@@ -422,7 +460,11 @@ func (b *Browser) DumpCookies(label string) {
 		fmt.Fprintf(os.Stderr, "[cookies %s] error: %v\n", label, err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[cookies %s] page=%s count=%d\n", label, b.page.MustInfo().URL, len(cookies))
+	page := "?"
+	if info, err := b.page.Info(); err == nil {
+		page = info.URL
+	}
+	fmt.Fprintf(os.Stderr, "[cookies %s] page=%s count=%d\n", label, page, len(cookies))
 	names := make([]string, 0, len(cookies))
 	for _, c := range cookies {
 		exp := "session"

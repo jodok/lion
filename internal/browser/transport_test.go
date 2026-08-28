@@ -280,7 +280,11 @@ func TestSignedInRequiresSessionCookie(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBrowser(t, srv.URL)
-	if b.signedIn() {
+	got, err := b.signedIn()
+	if err != nil {
+		t.Fatalf("signedIn: %v", err)
+	}
+	if got {
 		t.Error("signedIn() = true on a page with no li_at cookie")
 	}
 
@@ -290,7 +294,11 @@ func TestSignedInRequiresSessionCookie(t *testing.T) {
 	if err := b.page.WaitLoad(); err != nil {
 		t.Fatal(err)
 	}
-	if !b.signedIn() {
+	got, err = b.signedIn()
+	if err != nil {
+		t.Fatalf("signedIn: %v", err)
+	}
+	if !got {
 		t.Error("signedIn() = false after li_at was set")
 	}
 }
@@ -781,5 +789,100 @@ func TestRestoreSessionPreservesAttributes(t *testing.T) {
 	}
 	if err := DeleteSession("attrs"); err != nil {
 		t.Errorf("DeleteSession on an already-deleted session = %v, want nil", err)
+	}
+}
+
+// TestLoginFailsFastWhenBrowserCloses is the regression test for lion
+// polling in silence for ten minutes after the sign-in window went away.
+// A dead browser answers every probe with an error, which the loop used to
+// read as "not signed in yet".
+func TestLoginFailsFastWhenBrowserCloses(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>sign in</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	origLogin := loginURL
+	loginURL = srv.URL + "/signin"
+	defer func() { loginURL = origLogin }()
+
+	// The person gives up and closes the window.
+	b.Close()
+
+	// A deadline far longer than this should take: the point is that Login
+	// returns because the browser is gone, not because it timed out.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := b.Login(ctx, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("Login returned nil after the browser was closed")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Login waited for the deadline instead of noticing the browser was gone: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("Login took %v to notice a closed browser", elapsed)
+	}
+}
+
+// TestRestoreSessionIgnoresUnreadableFile keeps a corrupt session file from
+// blocking the one command that would replace it. Launch restores before
+// returning, and auth login goes through Launch.
+func TestRestoreSessionIgnoresUnreadableFile(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed")
+	}
+	t.Setenv("LION_HOME", t.TempDir())
+	path, err := sessionPath("broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	// Launch must succeed despite the unreadable file, or sign-in is
+	// unreachable and the only remedy is deleting it by hand.
+	b, err := Launch(ctx, Options{Alias: "broken"})
+	if err != nil {
+		t.Fatalf("Launch with an unreadable session file = %v, want it ignored", err)
+	}
+	b.Close()
+}
+
+// TestWaitForExitReportsExit covers the signal the close path branches on:
+// force-killing is skipped when the browser has already gone.
+func TestWaitForExitReportsExit(t *testing.T) {
+	if got := waitForExit(0, time.Second); !got {
+		t.Error("waitForExit(0) = false, want true (nothing to wait for)")
+	}
+	// Our own process is unambiguously alive, so the wait must time out and
+	// report that a kill is still needed.
+	start := time.Now()
+	if got := waitForExit(os.Getpid(), 200*time.Millisecond); got {
+		t.Error("waitForExit on a live process = true, want false")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Errorf("waitForExit returned after %v, want it to wait out the grace period", elapsed)
 	}
 }

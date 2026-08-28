@@ -148,7 +148,13 @@ func (b *Browser) RestoreSession(ctx context.Context, alias string) error {
 	}
 	var stored []storedCookie
 	if err := json.Unmarshal(blob, &stored); err != nil {
-		return fmt.Errorf("parse saved session: %w", err)
+		// Treated as "no session" rather than an error on purpose. Launch
+		// restores before returning, and `auth login` goes through Launch
+		// too — so failing here would fail the very command that exists to
+		// replace the unreadable file, leaving no way out short of deleting
+		// it by hand. Dropping it lets sign-in proceed and overwrite it.
+		fmt.Fprintf(os.Stderr, "warning: ignoring unreadable saved session %s (%v); sign in again to replace it\n", path, err)
+		return nil
 	}
 	params := make([]*proto.NetworkCookieParam, 0, len(stored))
 	for _, c := range stored {
