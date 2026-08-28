@@ -18,9 +18,11 @@ import (
 
 // isolateHome points LION_HOME at a fresh temp directory so tests never read
 // or write a real credentials.json/config.json.
-func isolateHome(t *testing.T) {
+func isolateHome(t *testing.T) string {
 	t.Helper()
-	t.Setenv("LION_HOME", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("LION_HOME", dir)
+	return dir
 }
 
 // execRoot isolates LION_HOME, builds the real command tree, and runs it
@@ -552,5 +554,48 @@ func TestReadOnlyAliasMatchesWacli(t *testing.T) {
 		if !cfg.ReadOnly {
 			t.Errorf("%s did not set ReadOnly", spelling)
 		}
+	}
+}
+
+// TestCookieTransportFalseRestoresBrowser: a config file that opted out must
+// be overridable for a single command without reaching for --browser, which
+// is deprecated and hidden from help.
+func TestCookieTransportFalseRestoresBrowser(t *testing.T) {
+	home := isolateHome(t)
+	// The gap only exists when something has already opted out: with no
+	// config the default is already true and any implementation passes.
+	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(`{"browser": false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	root, _ := newRootCmd(cfg)
+	root.SetArgs([]string{"--cookie-transport=false", "version"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Browser {
+		t.Error("Browser = false with --cookie-transport=false, want true (an explicit false asks for the browser)")
+	}
+}
+
+// TestLocalOnlyCommandsDoNotWarnAboutTheTransport: warning on every
+// invocation, including commands that never open a connection, trains people
+// to ignore the notice — the opposite of what a deprecation is for.
+func TestLocalOnlyCommandsDoNotWarnAboutTheTransport(t *testing.T) {
+	isolateHome(t)
+	out := captureStderr(t, func() {
+		cfg := &config.Config{}
+		root, _ := newRootCmd(cfg)
+		root.SetArgs([]string{"--cookie-transport", "version"})
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	if strings.Contains(out, "deprecated") {
+		t.Errorf("`version` warned about the transport it never uses: %q", out)
 	}
 }

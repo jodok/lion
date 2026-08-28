@@ -68,6 +68,9 @@ func newAuthLoginCmd() *cobra.Command {
 			if app.Cfg.Browser && !suppliedCookies {
 				return browserLogin(cmd.Context(), app, firstNonEmpty(alias, app.Cfg.Account, "default"))
 			}
+			if !app.Cfg.Browser {
+				warnCookieTransport()
+			}
 			if suppliedCookies && app.Cfg.Browser {
 				// The root warning keys on --cookie-transport, which this
 				// path does not require: supplying cookies selects it on its
@@ -241,6 +244,20 @@ func browserStatus(ctx context.Context, app *App) error {
 		return err
 	}
 	if len(aliases) == 0 {
+		// This is the command someone runs to find out what happened to
+		// their session, so it must not answer "not signed in" while their
+		// accounts sit in the credential store. Say what is actually there
+		// and how to reach it — the same guidance App.Client() gives.
+		if creds, _, lErr := auth.List(); lErr == nil && len(creds) > 0 {
+			names := make([]string, 0, len(creds))
+			for _, c := range creds {
+				names = append(names, c.Alias)
+			}
+			return fmt.Errorf("%w\n\nStored cookie credentials exist for: %s. lion now drives a real "+
+				"browser by default; run `lion auth login` to sign in once, or `lion auth status "+
+				"--cookie-transport` to validate the stored cookies (deprecated)",
+				browser.ErrLoggedOut, strings.Join(names, ", "))
+		}
 		return browser.ErrLoggedOut
 	}
 	fmt.Fprintf(os.Stderr, "validating %d browser profile(s)...\n", len(aliases))
@@ -668,7 +685,24 @@ func newAuthLogoutCmd() *cobra.Command {
 				if err := browser.DeleteProfile(alias); err != nil {
 					return err
 				}
-				fmt.Fprintf(os.Stderr, "removed browser profile for %q\n", alias)
+				// Logout reporting success is a promise about what is left
+				// behind. Someone upgrading from a cookie setup still has a
+				// live li_at in the credential store, and removing only the
+				// browser profile while saying "logged out" would leave the
+				// thing that actually grants access sitting on disk —
+				// exactly wrong on a shared machine or after a suspected
+				// compromise. Remove both.
+				removedCookies := false
+				if err := auth.Delete(alias); err == nil {
+					removedCookies = true
+				} else if !errors.Is(err, auth.ErrNoAccount) {
+					return err
+				}
+				if removedCookies {
+					fmt.Fprintf(os.Stderr, "removed browser profile and stored cookies for %q\n", alias)
+				} else {
+					fmt.Fprintf(os.Stderr, "removed browser profile for %q\n", alias)
+				}
 				return nil
 			}
 			if alias == "" {

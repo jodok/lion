@@ -100,6 +100,10 @@ func (a *App) Client(opts ...voyager.Option) (*voyager.Client, error) {
 	if a.Cfg.Browser {
 		return a.browserClient(opts...)
 	}
+	// Warned here rather than for every invocation: `lion version` and `lion
+	// store stats` never open a connection, and annotating purely local work
+	// with a transport notice trains people to ignore it.
+	warnCookieTransport()
 	cred, err := auth.Get(a.Cfg.Account)
 	if err != nil {
 		return nil, err
@@ -226,6 +230,15 @@ func (a *App) persistRotatedCookies() {
 	if _, err := auth.UpdateCookies(a.clientAlias, a.clientLiAt, merged); err != nil && a.Cfg.Verbose {
 		fmt.Fprintf(os.Stderr, "warning: could not persist rotated session cookies: %v\n", err)
 	}
+}
+
+// warnCookieTransport is printed once, where the deprecated transport is
+// actually constructed.
+func warnCookieTransport() {
+	fmt.Fprintln(os.Stderr, "warning: the cookie transport is deprecated. It replays stored "+
+		"cookies over a synthesized TLS fingerprint, and LinkedIn can revoke the session "+
+		"account-wide within minutes — signing you out of your own browser. Run `lion auth "+
+		"login` without --cookie-transport to sign in through a real browser instead.")
 }
 
 // requireWritable blocks a mutating command under --readonly.
@@ -374,14 +387,12 @@ func newRootCmd(cfg *config.Config) (*cobra.Command, *App) {
 			// the --browser default and anything the config file said, so a
 			// person reaching for the old path gets it without having to
 			// know which setting takes precedence.
-			if cmd.Flags().Changed("cookie-transport") && cfg.CookieTransport {
-				cfg.Browser = false
-			}
-			if !cfg.Browser {
-				fmt.Fprintln(os.Stderr, "warning: the cookie transport is deprecated. It replays stored "+
-					"cookies over a synthesized TLS fingerprint, and LinkedIn can revoke the session "+
-					"account-wide within minutes — signing you out of your own browser. Run `lion auth "+
-					"login` without --cookie-transport to sign in through a real browser instead.")
+			if cmd.Flags().Changed("cookie-transport") {
+				// Explicit either way: --cookie-transport selects the old
+				// path, and --cookie-transport=false asks for the browser
+				// back, which is otherwise unreachable without the
+				// now-deprecated --browser once a config file has opted out.
+				cfg.Browser = !cfg.CookieTransport
 			}
 			return nil
 		},

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"github.com/jodok/lion/internal/config"
 	"io"
 	"os"
 	"reflect"
@@ -508,5 +509,65 @@ func TestMissingCookiesMsg(t *testing.T) {
 	}
 	if strings.Contains(msg, "lidc") {
 		t.Errorf("missingCookiesMsg echoed a parsed cookie name: %q", msg)
+	}
+}
+
+// TestBrowserLogoutAlsoRemovesStoredCookies: logout reporting success is a
+// promise about what is left behind. With the browser transport now the
+// default, removing only the profile would tell someone upgrading from a
+// cookie setup that they had logged out while a working li_at stayed on disk
+// — exactly wrong on a shared machine or after a suspected compromise.
+func TestBrowserLogoutAlsoRemovesStoredCookies(t *testing.T) {
+	isolateHome(t)
+	if err := auth.Save(&auth.Credential{
+		Alias:   "default",
+		Cookies: map[string]string{"li_at": "live-token", "JSESSIONID": `"ajax:1"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	root, app := newRootCmd(cfg)
+	root.SetArgs([]string{"auth", "logout"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	ctx := context.WithValue(context.Background(), ctxKey{}, app)
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatalf("auth logout: %v", err)
+	}
+
+	if _, err := auth.Get("default"); !errors.Is(err, auth.ErrNoAccount) {
+		t.Errorf("stored credential survived logout (err=%v); the session it grants is still usable", err)
+	}
+}
+
+// TestBrowserStatusNamesStoredCookieAccounts: `auth status` is what someone
+// runs to find out what happened to their session, so it must not answer
+// "not signed in" while their accounts sit in the credential store.
+func TestBrowserStatusNamesStoredCookieAccounts(t *testing.T) {
+	isolateHome(t)
+	if err := auth.Save(&auth.Credential{
+		Alias:   "work",
+		Cookies: map[string]string{"li_at": "x", "JSESSIONID": `"ajax:1"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	root, app := newRootCmd(cfg)
+	root.SetArgs([]string{"auth", "status"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	ctx := context.WithValue(context.Background(), ctxKey{}, app)
+
+	err := root.ExecuteContext(ctx)
+	if err == nil {
+		t.Fatal("expected an error with no browser profile")
+	}
+	if !strings.Contains(err.Error(), "work") {
+		t.Errorf("error = %q, want it to name the stored account so it isn't reported as lost", err)
+	}
+	if exitCode(err) != ExitAuth {
+		t.Errorf("exit code = %d, want %d", exitCode(err), ExitAuth)
 	}
 }
