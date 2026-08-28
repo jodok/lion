@@ -156,9 +156,20 @@ func browserLogin(ctx context.Context, app *App, alias string) error {
 		}
 		return err
 	}
+	// LinkedIn hands out a session-scoped li_at unless "keep me logged in"
+	// applied, and a session cookie lives only in memory — so without this
+	// the profile can come back empty on the very next run.
+	promoted, err := b.PersistSession(ctx)
+	if err != nil {
+		return err
+	}
 	dir, err := browser.ProfileDir(alias)
 	if err != nil {
 		return err
+	}
+	if promoted {
+		fmt.Fprintln(os.Stderr, "note: LinkedIn issued a session-scoped login; lion gave it an "+
+			"expiry so it survives the browser closing (the same thing \"keep me logged in\" does)")
 	}
 	fmt.Fprintf(os.Stderr, "signed in; session stored in %s\n", dir)
 	return nil

@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -179,7 +180,17 @@ func Launch(ctx context.Context, opts Options) (*Browser, error) {
 	b := &Browser{
 		browser: br,
 		cleanup: func() {
+			// Ask Chromium to shut down and give it time to finish before
+			// resorting to force. This ordering is load-bearing: Chromium
+			// holds its cookie store in memory and commits it on a timer and
+			// at clean shutdown, while launcher.Kill sends SIGKILL after a
+			// one-second sleep. Killing straight after Close truncated every
+			// cookie set since the last commit — which is to say the entire
+			// session, since signing in is the last thing that happens before
+			// the browser is closed. The profile kept the anonymous cookies
+			// from the first page load and lost li_at.
 			_ = br.Close()
+			waitForExit(l.PID(), browserExitGrace)
 			l.Kill()
 			cancel()
 		},
@@ -304,6 +315,78 @@ func (b *Browser) Login(ctx context.Context, poll time.Duration) error {
 			return nil
 		}
 	}
+}
+
+// browserExitGrace bounds how long Close waits for Chromium to exit on its
+// own after being asked to. Long enough to commit a cookie store, short
+// enough that a wedged browser does not hang a CLI command.
+const browserExitGrace = 10 * time.Second
+
+// sessionRetention is the expiry given to a session-scoped li_at when it is
+// promoted to a persistent cookie. LinkedIn issues roughly a year when "keep
+// me logged in" applies, so this matches what the same sign-in would have
+// produced with that box ticked.
+const sessionRetention = 365 * 24 * time.Hour
+
+// waitForExit blocks until pid is gone or the grace period elapses. Signal 0
+// performs the liveness check without delivering anything.
+func waitForExit(pid int, grace time.Duration) {
+	if pid == 0 {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return // exited
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// PersistSession makes the session survive the browser closing.
+//
+// LinkedIn issues li_at as a session cookie unless "keep me logged in"
+// applied, and Chromium holds session cookies in memory only — so a profile
+// that is signed in right now can come back empty on the next run, through
+// no fault of the shutdown path. Since lion's whole reason for owning a
+// profile is that an unattended run picks up where the last one left off,
+// re-set such a cookie with an explicit expiry, which is precisely what
+// ticking that box would have done.
+//
+// A cookie LinkedIn already made persistent is left exactly as issued.
+func (b *Browser) PersistSession(ctx context.Context) (bool, error) {
+	cookies, err := b.page.Context(ctx).Cookies(nil)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range cookies {
+		if c.Name != sessionCookieName || c.Value == "" {
+			continue
+		}
+		if c.Expires > 0 {
+			return false, nil // already persistent; leave it alone
+		}
+		exp := proto.TimeSinceEpoch(float64(time.Now().Add(sessionRetention).Unix()))
+		_, err := proto.NetworkSetCookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Secure:   c.Secure,
+			HTTPOnly: c.HTTPOnly,
+			SameSite: c.SameSite,
+			Expires:  exp,
+		}.Call(b.page)
+		if err != nil {
+			return false, fmt.Errorf("persist session cookie: %w", err)
+		}
+		return true, nil
+	}
+	return false, ErrLoggedOut
 }
 
 // Close shuts the browser down and releases the profile lock. Safe to call

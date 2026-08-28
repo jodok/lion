@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/jodok/lion/internal/voyager"
 )
 
@@ -339,5 +340,196 @@ func TestLoginWaitsRatherThanFalselySucceeding(t *testing.T) {
 	err := b.Login(ctx, 200*time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Login() with no sign-in = %v, want it to keep waiting until the deadline", err)
+	}
+}
+
+// TestPersistSessionPromotesSessionCookie covers the second half of the
+// vanishing-session bug: LinkedIn issues li_at as a session cookie unless
+// "keep me logged in" applied, and Chromium keeps session cookies in memory
+// only, so the profile came back empty on the next run even after a clean
+// shutdown.
+func TestPersistSessionPromotesSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	// No Expires and no Max-Age: a session cookie, exactly as LinkedIn
+	// issues it without "keep me logged in".
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+
+	before, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := cookieExpiry(before, "li_at"); exp > 0 {
+		t.Fatalf("li_at started persistent (expires=%v); the test server should issue a session cookie", exp)
+	}
+
+	promoted, err := b.PersistSession(context.Background())
+	if err != nil {
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if !promoted {
+		t.Error("PersistSession reported no change for a session-scoped li_at")
+	}
+
+	after, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := cookieExpiry(after, "li_at")
+	if exp <= 0 {
+		t.Fatalf("li_at is still a session cookie after PersistSession (expires=%v)", exp)
+	}
+	if got := time.Until(time.Unix(int64(exp), 0)); got < 300*24*time.Hour {
+		t.Errorf("li_at expires in %v, want roughly a year", got)
+	}
+	// The value must survive the rewrite — a promoted cookie that lost its
+	// token would be worse than the bug it fixes.
+	if v := cookieValue(after, "li_at"); v != "session-token" {
+		t.Errorf("li_at value = %q after promotion, want it unchanged", v)
+	}
+}
+
+// TestPersistSessionLeavesPersistentCookieAlone confirms lion does not
+// rewrite an expiry LinkedIn already chose.
+func TestPersistSessionLeavesPersistentCookieAlone(t *testing.T) {
+	want := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "tok", Path: "/", Expires: want})
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	promoted, err := b.PersistSession(context.Background())
+	if err != nil {
+		t.Fatalf("PersistSession: %v", err)
+	}
+	if promoted {
+		t.Error("PersistSession rewrote a cookie LinkedIn had already made persistent")
+	}
+	after, err := b.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(cookieExpiry(after, "li_at")); got != want.Unix() {
+		t.Errorf("li_at expiry = %d, want %d (unchanged)", got, want.Unix())
+	}
+}
+
+// TestPersistSessionWithoutSessionReportsLoggedOut keeps the promotion step
+// from quietly succeeding on a profile that never signed in.
+func TestPersistSessionWithoutSessionReportsLoggedOut(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>home</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBrowser(t, srv.URL)
+	if _, err := b.PersistSession(context.Background()); !errors.Is(err, ErrLoggedOut) {
+		t.Errorf("PersistSession with no li_at = %v, want ErrLoggedOut", err)
+	}
+}
+
+func cookieExpiry(cookies []*proto.NetworkCookie, name string) proto.TimeSinceEpoch {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c.Expires
+		}
+	}
+	return 0
+}
+
+func cookieValue(cookies []*proto.NetworkCookie, name string) string {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// TestSessionSurvivesBrowserRestart is the end-to-end guarantee the whole
+// package exists for: sign in once, and a later, separate run of lion finds
+// the session still there.
+//
+// It is the test whose absence let two bugs ship. Everything else here
+// exercises one live browser, and both failures were about what reaches
+// disk between browsers — a SIGKILL arriving before Chromium committed its
+// cookie store, and a session-scoped cookie that is never written at all.
+// So this launches a browser, signs in, closes it properly, and launches a
+// second one against the same profile, exactly as two lion invocations do.
+func TestSessionSurvivesBrowserRestart(t *testing.T) {
+	if _, ok := launcher.LookPath(); !ok {
+		t.Skip("no Chrome/Chromium installed; skipping browser restart test")
+	}
+
+	// One LION_HOME for both launches: the profile is the thing under test.
+	home := t.TempDir()
+	t.Setenv("LION_HOME", home)
+
+	var issue bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/home", func(w http.ResponseWriter, r *http.Request) {
+		// Only the first launch signs in. The second must find the session
+		// already in the profile rather than being handed a fresh one.
+		if issue {
+			http.SetCookie(w, &http.Cookie{Name: "li_at", Value: "session-token", Path: "/"})
+		}
+		io.WriteString(w, "<html><body>feed</body></html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orig := homeURL
+	homeURL = srv.URL + "/home"
+	t.Cleanup(func() { homeURL = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	// First run: sign in, promote the cookie, shut down cleanly.
+	issue = true
+	first, err := Launch(ctx, Options{Alias: "restart"})
+	if err != nil {
+		t.Fatalf("first Launch: %v", err)
+	}
+	if err := first.Open(ctx); err != nil {
+		first.Close()
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, err := first.PersistSession(ctx); err != nil {
+		first.Close()
+		t.Fatalf("PersistSession: %v", err)
+	}
+	first.Close()
+
+	// Second run: a different browser process, same profile, and the server
+	// no longer hands out a session.
+	issue = false
+	second, err := Launch(ctx, Options{Alias: "restart"})
+	if err != nil {
+		t.Fatalf("second Launch: %v", err)
+	}
+	defer second.Close()
+
+	if err := second.Open(ctx); err != nil {
+		t.Fatalf("second Open: %v — the session did not survive the restart", err)
+	}
+	cookies, err := second.page.Cookies(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieValue(cookies, "li_at"); got != "session-token" {
+		t.Errorf("li_at after restart = %q, want the value from the first run", got)
 	}
 }
