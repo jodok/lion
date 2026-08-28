@@ -512,6 +512,13 @@ func exitCode(err error) int {
 		return ExitNotFound
 	case errors.Is(err, voyager.ErrChallenge):
 		return ExitChallenge
+	case errors.Is(err, errDoctorFailed):
+		// `doctor` reporting a broken setup is a normal, successful run of
+		// the command: the table it printed is the answer. The non-zero exit
+		// exists so a timer or script can gate on it, and ExitError is the
+		// generic bucket rather than a new code, since the report — not the
+		// number — carries which layer broke.
+		return ExitError
 	default:
 		if isPermission(err) {
 			return ExitPermission
