@@ -9,7 +9,10 @@ import (
 )
 
 func TestConversations(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations": "conversations.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_conversations.json",
+	})
 	convs, err := c.Conversations(context.Background(), false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -18,7 +21,7 @@ func TestConversations(t *testing.T) {
 		t.Fatalf("got %d conversations, want 2", len(convs))
 	}
 	first := convs[0]
-	if first.URN != "urn:li:fs_conversation:2-YWJjMTIz" {
+	if first.URN != "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz)" {
 		t.Errorf("urn = %q", first.URN)
 	}
 	if len(first.Participants) != 1 || first.Participants[0].Name != "Grace Hopper" {
@@ -33,7 +36,10 @@ func TestConversations(t *testing.T) {
 }
 
 func TestConversationsUnreadOnly(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations": "conversations.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_conversations.json",
+	})
 	convs, err := c.Conversations(context.Background(), true, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +53,10 @@ func TestConversationsUnreadOnly(t *testing.T) {
 }
 
 func TestConversationsRespectsMax(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations": "conversations.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_conversations.json",
+	})
 	convs, err := c.Conversations(context.Background(), false, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +67,10 @@ func TestConversationsRespectsMax(t *testing.T) {
 }
 
 func TestMessages(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations/2-YWJjMTIz/events": "messages.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_messages.json",
+	})
 	msgs, err := c.Messages(context.Background(), "2-YWJjMTIz", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +90,10 @@ func TestMessages(t *testing.T) {
 }
 
 func TestMessagesRespectsMax(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations/2-YWJjMTIz/events": "messages.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_messages.json",
+	})
 	msgs, err := c.Messages(context.Background(), "2-YWJjMTIz", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -117,17 +132,24 @@ func TestSendMessageToProfileDryRun(t *testing.T) {
 // archive/export consumer needs a stable id and participant identity, not
 // just a label.
 func TestConversationsIncludesIDAndParticipantURNs(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations": "conversations.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_conversations.json",
+	})
 	convs, err := c.Conversations(context.Background(), false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := convs[0]
 	if first.ID != "2-YWJjMTIz" {
-		t.Errorf("ID = %q, want 2-YWJjMTIz (parsed from the fs_conversation URN)", first.ID)
+		t.Errorf("ID = %q, want 2-YWJjMTIz (the thread segment of the msg_conversation URN)", first.ID)
 	}
-	if len(first.Participants) != 1 || first.Participants[0].URN != "urn:li:fs_miniProfile:ACoAAA1" {
-		t.Errorf("Participants = %+v, want [{Grace Hopper urn:li:fs_miniProfile:ACoAAA1}]", first.Participants)
+	// The messaging GraphQL surface identifies people by fsd_profile URN,
+	// where the retired REST one returned fs_miniProfile. Anything holding
+	// participant URNs from before the migration — notably the local store —
+	// will not match these without a translation step.
+	if len(first.Participants) != 1 || first.Participants[0].URN != "urn:li:fsd_profile:ACoAAgrace" {
+		t.Errorf("Participants = %+v, want [{Grace Hopper urn:li:fsd_profile:ACoAAgrace}]", first.Participants)
 	}
 }
 
@@ -189,16 +211,22 @@ func TestConversationIDFromURNMissingPrefix(t *testing.T) {
 // TestMessagesIncludesFromURN is the Message-side counterpart of
 // TestConversationsIncludesIDAndParticipantURNs.
 func TestMessagesIncludesFromURN(t *testing.T) {
-	c, _ := newTestClient(t, map[string]string{"/messaging/conversations/2-YWJjMTIz/events": "messages.json"})
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_messages.json",
+	})
 	msgs, err := c.Messages(context.Background(), "2-YWJjMTIz", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msgs[0].FromURN != "urn:li:fs_miniProfile:ACoAAA1" {
-		t.Errorf("msgs[0].FromURN = %q, want urn:li:fs_miniProfile:ACoAAA1", msgs[0].FromURN)
+	// Senders are fsd_profile URNs on the messaging GraphQL surface, where
+	// the retired REST one returned fs_miniProfile — the same identity-format
+	// change the conversation participants went through.
+	if msgs[0].FromURN != "urn:li:fsd_profile:ACoAAgrace" {
+		t.Errorf("msgs[0].FromURN = %q, want urn:li:fsd_profile:ACoAAgrace", msgs[0].FromURN)
 	}
-	if msgs[1].FromURN != "urn:li:fs_miniProfile:ACoAAAme" {
-		t.Errorf("msgs[1].FromURN = %q, want urn:li:fs_miniProfile:ACoAAAme", msgs[1].FromURN)
+	if msgs[1].FromURN != "urn:li:fsd_profile:ACoAAtestada" {
+		t.Errorf("msgs[1].FromURN = %q, want urn:li:fsd_profile:ACoAAtestada", msgs[1].FromURN)
 	}
 }
 
@@ -414,6 +442,9 @@ func TestMessagesPagePaginatesAcrossPages(t *testing.T) {
 // TestMessagesPageLoopGuardTerminates is the Message-side counterpart of
 // TestConversationsPageLoopGuardTerminates.
 func TestMessagesPageLoopGuardTerminates(t *testing.T) {
+	// MessagesPage still calls the retired REST events endpoint (see
+	// messaging.go), so this keeps driving the REST page shape rather than the
+	// messenger fixture Messages now uses.
 	page := messagesPageJSON([]msgEntry{{"urn:li:fs_event:(2-abc,1)", 5000}, {"urn:li:fs_event:(2-abc,2)", 4000}})
 	st := &sequenceTransport{responses: jsonResponses(page)}
 	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
@@ -478,9 +509,12 @@ func TestConversationsPageStalledCursorReturnsPageAndError(t *testing.T) {
 // condition that trips ErrPaginationStalled in the *Page variant) must not
 // make the plain, one-shot Conversations call fail.
 func TestConversationsUnaffectedByStalledPagination(t *testing.T) {
-	page := conversationsPageJSON([]convEntry{{"2-aaa", 5000}, {"2-bbb", 4000}})
-	st := &sequenceTransport{responses: jsonResponses(page)}
-	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+	// Conversations resolves the mailbox through /me before querying, so the
+	// sequence is /me and then the messaging GraphQL response.
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_conversations.json",
+	})
 
 	convs, err := c.Conversations(context.Background(), false, 0)
 	if err != nil {
@@ -515,9 +549,11 @@ func TestMessagesPageStalledCursorReturnsPageAndError(t *testing.T) {
 // TestMessagesUnaffectedByStalledPagination is the Message-side counterpart
 // of TestConversationsUnaffectedByStalledPagination.
 func TestMessagesUnaffectedByStalledPagination(t *testing.T) {
-	page := messagesPageJSON([]msgEntry{{"urn:li:fs_event:(2-abc,1)", 5000}, {"urn:li:fs_event:(2-abc,2)", 4000}})
-	st := &sequenceTransport{responses: jsonResponses(page)}
-	c := New("li_at_test", `"jsession_test"`, WithTransport(st), WithLimiter(noopLimiter()))
+	// Messages resolves the mailbox through /me before querying.
+	c, _ := newTestClient(t, map[string]string{
+		"/me":                              "me.json",
+		"/voyagerMessagingGraphQL/graphql": "messenger_messages.json",
+	})
 
 	msgs, err := c.Messages(context.Background(), "2-abc", 0)
 	if err != nil {

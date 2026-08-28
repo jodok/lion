@@ -56,15 +56,18 @@ func conversationIDFromURN(urn string) string {
 // reliably). max caps the number of returned conversations (0 = server
 // default / no client-side cap).
 func (c *Client) Conversations(ctx context.Context, unreadOnly bool, max int) ([]Conversation, error) {
-	q := url.Values{}
-	if max > 0 {
-		q.Set("count", fmt.Sprintf("%d", max))
-	}
-	body, err := c.get(ctx, "/messaging/conversations", q)
+	me, err := c.Me(ctx)
 	if err != nil {
 		return nil, err
 	}
-	convs, err := decodeConversations(body)
+	// The messaging GraphQL query takes no count: it returns the mailbox and
+	// the cap is applied below, as it already was for unreadOnly.
+	body, err := c.getMessagingGraphQL(ctx, queryIDMessengerConversations,
+		"(mailboxUrn:"+mailboxURN(me.URN)+")")
+	if err != nil {
+		return nil, err
+	}
+	convs, err := decodeMessengerConversations(body)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +106,18 @@ func (c *Client) Conversations(ctx context.Context, unreadOnly bool, max int) ([
 // very first call passes createdBefore=0, and "no bound" always counts as
 // bigger than any real timestamp the server returns, so that call must not
 // itself be flagged as non-decreasing.
+// NOTE: this still calls the retired REST endpoint, which answers 500 for
+// every request (see messenger.go). Conversations has moved to the messaging
+// GraphQL surface, but that query takes no pagination variables — count and
+// lastUpdatedBefore are both accepted and both ignored, verified by probing
+// four combinations against the live API and getting byte-identical
+// responses. LinkedIn's web app pages this surface by sync token, a
+// different model from the timestamp cursor this signature is built around.
+//
+// Rewriting it to return a single page would quietly cost `lion sync` its
+// paging, backfill, and resume behaviour, so the migration is left to its own
+// change rather than smuggled in here. Until then sync fails against the dead
+// endpoint, which is the status quo, and README records it.
 func (c *Client) ConversationsPage(ctx context.Context, createdBefore int64, count int) ([]Conversation, int64, error) {
 	q := url.Values{}
 	if createdBefore > 0 {
@@ -244,16 +259,17 @@ func (c *Client) Messages(ctx context.Context, conversationID string, max int) (
 	if conversationID == "" {
 		return nil, fmt.Errorf("empty conversation id")
 	}
-	q := url.Values{}
-	if max > 0 {
-		q.Set("count", fmt.Sprintf("%d", max))
-	}
-	path := fmt.Sprintf("/messaging/conversations/%s/events", url.PathEscape(conversationID))
-	body, err := c.get(ctx, path, q)
+	urn, err := c.conversationURN(ctx, conversationID)
 	if err != nil {
 		return nil, err
 	}
-	return decodeMessages(body, max)
+	// The messenger query takes no count; max is applied when decoding.
+	body, err := c.getMessagingGraphQL(ctx, queryIDMessengerMessages,
+		"(conversationUrn:"+url.QueryEscape(urn)+")")
+	if err != nil {
+		return nil, err
+	}
+	return decodeMessengerMessages(body, max)
 }
 
 // MessagesPage returns one page of a conversation's events, plus the cursor

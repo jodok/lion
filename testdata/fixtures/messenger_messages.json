@@ -1,0 +1,64 @@
+{
+  "data": {
+    "data": {
+      "$type": "com.linkedin.messenger.MessengerMessagesByConversation",
+      "messengerMessagesByConversation": {
+        "$type": "com.linkedin.messenger.CollectionResponse",
+        "*elements": [
+          "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m1)",
+          "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m2)"
+        ]
+      }
+    }
+  },
+  "included": [
+    {
+      "$type": "com.linkedin.messenger.Message",
+      "entityUrn": "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m2)",
+      "deliveredAt": 1753359484773,
+      "body": {
+        "text": "Are you free for a quick call this week?"
+      },
+      "*sender": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAtestada"
+    },
+    {
+      "$type": "com.linkedin.messenger.Message",
+      "entityUrn": "urn:li:msg_message:(urn:li:fsd_profile:ACoAAtestada,2-YWJjMTIz-m1)",
+      "deliveredAt": 1753359000000,
+      "body": {
+        "text": "Hello there."
+      },
+      "*sender": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAgrace"
+    },
+    {
+      "$type": "com.linkedin.messenger.MessagingParticipant",
+      "entityUrn": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAgrace",
+      "hostIdentityUrn": "urn:li:fsd_profile:ACoAAgrace",
+      "participantType": {
+        "member": {
+          "firstName": {
+            "text": "Grace"
+          },
+          "lastName": {
+            "text": "Hopper"
+          }
+        }
+      }
+    },
+    {
+      "$type": "com.linkedin.messenger.MessagingParticipant",
+      "entityUrn": "urn:li:msg_messagingParticipant:urn:li:fsd_profile:ACoAAtestada",
+      "hostIdentityUrn": "urn:li:fsd_profile:ACoAAtestada",
+      "participantType": {
+        "member": {
+          "firstName": {
+            "text": "Ada"
+          },
+          "lastName": {
+            "text": "Lovelace"
+          }
+        }
+      }
+    }
+  ]
+}
